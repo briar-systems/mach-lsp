@@ -1,4 +1,4 @@
-# mls.main: mach language server entry point.
+# mach language server entry point
 #
 # initializes the server over a page-backed allocator and runs the JSON-RPC
 # message loop over stdin/stdout until the client shuts the server down. all

@@ -1,4 +1,4 @@
-# mls.server: top-level server state, lifecycle, message loop, and dispatch.
+# top-level server state, lifecycle, message loop, and dispatch
 #
 # owns the long-lived state of one server process: the lifecycle status, the
 # allocator, the compiler `session.Session` (SourceMap + DiagList), the
@@ -26,25 +26,25 @@ use std.allocator.deallocate;
 
 use mem: std.memory;
 
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use sess:   mach.lang.session;
+use src:    mach.lang.source;
 use editor: mach.lang.editor;
 
-use transport: mls.transport;
-use json:      mls.json;
-use documents: mls.documents;
+use transport:   mls.transport;
+use json:        mls.json;
+use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
-use language:  mls.language;
-use project:   mls.project;
-use trace:     mls.trace;
+use language:    mls.language;
+use project:     mls.project;
+use trace:       mls.trace;
 
-# lifecycle statuses.
+# lifecycle statuses
 pub val STATUS_UNINITIALIZED: u8 = 0;
 pub val STATUS_RUNNING:       u8 = 1;
 pub val STATUS_SHUTTING_DOWN: u8 = 2;
 pub val STATUS_EXITED:        u8 = 3;
 
-# Server: the long-lived server state.
+# the long-lived server state
 # ---
 # status:        current lifecycle phase
 # exit_code:     process exit code to return from `run`
@@ -66,7 +66,7 @@ pub rec Server {
     watch_dynamic: bool;
 }
 
-# init: build a server over the given allocator.
+# build a server over the given allocator
 # ---
 # srv:   server to initialize
 # alloc: allocator backing all server-owned memory; must outlive the server
@@ -87,7 +87,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     ret true;
 }
 
-# dnit: tear down the server's owned state.
+# tear down the server's owned state
 # ---
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
@@ -98,7 +98,7 @@ pub fun dnit(srv: *Server) {
     srv.status = STATUS_EXITED;
 }
 
-# run: read and dispatch framed messages until the server exits.
+# read and dispatch framed messages until the server exits
 # ---
 # srv: the server to drive
 # ret: the process exit code
@@ -131,7 +131,7 @@ pub fun run(srv: *Server) i64 {
     ret srv.exit_code;
 }
 
-# dispatch: route one message body by its `method` field.
+# route one message body by its `method` field
 fun dispatch(srv: *Server, msg: *transport.Message) {
     val body: str = msg.body;
     val method: str = json.extract_string(body, "\"method\"", srv.alloc);
@@ -236,8 +236,8 @@ fun dispatch(srv: *Server, msg: *transport.Message) {
     reply_error(srv, body, -32601, "method not found");
 }
 
-# handle_initialize: answer the initialize request with the server's
-# capabilities (full-text document sync) and mark the server running.
+# answer the initialize request with the server's
+# capabilities (full-text document sync) and mark the server running
 fun handle_initialize(srv: *Server, body: str) {
     val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
     if (id == nil) { ret; }
@@ -255,11 +255,11 @@ fun handle_initialize(srv: *Server, body: str) {
     trace.log("initialized\n");
 }
 
-# handle_initialized: once the client signals it is ready, register file
+# once the client signals it is ready, register file
 # watchers for the manifest, lockfile, and source trees so a dep-graph change
 # (pulling deps, editing a dep source) triggers `workspace/didChangeWatchedFiles`
 # and the affected project root is rebuilt. only sent when the client advertised
-# dynamic registration; clients without it fall back to the server's mtime check.
+# dynamic registration; clients without it fall back to the server's mtime check
 fun handle_initialized(srv: *Server) {
     if (!srv.watch_dynamic) { ret; }
     val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
@@ -269,9 +269,9 @@ fun handle_initialized(srv: *Server) {
     project.set_watch_active(?srv.ws, true);
 }
 
-# handle_did_change_watched_files: invalidate every project root whose tree
+# invalidate every project root whose tree
 # contains a changed file, so the next request rebuilds it from disk. each
-# `uri` in the notification's `changes` array is invalidated in turn.
+# `uri` in the notification's `changes` array is invalidated in turn
 fun handle_did_change_watched_files(srv: *Server, body: str) {
     var i: u32 = 0;
     for (true) {
@@ -283,7 +283,7 @@ fun handle_did_change_watched_files(srv: *Server, body: str) {
     }
 }
 
-# handle_shutdown: acknowledge a shutdown request and enter the shutting-down phase.
+# acknowledge a shutdown request and enter the shutting-down phase
 fun handle_shutdown(srv: *Server, body: str) {
     val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
     if (id != nil) {
@@ -295,14 +295,14 @@ fun handle_shutdown(srv: *Server, body: str) {
     srv.status = STATUS_SHUTTING_DOWN;
 }
 
-# handle_exit: exit the process, with code 0 only after a clean shutdown.
+# exit the process, with code 0 only after a clean shutdown
 fun handle_exit(srv: *Server) {
     if (srv.status == STATUS_SHUTTING_DOWN) { srv.exit_code = 0; }
     or { srv.exit_code = 1; }
     srv.status = STATUS_EXITED;
 }
 
-# handle_did_open: register the opened document and publish its diagnostics.
+# register the opened document and publish its diagnostics
 fun handle_did_open(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
@@ -315,9 +315,9 @@ fun handle_did_open(srv: *Server, body: str) {
     json.free_str(uri, srv.alloc);
 }
 
-# handle_did_change: apply the document's new full text and republish diagnostics.
+# apply the document's new full text and republish diagnostics.
 # only full-document sync (textDocumentSync = 1) is advertised, so the change is
-# the entire new text.
+# the entire new text
 fun handle_did_change(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
@@ -330,8 +330,8 @@ fun handle_did_change(srv: *Server, body: str) {
     json.free_str(uri, srv.alloc);
 }
 
-# handle_did_close: retire the document, reclaim its cached resolve result, and
-# clear its diagnostics.
+# retire the document, reclaim its cached resolve result, and
+# clear its diagnostics
 fun handle_did_close(srv: *Server, body: str) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
     if (uri == nil) { ret; }
@@ -342,12 +342,12 @@ fun handle_did_close(srv: *Server, body: str) {
     json.free_str(uri, srv.alloc);
 }
 
-# handle_feature: route a language-feature request to its handler in `language`.
+# route a language-feature request to its handler in `language`.
 # the document uri is extracted once here and passed through; the feature code
 # resolves the buffer, pivots the cursor, and replies. `which` selects the
 # feature: 0 hover, 1 definition, 2 references, 3 rename, 4 prepareRename,
 # 5 documentSymbol, 6 completion. an unknown / unopened uri still gets a
-# null / empty reply from the feature so the client is never left waiting.
+# null / empty reply from the feature so the client is never left waiting
 fun handle_feature(srv: *Server, body: str, which: i64) {
     val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
 
@@ -355,7 +355,7 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
     # governing project lazily on first use; a type-aware feature additionally
     # sema's the closure lazily (ensure_sema). snapshot both the load epoch and the
     # sema epoch so a load (#96) or a first sema (#113) triggered here re-publishes
-    # the now-loaded / now-typed buffers' diagnostics.
+    # the now-loaded / now-typed buffers' diagnostics
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
@@ -372,15 +372,15 @@ fun handle_feature(srv: *Server, body: str, which: i64) {
     if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_loaded(srv); }
 }
 
-# republish_loaded: re-publish diagnostics for every open document now governed
+# re-publish diagnostics for every open document now governed
 # by a loaded project root. run after a feature request triggers a lazy load (#96)
 # or the first whole-closure sema (#113): the buffers under the freshly-loaded root
 # were published parse-only on open, so a load upgrades them to dep-aware
-# resolution diagnostics — including any out-of-closure import the load now flags —
+# resolution diagnostics - including any out-of-closure import the load now flags -
 # and a completed sema further layers their type diagnostics, all without the user
 # touching the file. the publish path is load-free, so a buffer under no loaded
 # root simply re-publishes its parse-only diagnostics (unchanged), and nothing new
-# is built.
+# is built
 fun republish_loaded(srv: *Server) {
     val n: usize = documents.slot_count(?srv.docs);
     var i: usize = 0;
@@ -393,8 +393,8 @@ fun republish_loaded(srv: *Server) {
     }
 }
 
-# publish_for: register/update `uri`'s buffer and publish its diagnostics.
-# `is_open` selects open vs change registration; both end in a publish.
+# register/update `uri`'s buffer and publish its diagnostics.
+# `is_open` selects open vs change registration; both end in a publish
 fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
     var dr: Result[*documents.Document, str];
     if (is_open) { dr = documents.open(?srv.docs, uri, text); }
@@ -410,8 +410,8 @@ fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
     diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
 }
 
-# reply_error: send a JSON-RPC error response for a request that carries an id;
-# a no-op for a notification (no id).
+# send a JSON-RPC error response for a request that carries an id;
+# a no-op for a notification (no id)
 fun reply_error(srv: *Server, body: str, code: i64, message: str) {
     val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
     if (id == nil) { ret; }
@@ -430,13 +430,13 @@ fun reply_error(srv: *Server, body: str, code: i64, message: str) {
     json.free_str(id, srv.alloc);
 }
 
-# send_concat2: frame and send `a + b + c`.
+# frame and send `a + b + c`
 fun send_concat2(srv: *Server, a: str, b: str, c: str) {
     send_concat(srv, a, b, c, nil, nil, nil, nil);
 }
 
-# send_concat: frame and send the concatenation of up to seven fragments,
-# skipping nil fragments.
+# frame and send the concatenation of up to seven fragments,
+# skipping nil fragments
 fun send_concat(srv: *Server, a: str, b: str, c: str, d: str, e: str, f: str, g: str) {
     val total: usize = flen(a) + flen(b) + flen(c) + flen(d) + flen(e) + flen(f) + flen(g);
     val r: Result[*u8, str] = allocate[u8](srv.alloc, total + 1);
@@ -457,13 +457,13 @@ fun send_concat(srv: *Server, a: str, b: str, c: str, d: str, e: str, f: str, g:
     deallocate[u8](srv.alloc, buf, total + 1);
 }
 
-# flen: length of `s`, treating nil as 0.
+# length of `s`, treating nil as 0
 fun flen(s: str) usize {
     if (s == nil) { ret 0; }
     ret str_len(s);
 }
 
-# fappend: copy `s` into `buf` at `offset`, returning the new offset.
+# copy `s` into `buf` at `offset`, returning the new offset
 fun fappend(buf: *u8, offset: usize, s: str) usize {
     if (s == nil) { ret offset; }
     val n: usize = str_len(s);

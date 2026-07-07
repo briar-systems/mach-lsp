@@ -1,4 +1,4 @@
-# mls.documents: the open-document registry bridging LSP URIs to editor buffers.
+# the open-document registry bridging LSP URIs to editor buffers
 #
 # the LSP identifies documents by URI; the editor surface identifies buffers by
 # `source.FileId`. this module owns that mapping. `didOpen` registers a URI's
@@ -6,7 +6,7 @@
 # replaces the buffer text in place; `didClose` retires the entry. each entry
 # keeps its own owned URI copy so it survives the request that created it.
 #
-# the editor session is borrowed from the server and reused across documents —
+# the editor session is borrowed from the server and reused across documents -
 # it owns the per-buffer analysis and the underlying session owns the source
 # text, so this registry stores only the URI/FileId association.
 
@@ -33,7 +33,7 @@ use strutil: std.text.string;
 use src:    mach.lang.source;
 use editor: mach.lang.editor;
 
-# Document: one tracked open document.
+# one tracked open document
 # ---
 # uri:     owned document URI
 # file_id: editor FileId the buffer is registered under
@@ -44,7 +44,7 @@ pub rec Document {
     in_use:  bool;
 }
 
-# Store: the registry of tracked documents over a borrowed editor session.
+# the registry of tracked documents over a borrowed editor session
 # ---
 # es:    borrowed editor session that owns buffer analysis
 # alloc: allocator for the entry array and owned URIs
@@ -57,7 +57,7 @@ pub rec Store {
     len:   usize;
 }
 
-# init: construct an empty document store over an editor session.
+# construct an empty document store over an editor session
 # ---
 # es:    editor session the store registers buffers with
 # alloc: allocator for the store's own storage
@@ -71,8 +71,8 @@ pub fun init(es: *editor.EditorSession, alloc: *Allocator) Store {
     ret st;
 }
 
-# dnit: release every owned URI and the entry array. the borrowed editor
-# session is left untouched.
+# release every owned URI and the entry array. the borrowed editor
+# session is left untouched
 # ---
 # st: the store to tear down; all owned fields are zeroed
 pub fun dnit(st: *Store) {
@@ -89,8 +89,8 @@ pub fun dnit(st: *Store) {
     st.len = 0;
 }
 
-# open: register a document's text as an editor buffer, returning its entry.
-# a re-open of an already-tracked URI replaces the buffer text in place.
+# register a document's text as an editor buffer, returning its entry.
+# a re-open of an already-tracked URI replaces the buffer text in place
 # ---
 # st:   the store
 # uri:  document URI
@@ -120,7 +120,7 @@ pub fun open(st: *Store, uri: str, text: str) Result[*Document, str] {
     ret ok[*Document, str](d);
 }
 
-# change: replace the text of an already-open document.
+# replace the text of an already-open document
 # ---
 # st:   the store
 # uri:  document URI; must already be open
@@ -134,9 +134,9 @@ pub fun change(st: *Store, uri: str, text: str) Result[*Document, str] {
     ret ok[*Document, str](d);
 }
 
-# close: retire a tracked document, freeing its URI. the editor buffer's
+# retire a tracked document, freeing its URI. the editor buffer's
 # cached analysis is dropped on the next reuse of its FileId. a no-op for an
-# untracked URI.
+# untracked URI
 # ---
 # st:  the store
 # uri: document URI to close
@@ -148,9 +148,9 @@ pub fun close(st: *Store, uri: str) {
     d.in_use = false;
 }
 
-# slot_count: the number of Document slots in the store. paired with `at` to
-# walk every live document — the re-publish-after-load sweep iterates
-# [0, slot_count) and skips slots whose `in_use` is false.
+# the number of Document slots in the store. paired with `at` to
+# walk every live document - the re-publish-after-load sweep iterates
+# [0, slot_count) and skips slots whose `in_use` is false
 # ---
 # st:  the store
 # ret: the slot-array length
@@ -158,9 +158,9 @@ pub fun slot_count(st: *Store) usize {
     ret st.len;
 }
 
-# at: the Document in slot `idx`, or nil when out of range. the slot may be
-# retired (`in_use` false) — callers check that. for the open-document sweep
-# that re-publishes diagnostics once a project finishes loading.
+# the Document in slot `idx`, or nil when out of range. the slot may be
+# retired (`in_use` false) - callers check that. for the open-document sweep
+# that re-publishes diagnostics once a project finishes loading
 # ---
 # st:  the store
 # idx: slot index in [0, slot_count)
@@ -170,7 +170,7 @@ pub fun at(st: *Store, idx: usize) *Document {
     ret ?st.docs[idx];
 }
 
-# find: the tracked Document for `uri`, or nil when not open.
+# the tracked Document for `uri`, or nil when not open
 # ---
 # st:  the store
 # uri: document URI to look up
@@ -186,7 +186,7 @@ pub fun find(st: *Store, uri: str) *Document {
     ret nil;
 }
 
-# ensure_slot: return a free Document slot, growing the array if needed.
+# return a free Document slot, growing the array if needed
 fun ensure_slot(st: *Store) Result[*Document, str] {
     var i: usize = 0;
     for (i < st.len) {

@@ -1,4 +1,4 @@
-# mls.trace: append-only file trace log for debugging the server over stdio.
+# append-only file trace log for debugging the server over stdio
 #
 # the LSP speaks JSON-RPC on stdout, so diagnostics about the server's own
 # behaviour cannot go there. every notable event is appended to a fixed log
@@ -18,27 +18,27 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 
-use os: std.system.os;
+use os:  std.system.os;
 use env: std.process.env;
 
-# LOG_PATH: fixed file the trace log is appended to.
+# fixed file the trace log is appended to
 val LOG_PATH: str = "/tmp/mach-lsp.log";
 
-# TRACE_VAR: environment variable that enables tracing when set.
+# environment variable that enables tracing when set
 val TRACE_VAR: str = "MLS_TRACE";
 
-# LOG_CHECKED: whether the MLS_TRACE gate has been evaluated yet.
+# whether the MLS_TRACE gate has been evaluated yet
 var LOG_CHECKED: bool = false;
 
-# LOG_ENABLED: cached MLS_TRACE gate; writes happen only when true.
+# cached MLS_TRACE gate; writes happen only when true
 var LOG_ENABLED: bool = false;
 
-# LOG_FD: trace log descriptor, opened lazily once tracing is enabled. -1
+# trace log descriptor, opened lazily once tracing is enabled. -1
 # until opened, and left at -1 when the open fails so logging stays a silent
-# no-op (best-effort).
+# no-op (best-effort)
 var LOG_FD: i64 = -1;
 
-# trace_enabled: report whether the MLS_TRACE variable is set.
+# report whether the MLS_TRACE variable is set
 # ---
 # ret: true when MLS_TRACE is present in the environment
 fun trace_enabled() bool {
@@ -46,7 +46,7 @@ fun trace_enabled() bool {
     ret env.get(TRACE_VAR, ?buf[0], 1) >= 0;
 }
 
-# trace_open: open the trace log for appending.
+# open the trace log for appending
 # ---
 # ret: a live descriptor, or a negative value on failure
 fun trace_open() i64 {
@@ -54,7 +54,7 @@ fun trace_open() i64 {
     ret os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
 }
 
-# log: append a message to the trace log, best-effort.
+# append a message to the trace log, best-effort
 #
 # the MLS_TRACE gate and log descriptor are resolved on the first call and
 # reused thereafter; when tracing is disabled this returns with no syscalls.

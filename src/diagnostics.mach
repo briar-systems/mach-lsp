@@ -1,10 +1,10 @@
-# mls.diagnostics: run the editor diagnostics slice and publish LSP diagnostics.
+# run the editor diagnostics slice and publish LSP diagnostics
 #
 # the diagnostics vertical slice end-to-end: feed a document's buffer to the
 # editor surface (`editor.diagnostics`), translate every reported
-# `diagnostic.Diagnostic` into an LSP `Diagnostic` — mapping its byte `span`
+# `diagnostic.Diagnostic` into an LSP `Diagnostic` - mapping its byte `span`
 # through `positions.range_of` to a 0-based UTF-16 range and its severity
-# to the LSP scale — and emit a `textDocument/publishDiagnostics` notification.
+# to the LSP scale - and emit a `textDocument/publishDiagnostics` notification.
 # clearing is the same notification with an empty array.
 
 use std.types.bool.bool;
@@ -33,36 +33,36 @@ use json:      mls.json;
 use positions: mls.positions;
 use project:   mls.project;
 
-# LSP diagnostic severities (1 = Error … 4 = Hint).
+# LSP diagnostic severities (1 = Error ... 4 = Hint)
 val LSP_ERROR:   i64 = 1;
 val LSP_WARNING: i64 = 2;
 val LSP_INFO:    i64 = 3;
 val LSP_HINT:    i64 = 4;
 
-# MAX_DIAGNOSTICS: cap on diagnostics published per document, to bound message size.
+# cap on diagnostics published per document, to bound message size
 val MAX_DIAGNOSTICS: usize = 200;
 
-# publish: analyze `uri`'s buffer and send its current diagnostics. a document
+# analyze `uri`'s buffer and send its current diagnostics. a document
 # governed by an already-loaded project root is analyzed dep-aware
-# (`project.diagnose_doc`) so its name-resolution diagnostics — including an
-# import of a module outside the project's dep closure — are surfaced, keeping
+# (`project.diagnose_doc`) so its name-resolution diagnostics - including an
+# import of a module outside the project's dep closure - are surfaced, keeping
 # the published diagnostics consistent with what go-to-definition can resolve
 # (#78). a document under no loaded project resolves single-file
 # (`editor.diagnostics`, parse-only), so its cross-module `use`s are not flagged
 # against an empty dep set. the governing-root lookup is load-free
 # (`root_for_loaded`): publishing must never trigger a project build, so opening
-# or editing a buffer stays instant — the project loads lazily on the first
+# or editing a buffer stays instant - the project loads lazily on the first
 # feature request, after which the server re-publishes the now-loaded buffers
 # (#96).
-# semantic (type) diagnostics are layered on when — and only when — the governing
+# semantic (type) diagnostics are layered on when - and only when - the governing
 # root's dep closure has already been sema'd (`project.sema_ready`, a load-free
 # check that never triggers a build or the heavy whole-closure `ensure_sema`).
 # `sema_doc` then types the active buffer against the closure's retained dep typing
-# (bounded — one module) and emits its type diagnostics onto the same session
+# (bounded - one module) and emits its type diagnostics onto the same session
 # DiagList `diagnose_doc` populated, so parse + resolve + type diagnostics publish
 # together. a loaded-but-un-sema'd root publishes parse + resolve only (instant);
 # the server re-publishes with types once a feature request sema's the closure (the
-# sema epoch) (#113).
+# sema epoch) (#113)
 # ---
 # w:       the workspace, for routing the document to its governing root
 # es:      editor session holding the buffer
@@ -83,7 +83,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
 
     # append the buffer's type diagnostics when the closure is already sema'd. the
     # gate is load-free (never `ensure_sema`), so this stays off the build/whole-
-    # closure path — `sema_doc`'s internal `ensure_sema` is a no-op on a ready root.
+    # closure path - `sema_doc`'s internal `ensure_sema` is a no-op on a ready root.
     # the type diagnostics land on the same session DiagList `list` points into;
     # `sema_doc`'s returned typing is the feature layer's, discarded here.
     if (project.sema_ready(root)) { project.sema_doc(w, root, fid); }
@@ -153,7 +153,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
     json.free_str(quoted_uri, alloc);
 }
 
-# clear: publish an empty diagnostics array for `uri` (e.g. on close).
+# publish an empty diagnostics array for `uri` (e.g. on close)
 # ---
 # alloc: allocator for the message buffer
 # uri:   document URI to clear
@@ -183,18 +183,18 @@ pub fun clear(alloc: *Allocator, uri: str) {
     json.free_str(quoted_uri, alloc);
 }
 
-# build_entry: render one diagnostic as an LSP Diagnostic JSON object, resolving
-# its span to a 0-based range against the source map.
+# render one diagnostic as an LSP Diagnostic JSON object, resolving
+# its span to a 0-based range against the source map
 fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) str {
     var start_line: usize = 0;
     var start_char: usize = 0;
     var end_line: usize = 0;
     var end_char: usize = 0;
 
-    val so: Option[*src.SourceFile] = src.get(sources, d.file_id);
+    val so: Option[*src.SourceFile] = src.get(sources, d.loc.file_id);
     if (is_some[*src.SourceFile](so)) {
         val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
-        val r: positions.LspRange = positions.range_of(sf, d.span);
+        val r: positions.LspRange = positions.range_of(sf, d.loc.span);
         start_line = r.start_line;
         start_char = r.start_char;
         end_line = r.end_line;
@@ -205,7 +205,7 @@ fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator)
     ret build_diagnostic_json(start_line, start_char, end_line, end_char, severity, d.message, alloc);
 }
 
-# map_severity: translate a compiler Severity to the LSP severity scale.
+# translate a compiler Severity to the LSP severity scale
 fun map_severity(sev: diag.Severity) i64 {
     if (sev == diag.SEVERITY_ERROR)   { ret LSP_ERROR; }
     if (sev == diag.SEVERITY_WARNING) { ret LSP_WARNING; }
@@ -213,8 +213,8 @@ fun map_severity(sev: diag.Severity) i64 {
     ret LSP_HINT;
 }
 
-# build_diagnostic_json: assemble one `{ range, severity, source, message }`
-# object from its parts.
+# assemble one `{ range, severity, source, message }`
+# object from its parts
 fun build_diagnostic_json(
     start_line: usize, start_char: usize,
     end_line: usize, end_char: usize,
@@ -265,13 +265,13 @@ fun build_diagnostic_json(
     ret buf::str;
 }
 
-# slen: length of `s`, treating nil as 0.
+# length of `s`, treating nil as 0
 fun slen(s: str) usize {
     if (s == nil) { ret 0; }
     ret str_len(s);
 }
 
-# append: copy `s` into `buf` at `offset`, returning the new offset.
+# copy `s` into `buf` at `offset`, returning the new offset
 fun append(buf: *u8, offset: usize, s: str) usize {
     if (s == nil) { ret offset; }
     val n: usize = str_len(s);
@@ -279,7 +279,7 @@ fun append(buf: *u8, offset: usize, s: str) usize {
     ret offset + n;
 }
 
-# free_entries: free an array of owned diagnostic JSON strings and the array.
+# free an array of owned diagnostic JSON strings and the array
 fun free_entries(entries: *str, count: usize, alloc: *Allocator) {
     if (entries == nil) { ret; }
     var i: usize = 0;
@@ -290,7 +290,7 @@ fun free_entries(entries: *str, count: usize, alloc: *Allocator) {
     deallocate[str](alloc, entries, count);
 }
 
-# free_parts: free the six fragment strings of one diagnostic object.
+# free the six fragment strings of one diagnostic object
 fun free_parts(sl: str, sc: str, el: str, ec: str, sev: str, qmsg: str, alloc: *Allocator) {
     json.free_str(sl, alloc);
     json.free_str(sc, alloc);

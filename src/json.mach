@@ -1,4 +1,4 @@
-# mls.json: minimal JSON extraction and construction for LSP messages.
+# minimal JSON extraction and construction for LSP messages
 #
 # the server never builds a full JSON tree: requests are small, flat objects
 # and the fields it needs (method, id, uri, text, version, position) are read
@@ -27,8 +27,8 @@ use std.allocator.deallocate;
 
 use mem: std.memory;
 
-# extract_string: read the string value of `key` in `data`, decoding JSON
-# escapes. returns owned text, or nil when the key is absent or not a string.
+# read the string value of `key` in `data`, decoding JSON
+# escapes. returns owned text, or nil when the key is absent or not a string
 # ---
 # data:  JSON text to scan
 # key:   quoted key to find, e.g. `"method"`
@@ -91,8 +91,8 @@ pub fun extract_string(data: str, key: str, alloc: *Allocator) str {
     ret buf::str;
 }
 
-# extract_raw: read the raw token of `key` (a quoted string copied verbatim, or
-# a bare number / literal). returns owned text, or nil on miss.
+# read the raw token of `key` (a quoted string copied verbatim, or
+# a bare number / literal). returns owned text, or nil on miss
 # ---
 # data:  JSON text to scan
 # key:   quoted key to find
@@ -135,7 +135,7 @@ pub fun extract_raw(data: str, key: str, alloc: *Allocator) str {
     ret copy_range(data, start, pos, alloc);
 }
 
-# extract_number_i64: read the integer value of `key`, or 0 when absent.
+# read the integer value of `key`, or 0 when absent
 # ---
 # data:  JSON text to scan
 # key:   quoted key to find
@@ -149,10 +149,10 @@ pub fun extract_number_i64(data: str, key: str, alloc: *Allocator) i64 {
     ret result;
 }
 
-# seek_after: the tail of `data` starting just past the first occurrence of
+# the tail of `data` starting just past the first occurrence of
 # `anchor` as an object key, or nil when the anchor is absent or ends the text.
 # the shared prologue of the *_after accessors; the returned pointer borrows
-# `data`.
+# `data`
 fun seek_after(data: str, anchor: str) str {
     val idx: isize = find_key(data, anchor);
     if (idx < 0) { ret nil; }
@@ -161,8 +161,8 @@ fun seek_after(data: str, anchor: str) str {
     ret (data::usize + offset)::str;
 }
 
-# extract_after: read string `key` that appears after the first occurrence of
-# `anchor` (scopes a key lookup to a nested object whose opening key is known).
+# read string `key` that appears after the first occurrence of
+# `anchor` (scopes a key lookup to a nested object whose opening key is known)
 # ---
 # data:   JSON text to scan
 # anchor: quoted key marking where to start scanning
@@ -175,7 +175,7 @@ pub fun extract_after(data: str, anchor: str, key: str, alloc: *Allocator) str {
     ret extract_string(sub, key, alloc);
 }
 
-# extract_number_after: read integer `key` after `anchor`, or 0 on miss.
+# read integer `key` after `anchor`, or 0 on miss
 # ---
 # data:   JSON text to scan
 # anchor: quoted key marking where to start scanning
@@ -188,10 +188,10 @@ pub fun extract_number_after(data: str, anchor: str, key: str, alloc: *Allocator
     ret extract_number_i64(sub, key, alloc);
 }
 
-# extract_string_seq: decode the string value of the `index`-th occurrence of
+# decode the string value of the `index`-th occurrence of
 # `key` in `data` (0-based), or nil when there are fewer than index+1
-# occurrences. lets a caller iterate a repeated key — e.g. every `"uri"` in a
-# `workspace/didChangeWatchedFiles` changes array — by bumping `index` until nil.
+# occurrences. lets a caller iterate a repeated key - e.g. every `"uri"` in a
+# `workspace/didChangeWatchedFiles` changes array - by bumping `index` until nil
 # ---
 # data:  JSON text to scan
 # key:   quoted key to find, e.g. `"uri"`
@@ -209,13 +209,13 @@ pub fun extract_string_seq(data: str, key: str, index: u32, alloc: *Allocator) s
     ret extract_string(sub, key, alloc);
 }
 
-# extract_bool_after: whether the boolean `key` inside the object value of
+# whether the boolean `key` inside the object value of
 # `anchor` is the literal `true`. the scan is scoped to the anchor's balanced
-# object, so an equally-named key in a later sibling object is never misread —
+# object, so an equally-named key in a later sibling object is never misread -
 # e.g. another capability's `dynamicRegistration` after an empty
 # `"didChangeWatchedFiles":{}`. false when the anchor is absent, its value is
 # not an object, or the key is absent / non-true, so a missing capability reads
-# as unsupported.
+# as unsupported
 # ---
 # data:   JSON text to scan
 # anchor: quoted key whose object value scopes the lookup
@@ -245,8 +245,8 @@ pub fun extract_bool_after(data: str, anchor: str, key: str, alloc: *Allocator) 
     ret is_true;
 }
 
-# object_end: the index one past the matching `}` of the `{` at `start`,
-# skipping string contents, or 0 when the object is unbalanced.
+# the index one past the matching `}` of the `{` at `start`,
+# skipping string contents, or 0 when the object is unbalanced
 fun object_end(data: str, start: usize) usize {
     val n: usize = str_len(data);
     var depth: usize = 0;
@@ -274,8 +274,8 @@ fun object_end(data: str, start: usize) usize {
     ret 0;
 }
 
-# quote: JSON-encode `s` as a quoted, escaped string literal (including the
-# surrounding quotes). returns owned text, or nil on allocation failure.
+# JSON-encode `s` as a quoted, escaped string literal (including the
+# surrounding quotes). returns owned text, or nil on allocation failure
 # ---
 # s:     raw text to encode
 # alloc: allocator backing the returned string
@@ -322,7 +322,7 @@ pub fun quote(s: str, alloc: *Allocator) str {
     ret buf::str;
 }
 
-# format_usize: render `value` in base 10. returns owned text, or nil on failure.
+# render `value` in base 10. returns owned text, or nil on failure
 # ---
 # value: number to render
 # alloc: allocator backing the returned string
@@ -348,7 +348,7 @@ pub fun format_usize(value: usize, alloc: *Allocator) str {
     ret buf::str;
 }
 
-# format_i64: render `value` in base 10 with a leading sign for negatives.
+# render `value` in base 10 with a leading sign for negatives
 # ---
 # value: number to render
 # alloc: allocator backing the returned string
@@ -377,7 +377,7 @@ pub fun format_i64(value: i64, alloc: *Allocator) str {
     ret buf::str;
 }
 
-# free_str: release a string returned by this module.
+# release a string returned by this module
 # ---
 # s:     string to free; nil is a no-op
 # alloc: allocator the string was allocated from
@@ -387,8 +387,8 @@ pub fun free_str(s: str, alloc: *Allocator) {
     deallocate[u8](alloc, s::*u8, len + 1);
 }
 
-# find_key: byte offset of the opening quote of `key` as an object key in
-# `data` (a `"key"` token outside any string value), or -1 when absent.
+# byte offset of the opening quote of `key` as an object key in
+# `data` (a `"key"` token outside any string value), or -1 when absent
 fun find_key(data: str, key: str) isize {
     val key_len: usize = str_len(key);
     val data_len: usize = str_len(data);
@@ -411,7 +411,7 @@ fun find_key(data: str, key: str) isize {
     ret -1;
 }
 
-# is_escaped: whether the byte at `index` is preceded by an odd run of backslashes.
+# whether the byte at `index` is preceded by an odd run of backslashes
 fun is_escaped(data: str, index: usize) bool {
     if (index == 0) { ret false; }
     var back: usize = index - 1;
@@ -425,7 +425,7 @@ fun is_escaped(data: str, index: usize) bool {
     ret (count & 1) == 1;
 }
 
-# match_at: whether `pattern` occurs verbatim at `offset` in `data`.
+# whether `pattern` occurs verbatim at `offset` in `data`
 fun match_at(data: str, offset: usize, pattern: str) bool {
     val pattern_len: usize = str_len(pattern);
     val data_len: usize = str_len(data);
@@ -438,7 +438,7 @@ fun match_at(data: str, offset: usize, pattern: str) bool {
     ret true;
 }
 
-# skip_ws: advance past JSON whitespace starting at `pos`.
+# advance past JSON whitespace starting at `pos`
 fun skip_ws(data: str, pos: usize) usize {
     val data_len: usize = str_len(data);
     var p: usize = pos;
@@ -450,7 +450,7 @@ fun skip_ws(data: str, pos: usize) usize {
     ret p;
 }
 
-# parse_i64: parse a leading optionally-signed decimal integer from `s`.
+# parse a leading optionally-signed decimal integer from `s`
 fun parse_i64(s: str) i64 {
     if (s == nil) { ret 0; }
     val s_len: usize = str_len(s);
@@ -469,7 +469,7 @@ fun parse_i64(s: str) i64 {
     ret result;
 }
 
-# copy_range: owned copy of `data[start..end)`, nil-terminated.
+# owned copy of `data[start..end)`, nil-terminated
 fun copy_range(data: str, start: usize, end: usize, alloc: *Allocator) str {
     val len: usize = end - start;
     if (len == 0) { ret nil; }

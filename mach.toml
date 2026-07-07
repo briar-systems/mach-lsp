@@ -1,23 +1,40 @@
 [project]
-id      = "mls"
-name    = "Mach Language Server"
-version = "0.8.3"
-src     = "src"
-dep     = "dep"
-target  = "native"
-out     = "out/{target}/{profile}/bin/{name}{ext}"
-obj     = "out/{target}/{profile}/obj"
-ir      = "out/{target}/{profile}/ir"
-asm     = "out/{target}/{profile}/asm"
-tests   = "out/{target}/{profile}/test/{name}"
+id = "mls"
+name = "Mach Language Server"
+description = "Mach Language Server"
+version = "0.9.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
 
-[target.linux]
+[target.linux-x86_64]
 isa = "x86_64"
 os  = "linux"
 abi = "sysv64"
 
-[bin.mls]
-entry = "main.mach"
+[target.linux-arm64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
+
+[target.linux-riscv64]
+isa = "riscv64"
+os  = "linux"
+abi = "lp64"
+
+[target.windows-x86_64]
+isa  = "x86_64"
+os   = "windows"
+abi  = "win64"
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os  = "darwin"
+abi = "sysv64"
+
+[target.darwin-aarch64]
+isa = "aarch64"
+os  = "darwin"
+abi = "aapcs64"
 
 [profile.debug]
 opt = 0
@@ -25,10 +42,16 @@ opt = 0
 [profile.release]
 opt = 2
 
-[deps.mach-std]
+[artifact.mls]
+kind = "bin"
+entry = "main.mach"
+out = "bin/mls"
+targets = ["*"]
+
+[dep.mach-std]
 git = "https://github.com/briar-systems/mach-std"
 ref = "branch/main"
 
-[deps.mach]
+[dep.mach]
 git = "https://github.com/briar-systems/mach"
 ref = "branch/main"

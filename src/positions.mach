@@ -1,9 +1,9 @@
-# mls.positions: byte-offset <-> LSP position conversions and span helpers.
+# byte-offset <-> LSP position conversions and span helpers
 #
 # the LSP addresses text by 0-based (line, character); the compiler addresses
 # it by byte offset (and reports 1-based line/col via `source.position`). the
-# language features pivot on byte offset — `ast.offset_to_*` takes an offset
-# and the resolve side tables index by node id — so every request first maps
+# language features pivot on byte offset - `ast.offset_to_*` takes an offset
+# and the resolve side tables index by node id - so every request first maps
 # the incoming LSP position to an offset, and every response maps a `token.Span`
 # back to an LSP range. these helpers are the single conversion point.
 #
@@ -36,7 +36,7 @@ use mem: std.memory;
 use src:   mach.lang.source;
 use token: mach.lang.fe.token;
 
-# LspRange: a 0-based LSP range, the form a `Location` / hover range needs.
+# a 0-based LSP range, the form a `Location` / hover range needs
 # ---
 # start_line: 0-based start line
 # start_char: 0-based start character (UTF-16 code-unit column)
@@ -49,9 +49,9 @@ pub rec LspRange {
     end_char:   usize;
 }
 
-# offset_at: the byte offset of a 0-based LSP (line, character) in `file`, or
+# the byte offset of a 0-based LSP (line, character) in `file`, or
 # none when the line is out of range. the UTF-16 character column is resolved
-# to a byte offset by walking the line's UTF-8, clamped to the line's end.
+# to a byte offset by walking the line's UTF-8, clamped to the line's end
 # ---
 # file: the source file the position addresses
 # line: 0-based LSP line
@@ -68,9 +68,9 @@ pub fun offset_at(file: *src.SourceFile, line: usize, ch: usize) Option[usize] {
     ret some[usize](u16_col_to_byte(file, ls_off, le_off, ch));
 }
 
-# range_of: the LSP range covering a byte span in `file`. a zero-length span
+# the LSP range covering a byte span in `file`. a zero-length span
 # yields an empty range at its offset. columns are reported as UTF-16 code-unit
-# offsets within their line.
+# offsets within their line
 # ---
 # file: the source file the span addresses
 # span: the byte range to convert
@@ -90,9 +90,9 @@ pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
     ret r;
 }
 
-# span_text: an owned copy of the source text a span covers, nil-terminated, or
+# an owned copy of the source text a span covers, nil-terminated, or
 # nil on an empty span / allocation failure. used to render the spelling of a
-# decl name or type as written.
+# decl name or type as written
 # ---
 # file:  the source file the span addresses
 # span:  the byte range to copy
@@ -113,8 +113,8 @@ pub fun span_text(file: *src.SourceFile, span: token.Span, alloc: *Allocator) st
     ret buf::str;
 }
 
-# u16_col: the 0-based UTF-16 code-unit column of a byte `offset` on its
-# 1-based `line`, measured by walking the line prefix's UTF-8.
+# the 0-based UTF-16 code-unit column of a byte `offset` on its
+# 1-based `line`, measured by walking the line prefix's UTF-8
 # ---
 # file:   the source file the offset addresses
 # line:   1-based line the offset falls on (as `source.position` reports)
@@ -131,9 +131,9 @@ fun u16_col(file: *src.SourceFile, line: usize, offset: usize) usize {
     ret units;
 }
 
-# u16_col_to_byte: the byte offset of a 0-based UTF-16 code-unit column on the
+# the byte offset of a 0-based UTF-16 code-unit column on the
 # line spanning [start, end), or `end` when the column runs past the line. a
-# column landing inside a codepoint snaps to that codepoint's start.
+# column landing inside a codepoint snaps to that codepoint's start
 # ---
 # file:  the source file
 # start: byte offset of the line's first byte
@@ -153,8 +153,8 @@ fun u16_col_to_byte(file: *src.SourceFile, start: usize, end: usize, col: usize)
     ret o;
 }
 
-# u8_seq_len: the byte length of the UTF-8 sequence led by `b`; a stray
-# continuation byte counts as 1 so malformed input still advances.
+# the byte length of the UTF-8 sequence led by `b`; a stray
+# continuation byte counts as 1 so malformed input still advances
 fun u8_seq_len(b: u8) usize {
     if (b < 0xC0) { ret 1; }
     if (b < 0xE0) { ret 2; }
@@ -162,14 +162,14 @@ fun u8_seq_len(b: u8) usize {
     ret 4;
 }
 
-# u16_units: the UTF-16 code units the codepoint led by `b` encodes to — 2 for a
-# 4-byte sequence (a surrogate pair), 1 otherwise.
+# the UTF-16 code units the codepoint led by `b` encodes to - 2 for a
+# 4-byte sequence (a surrogate pair), 1 otherwise
 fun u16_units(b: u8) usize {
     if (b >= 0xF0) { ret 2; }
     ret 1;
 }
 
-# dec: clamp `n - 1` at 0 (1-based compiler position -> 0-based LSP position).
+# clamp `n - 1` at 0 (1-based compiler position -> 0-based LSP position)
 fun dec(n: usize) usize {
     if (n == 0) { ret 0; }
     ret n - 1;

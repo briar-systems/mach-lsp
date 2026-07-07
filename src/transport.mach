@@ -1,9 +1,9 @@
-# mls.transport: LSP base-protocol framing over stdin/stdout.
+# LSP base-protocol framing over stdin/stdout
 #
 # every message is a set of `Header: value\r\n` lines, a blank line, then a
 # body of exactly `Content-Length` bytes. this module reads one framed message
 # at a time from stdin and writes one framed message to stdout. it owns no
-# protocol semantics — the body is opaque JSON the server layer interprets.
+# protocol semantics - the body is opaque JSON the server layer interprets.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -25,8 +25,8 @@ use mem: std.memory;
 
 use trace: mls.trace;
 
-# Message: one received LSP message. `body` is the owned, nil-terminated JSON
-# payload of length `body_len`; free it with `message_free`.
+# one received LSP message. `body` is the owned, nil-terminated JSON
+# payload of length `body_len`; free it with `message_free`
 # ---
 # body:     owned nil-terminated JSON body
 # body_len: length of the body in bytes (excluding the terminator)
@@ -35,16 +35,16 @@ pub rec Message {
     body_len: usize;
 }
 
-# HEADER_PREFIX: the only response header the server emits.
+# the only response header the server emits
 val HEADER_PREFIX: str = "Content-Length: ";
-# CRLF_CRLF: the header/body separator.
+# the header/body separator
 val CRLF_CRLF: str = "\r\n\r\n";
-# HEADER_BUF_INITIAL: starting capacity for the header accumulation buffer.
+# starting capacity for the header accumulation buffer
 val HEADER_BUF_INITIAL: usize = 256;
-# CL_KEY: lowercased Content-Length header name for case-insensitive matching.
+# lowercased Content-Length header name for case-insensitive matching
 val CL_KEY: str = "content-length";
 
-# message_free: release a message's owned body.
+# release a message's owned body
 # ---
 # msg:   message whose body is freed and zeroed
 # alloc: allocator the body was read with
@@ -56,7 +56,7 @@ pub fun message_free(msg: *Message, alloc: *Allocator) {
     msg.body_len = 0;
 }
 
-# read_message: read one framed message from stdin into `msg`.
+# read one framed message from stdin into `msg`
 # ---
 # msg:   message to populate; its body is owned by `alloc` on success
 # alloc: allocator for the header scratch buffer and the body
@@ -128,7 +128,7 @@ pub fun read_message(msg: *Message, alloc: *Allocator) bool {
     ret true;
 }
 
-# send_message: write `body` as one framed message to stdout.
+# write `body` as one framed message to stdout
 # ---
 # body:  nil-terminated JSON body to send; nil / empty is a no-op
 # alloc: allocator for the send buffer
@@ -166,7 +166,7 @@ pub fun send_message(body: str, alloc: *Allocator) {
     deallocate[u8](alloc, buf, total);
 }
 
-# write_all: write exactly `len` bytes of `buf` to stdout, retrying short writes.
+# write exactly `len` bytes of `buf` to stdout, retrying short writes
 fun write_all(buf: *u8, len: usize) {
     var off: usize = 0;
     for (off < len) {
@@ -176,8 +176,8 @@ fun write_all(buf: *u8, len: usize) {
     }
 }
 
-# parse_content_length: scan accumulated header bytes for a Content-Length value
-# (case-insensitive key), or -1 when absent / unparseable.
+# scan accumulated header bytes for a Content-Length value
+# (case-insensitive key), or -1 when absent / unparseable
 fun parse_content_length(hdr: *u8, hdr_len: usize) i64 {
     val cl_len: usize = str_len(CL_KEY);
     var line_start: usize = 0;
@@ -236,8 +236,8 @@ fun parse_content_length(hdr: *u8, hdr_len: usize) i64 {
     ret -1;
 }
 
-# usize_to_buf: write `value` in base 10 right-aligned into the tail of `buf`,
-# returning the number of digits written.
+# write `value` in base 10 right-aligned into the tail of `buf`,
+# returning the number of digits written
 fun usize_to_buf(buf: *u8, buf_cap: usize, value: usize) usize {
     if (value == 0) {
         buf[buf_cap - 1] = '0';
