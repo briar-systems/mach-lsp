@@ -97,6 +97,7 @@ use std.allocator.reallocate;
 
 use strutil: std.text.string;
 use fs:      std.filesystem;
+use chrono:  std.chrono.time;
 use pathlib: std.types.path;
 use toml:    std.data.toml;
 
@@ -116,6 +117,7 @@ use sema:     mach.lang.fe.sema;
 use type:     mach.lang.type;
 use comptime: mach.lang.fe.comptime;
 use driver:   mach.lang.driver;
+use outcome:  mach.lang.build.outcome;
 use tgt:      mach.lang.target;
 
 use transport: mls.transport;
@@ -433,7 +435,7 @@ fun resolve_fresh(w: *Workspace, root: *Root, fid: src.FileId, a: *ast.Ast) Resu
     var ctx: comptime.ComptimeCtx;
     if (root != nil) {
         deps = ?root.deps;
-        ctx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, 0, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
+        ctx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, 0, root.p.target.isa.pointer_width, root.p.compiler_name, root.p.compiler_ver);
     }
     or {
         ctx = comptime.init(w.alloc, 0, 0, 0, comptime.MODE_DEBUG, 0, 8, intern.STR_NIL, intern.STR_NIL);
@@ -503,7 +505,7 @@ pub fun sema_doc(w: *Workspace, root: *Root, fid: src.FileId) Result[*sema.SemaR
     build_full_sema_deps(w, root, ?deps);
 
     val own: sess.ModuleId = own_module(root, fid);
-    var ctx: comptime.ComptimeCtx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, 0, root.p.target.arch.pointer_width, root.p.compiler_name, root.p.compiler_ver);
+    var ctx: comptime.ComptimeCtx = comptime.init(w.alloc, root.p.target.os_id, root.p.target.arch_id, root.p.target.abi_id, comptime.MODE_DEBUG, 0, root.p.target.isa.pointer_width, root.p.compiler_name, root.p.compiler_ver);
     val sr_r: Result[sema.SemaResult, str] = sema.sema(w.s, a, rr, ?deps, ?ctx, own);
     comptime.dnit(?ctx);
     free_sema_deps(w, ?deps);
@@ -739,7 +741,7 @@ fun vendors_enclosing(w: *Workspace, root_path: str, dir: str) bool {
     val mp_r: Result[pathlib.Path, str] = pathlib.join(w.alloc, root_path, "mach.toml");
     if (is_err[pathlib.Path, str](mp_r)) { ret false; }
     val mp: str = unwrap_ok[pathlib.Path, str](mp_r);
-    val text_r: Result[str, str] = fs.read_all(w.alloc, mp);
+    val text_r: Result[str, str] = fs.read_string(w.alloc, mp);
     strutil.str_free(w.alloc, mp);
     if (is_err[str, str](text_r)) { ret false; }
     val text: str = unwrap_ok[str, str](text_r);
@@ -970,13 +972,14 @@ fun try_load(w: *Workspace, r: *Root) bool {
         ret false;
     }
 
-    val pr: Result[driver.Project, str] = driver.build_project_union(w.s, r.path);
-    if (is_err[driver.Project, str](pr)) {
-        report_load_failure(w, r.path, unwrap_err[driver.Project, str](pr));
+    val pr: Result[driver.Project, outcome.Fail] = driver.build_project_union(w.s, r.path);
+    if (is_err[driver.Project, outcome.Fail](pr)) {
+        var f: outcome.Fail = unwrap_err[driver.Project, outcome.Fail](pr);
+        report_load_failure(w, r.path, fail_message(?f));
         ret false;
     }
 
-    r.p        = unwrap_ok[driver.Project, str](pr);
+    r.p        = unwrap_ok[driver.Project, outcome.Fail](pr);
     r.loaded   = true;
     r.own_base = r.p.module_len;
     r.gen      = next_gen(w);
@@ -1159,17 +1162,19 @@ fun stat_mtimes(w: *Workspace, root_path: str, man: *i64, lock: *i64) {
     @lock = join_mtime(w.alloc, root_path, "mach.lock");
 }
 
-# the mtime of `<dir>/<name>`, or 0 when the file is absent or
-# cannot be joined
+# the mtime of `<dir>/<name>` in unix nanoseconds, or 0 when the file is
+# absent or cannot be joined. nanosecond resolution matters: the check is an
+# equality test, and a save followed immediately by a request lands inside the
+# same second
 fun join_mtime(alloc: *Allocator, dir: str, name: str) i64 {
     val jr: Result[pathlib.Path, str] = pathlib.join(alloc, dir, name);
     if (is_err[pathlib.Path, str](jr)) { ret 0; }
     val p: str = unwrap_ok[pathlib.Path, str](jr);
     var m: i64 = 0;
-    val fi_r: Result[fs.FileInfo, str] = fs.info_path(p);
-    if (!is_err[fs.FileInfo, str](fi_r)) {
-        var fi: fs.FileInfo = unwrap_ok[fs.FileInfo, str](fi_r);
-        m = fi.modified;
+    val fi_r: Result[fs.Metadata, str] = fs.metadata(p);
+    if (!is_err[fs.Metadata, str](fi_r)) {
+        var fi: fs.Metadata = unwrap_ok[fs.Metadata, str](fi_r);
+        m = chrono.time_unix_nsec(fi.modified);
     }
     strutil.str_free(alloc, p);
     ret m;
@@ -1553,6 +1558,19 @@ fun document_root(w: *Workspace, uri: str) str {
 # unparseable mach.toml) is distinguishable from "no project found". the slot
 # itself remembers the failure (tracked + !loaded), so the load is only retried
 # when the manifest / lockfile changes
+# the text to show for a build-layer `Fail`.
+#
+# `outcome.Fail` carries a message only when the failure was NOT already filed
+# as a located diagnostic; a reported failure leaves `message` empty because the
+# compiler's own render step would have printed the diagnostics. the lsp has no
+# render step for a project load, so an empty message would surface as a blank
+# warning - name the channel the detail actually went to instead
+fun fail_message(f: *outcome.Fail) str {
+    if (!f.reported) { ret f.message; }
+    if (f.internal)  { ret "internal compiler error while loading the project"; }
+    ret "the project does not compile; see the diagnostics on its source files";
+}
+
 fun report_load_failure(w: *Workspace, root: str, msg: str) {
     trace.log("project: failed to load project at ");
     trace.log(root);
@@ -2039,6 +2057,34 @@ fun normalize_path(alloc: *Allocator, path: str) str {
 
 # a `file://` URI for an already-normalized absolute path, owned by
 # the caller, or nil on allocation failure
+# a `file://` URI for a SourceFile's `path`, owned by the caller, or
+# nil on allocation failure.
+#
+# the two path spaces a SourceFile can come from are distinguished by the scheme,
+# not by a flag: an editor buffer is registered under its URI (`editor.open` takes
+# the uri as the path), so it already carries `file://` and is copied through,
+# while an on-disk project module carries a filesystem path and gains the scheme.
+# this is what a diagnostic's secondary location needs, since `related` may point
+# into either space - a "previous definition here" in the buffer, or in the
+# dependency module the buffer imports
+# ---
+# alloc: allocator backing the returned URI
+# path:  a SourceFile path
+# ret:   an owned URI, or nil
+pub fun uri_of_path(alloc: *Allocator, path: str) str {
+    if (path == nil) { ret nil; }
+    if (str_starts_with(path, "file://")) {
+        val dr: Result[str, str] = strutil.str_dup(alloc, path);
+        if (is_err[str, str](dr)) { ret nil; }
+        ret unwrap_ok[str, str](dr);
+    }
+    val norm: str = normalize_path(alloc, path);
+    if (norm == nil) { ret nil; }
+    val u: str = norm_uri(alloc, norm);
+    strutil.str_free(alloc, norm);
+    ret u;
+}
+
 fun norm_uri(alloc: *Allocator, norm: str) str {
     val scheme: str = "file://";
     val plen: usize = str_len(norm);
@@ -2106,15 +2152,17 @@ fun t_cat(alloc: *Allocator, a: str, b: str) str {
 }
 
 # the scaffolded project's mach.toml (id "proj", host-resolved native
-# target), mirroring the three-target shape the driver's own union tests use
+# target), mirroring the three-target shape the driver's own union tests use.
+# [project] is trimmed to the V2 id/version/src/out totality and the artifact
+# carries the root-required link/need keys (#1964/#1971)
 fun t_manifest() str {
-    ret "[project]\nid = \"proj\"\nname = \"p\"\ndescription = \"p\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[target.linux-arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[artifact.proj]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/proj\"\ntargets = [\"*\"]\n";
+    ret "[project]\nid = \"proj\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[target.linux-arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[artifact.proj]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/proj\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
 }
 
 # write `text` to `path` (test helper), true on success
 fun t_write(path: str, text: str) bool {
     if (path == nil) { ret false; }
-    ret !is_err[bool, str](fs.write_file(path, text, str_len(text), 420));
+    ret is_none[str](fs.write_bytes(path, text, str_len(text), 420));
 }
 
 # materialize a temp "proj" project (manifest + src/main,leaf,other) on
@@ -2129,9 +2177,9 @@ fun t_scaffold(alloc: *Allocator, main_text: str, leaf_text: str) str {
     if (is_err[str, str](dup_r)) { ret nil; }
     val root: str = unwrap_ok[str, str](dup_r);
 
-    if (is_err[bool, str](fs.create_dir_all(alloc, root, 493))) { ret nil; }
+    if (is_some[str](fs.create_dir_all(alloc, root, 493))) { ret nil; }
     val src_dir: str = t_cat(alloc, root, "/src");
-    if (src_dir == nil || is_err[bool, str](fs.create_dir_all(alloc, src_dir, 493))) { ret nil; }
+    if (src_dir == nil || is_some[str](fs.create_dir_all(alloc, src_dir, 493))) { ret nil; }
 
     if (!t_write(t_cat(alloc, root, "/mach.toml"), t_manifest())) { ret nil; }
     if (!t_write(t_cat(alloc, src_dir, "/main.mach"), main_text)) { ret nil; }

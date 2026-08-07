@@ -267,7 +267,7 @@ test "types: nominal_of maps a generic instance to its template" {
     var args: [1]type.TypeId;
     args[0] = i32t;
     val inst: type.TypeId = unwrap_ok[type.TypeId, str](
-        type.intern_instance(?ti, 5::sess.ModuleId, 8::id.DeclId, ?args[0], 1));
+        type.intern_instance(?ti, type.TYPE_ERROR, 5::sess.ModuleId, 8::id.DeclId, ?args[0], 1));
 
     val no: Option[Nominal] = nominal_of(?ti, inst);
     var fail: bool = false;

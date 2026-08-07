@@ -1,8 +1,6 @@
 [project]
 id = "mls"
-name = "Mach Language Server"
-description = "Mach Language Server"
-version = "0.9.0"
+version = "0.10.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -38,15 +36,21 @@ abi = "aapcs64"
 
 [profile.debug]
 opt = 0
+debug = true
+simd = "scalarize"
 
 [profile.release]
 opt = 2
+debug = false
+simd = "scalarize"
 
 [artifact.mls]
 kind = "bin"
 entry = "main.mach"
 out = "bin/mls"
 targets = ["*"]
+link = []
+need = []
 
 [dep.mach-std]
 git = "https://github.com/briar-systems/mach-std"

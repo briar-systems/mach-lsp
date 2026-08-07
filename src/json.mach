@@ -24,8 +24,160 @@ use std.types.result.unwrap_ok;
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
+use std.allocator.reallocate;
 
-use mem: std.memory;
+use mem:  std.memory;
+use page: std.allocator.page;
+
+# a growable byte buffer for assembling one JSON payload
+#
+# the fixed-shape responses in this server are assembled by summing their
+# fragment lengths and appending into one exact allocation. that pattern does
+# not survive a payload whose SHAPE is data-dependent - a diagnostic's
+# relatedInformation array, a document's semantic tokens - where the fragment
+# count is only known while emitting. `Buf` is the append-only sink for those:
+# grow-by-doubling, nul-terminated on read, and total under allocation failure
+# (a failed grow latches `failed` and every later push is a no-op, so callers
+# check once at the end rather than at every push).
+# ---
+# a:      allocator backing `data`
+# data:   the bytes written so far, or nil before the first push
+# len:    bytes written
+# cap:    allocated bytes in `data`
+# failed: an allocation failed; the contents are incomplete and `buf_str` is nil
+pub rec Buf {
+    a:      *Allocator;
+    data:   *u8;
+    len:    usize;
+    cap:    usize;
+    failed: bool;
+}
+
+# slots reserved on a Buf's first growth
+val BUF_INITIAL_CAP: usize = 256;
+
+# construct an empty buffer over `alloc`; no allocation until the first push
+# ---
+# alloc: allocator backing the buffer
+# ret:   an empty Buf, released with `buf_dnit`
+pub fun buf_init(alloc: *Allocator) Buf {
+    var b: Buf;
+    b.a      = alloc;
+    b.data   = nil;
+    b.len    = 0;
+    b.cap    = 0;
+    b.failed = false;
+    ret b;
+}
+
+# release a buffer's storage; safe on an already-released or failed buffer
+pub fun buf_dnit(b: *Buf) {
+    if (b.data != nil && b.cap > 0) { deallocate[u8](b.a, b.data, b.cap); }
+    b.data = nil;
+    b.len  = 0;
+    b.cap  = 0;
+}
+
+# ensure `want` more bytes fit, doubling until they do. latches `failed`
+# and answers false when the growth cannot be made
+fun buf_reserve(b: *Buf, want: usize) bool {
+    if (b.failed) { ret false; }
+    # one byte of headroom so `buf_str` can terminate without a further grow
+    val need: usize = b.len + want + 1;
+    if (need <= b.cap) { ret true; }
+
+    var next: usize = b.cap;
+    if (next == 0) { next = BUF_INITIAL_CAP; }
+    for (next < need) { next = next * 2; }
+
+    if (b.data == nil) {
+        val r: Result[*u8, str] = allocate[u8](b.a, next);
+        if (is_err[*u8, str](r)) { b.failed = true; ret false; }
+        b.data = unwrap_ok[*u8, str](r);
+    }
+    or {
+        val r: Result[*u8, str] = reallocate[u8](b.a, b.data, b.cap, next);
+        if (is_err[*u8, str](r)) { b.failed = true; ret false; }
+        b.data = unwrap_ok[*u8, str](r);
+    }
+    b.cap = next;
+    ret true;
+}
+
+# append `s` verbatim (no escaping). nil is a no-op
+pub fun buf_push(b: *Buf, s: str) {
+    if (s == nil) { ret; }
+    val n: usize = str_len(s);
+    if (n == 0) { ret; }
+    if (!buf_reserve(b, n)) { ret; }
+    mem.raw_copy((b.data::usize + b.len)::ptr, s::ptr, n);
+    b.len = b.len + n;
+}
+
+# append one byte verbatim
+pub fun buf_push_byte(b: *Buf, ch: u8) {
+    if (!buf_reserve(b, 1)) { ret; }
+    b.data[b.len] = ch;
+    b.len = b.len + 1;
+}
+
+# append `s` as a quoted, escaped JSON string. nil renders as `""`
+pub fun buf_push_quoted(b: *Buf, s: str) {
+    buf_push_byte(b, '"');
+    if (s == nil) { buf_push_byte(b, '"'); ret; }
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) {
+        val ch: u8 = s[i];
+        if (ch == '"')  { buf_push(b, "\\\""); }
+        or (ch == '\\') { buf_push(b, "\\\\"); }
+        or (ch == '\n') { buf_push(b, "\\n"); }
+        or (ch == '\r') { buf_push(b, "\\r"); }
+        or (ch == '\t') { buf_push(b, "\\t"); }
+        or (ch < 32)    { buf_push_byte(b, '?'); }
+        or              { buf_push_byte(b, ch); }
+        i = i + 1;
+    }
+    buf_push_byte(b, '"');
+}
+
+# append `value` in base 10
+pub fun buf_push_usize(b: *Buf, value: usize) {
+    var tmp: [20]u8;
+    var pos: usize = 20;
+    var v: usize = value;
+    if (v == 0) { pos = pos - 1; tmp[pos] = '0'; }
+    or {
+        for (v > 0 && pos > 0) {
+            pos = pos - 1;
+            tmp[pos] = ('0' + (v % 10))::u8;
+            v = v / 10;
+        }
+    }
+    val n: usize = 20 - pos;
+    if (!buf_reserve(b, n)) { ret; }
+    mem.raw_copy((b.data::usize + b.len)::ptr, (?tmp[pos])::ptr, n);
+    b.len = b.len + n;
+}
+
+# append `value` in base 10 with a leading sign for negatives
+pub fun buf_push_i64(b: *Buf, value: i64) {
+    if (value < 0) { buf_push_byte(b, '-'); buf_push_usize(b, (-value)::usize); ret; }
+    buf_push_usize(b, value::usize);
+}
+
+# the buffer's contents as a nul-terminated string BORROWED from the buffer -
+# invalidated by any later push and freed by `buf_dnit`. nil when a push failed
+# to allocate, so one check here covers every push
+# ---
+# b:   the buffer
+# ret: a borrowed nul-terminated view, or nil when the buffer failed
+pub fun buf_str(b: *Buf) str {
+    if (b.failed) { ret nil; }
+    if (b.data == nil) { ret ""; }
+    b.data[b.len] = 0;
+    ret b.data::str;
+}
 
 # read the string value of `key` in `data`, decoding JSON
 # escapes. returns owned text, or nil when the key is absent or not a string
@@ -479,4 +631,123 @@ fun copy_range(data: str, start: usize, end: usize, alloc: *Allocator) str {
     mem.raw_copy(buf::ptr, (data::usize + start)::ptr, len);
     buf[len] = 0;
     ret buf::str;
+}
+
+# --- Buf ---
+
+test "json: an untouched Buf reads as the empty string and needs no allocation" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    var fail: bool = false;
+    if (b.data != nil)                { fail = true; }
+    if (!str_equals(buf_str(?b), "")) { fail = true; }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "json: pushes concatenate and nil is a no-op" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    buf_push(?b, "a");
+    buf_push(?b, nil);
+    buf_push(?b, "");
+    buf_push_byte(?b, 'b');
+    buf_push(?b, "cd");
+    var fail: bool = false;
+    if (!str_equals(buf_str(?b), "abcd")) { fail = true; }
+    if (b.len != 4)                       { fail = true; }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the growth path is the whole reason Buf exists, so it is exercised past the
+# doubling boundary rather than only within the first allocation
+test "json: content survives growth past the initial capacity" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    var i: usize = 0;
+    for (i < 1000) { buf_push(?b, "xy"); i = i + 1; }
+
+    var fail: bool = false;
+    if (b.len != 2000)          { fail = true; }
+    if (b.cap < 2001)           { fail = true; }
+    val s: str = buf_str(?b);
+    if (s == nil)               { fail = true; }
+    or {
+        if (str_len(s) != 2000) { fail = true; }
+        # spot-check both ends and the first doubling boundary
+        if (s[0] != 'x')        { fail = true; }
+        if (s[1] != 'y')        { fail = true; }
+        if (s[256] != 'x')      { fail = true; }
+        if (s[1999] != 'y')     { fail = true; }
+    }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "json: buf_push_quoted escapes the JSON control set" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    buf_push_quoted(?b, "a\"b\\c\nd\te");
+    var fail: bool = false;
+    if (!str_equals(buf_str(?b), "\"a\\\"b\\\\c\\nd\\te\"")) { fail = true; }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a nil string is a valid JSON value only as `""` - a diagnostic's optional
+# `related` label arrives nil and the protocol requires a string there
+test "json: buf_push_quoted renders nil as an empty JSON string" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    buf_push_quoted(?b, nil);
+    var fail: bool = false;
+    if (!str_equals(buf_str(?b), "\"\"")) { fail = true; }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "json: numbers render in base 10 with a sign only where negative" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    buf_push_usize(?b, 0);
+    buf_push_byte(?b, ',');
+    buf_push_usize(?b, 1234);
+    buf_push_byte(?b, ',');
+    buf_push_i64(?b, -7);
+    buf_push_byte(?b, ',');
+    buf_push_i64(?b, 42);
+    var fail: bool = false;
+    if (!str_equals(buf_str(?b), "0,1234,-7,42")) { fail = true; }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the failure latch is what lets callers check once at the end instead of at
+# every push, so a latched buffer must stay latched and read as nil
+test "json: a failed Buf latches and reads nil" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    buf_push(?b, "kept");
+    b.failed = true;
+    buf_push(?b, "dropped");
+    var fail: bool = false;
+    if (b.len != 4)          { fail = true; }
+    if (buf_str(?b) != nil)  { fail = true; }
+    buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
 }

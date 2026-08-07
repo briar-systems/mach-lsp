@@ -8,9 +8,11 @@
 # clearing is the same notification with an empty array.
 
 use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -19,10 +21,8 @@ use std.types.option.is_some;
 use std.types.option.unwrap;
 
 use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
 
-use mem: std.memory;
+use page: std.allocator.page;
 
 use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
@@ -88,69 +88,24 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
     # `sema_doc`'s returned typing is the feature layer's, discarded here.
     if (project.sema_ready(root)) { project.sema_doc(w, root, fid); }
 
-    val quoted_uri: str = json.quote(uri, alloc);
-    if (quoted_uri == nil) { ret; }
-
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":";
-    val mid: str = ",\"diagnostics\":[";
-    val suffix: str = "]}}";
-
     var count: usize = list.len;
     if (count > MAX_DIAGNOSTICS) { count = MAX_DIAGNOSTICS; }
 
-    var entries: *str = nil;
-    var entry_count: usize = 0;
-    if (count > 0) {
-        val ar: Result[*str, str] = allocate[str](alloc, count);
-        if (is_err[*str, str](ar)) {
-            json.free_str(quoted_uri, alloc);
-            ret;
-        }
-        entries = unwrap_ok[*str, str](ar);
-
-        var i: usize = 0;
-        for (i < count) {
-            val d: *diag.Diagnostic = ?list.items[i];
-            entries[entry_count] = build_entry(sources, d, alloc);
-            entry_count = entry_count + 1;
-            i = i + 1;
-        }
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    json.buf_push_quoted(?b, uri);
+    json.buf_push(?b, ",\"diagnostics\":[");
+    var i: usize = 0;
+    for (i < count) {
+        if (i > 0) { json.buf_push_byte(?b, ','); }
+        push_entry(?b, sources, ?list.items[i], alloc);
+        i = i + 1;
     }
+    json.buf_push(?b, "]}}");
 
-    var total: usize = str_len(prefix) + str_len(quoted_uri) + str_len(mid) + str_len(suffix);
-    var e: usize = 0;
-    for (e < entry_count) {
-        if (entries[e] != nil) { total = total + str_len(entries[e]); }
-        if (e > 0) { total = total + 1; }
-        e = e + 1;
-    }
-
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) {
-        free_entries(entries, entry_count, alloc);
-        json.free_str(quoted_uri, alloc);
-        ret;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, quoted_uri);
-    off = append(buf, off, mid);
-    var j: usize = 0;
-    for (j < entry_count) {
-        if (j > 0) { buf[off] = ','; off = off + 1; }
-        off = append(buf, off, entries[j]);
-        j = j + 1;
-    }
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-
-    transport.send_message(buf::str, alloc);
-
-    deallocate[u8](alloc, buf, total + 1);
-    free_entries(entries, entry_count, alloc);
-    json.free_str(quoted_uri, alloc);
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(?b);
 }
 
 # publish an empty diagnostics array for `uri` (e.g. on close)
@@ -158,51 +113,118 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
 # alloc: allocator for the message buffer
 # uri:   document URI to clear
 pub fun clear(alloc: *Allocator, uri: str) {
-    val quoted_uri: str = json.quote(uri, alloc);
-    if (quoted_uri == nil) { ret; }
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
+    json.buf_push_quoted(?b, uri);
+    json.buf_push(?b, ",\"diagnostics\":[]}}");
 
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":";
-    val suffix: str = ",\"diagnostics\":[]}}";
-    val total: usize = str_len(prefix) + str_len(quoted_uri) + str_len(suffix);
-
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) {
-        json.free_str(quoted_uri, alloc);
-        ret;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, quoted_uri);
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
-    json.free_str(quoted_uri, alloc);
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(?b);
 }
 
-# render one diagnostic as an LSP Diagnostic JSON object, resolving
-# its span to a 0-based range against the source map
-fun build_entry(sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) str {
+# append one diagnostic as an LSP Diagnostic object.
+#
+# a mach diagnostic is more than its primary message: the resolve and type stages
+# attach a `= note:` line, a `= help:` suggestion, and secondary `related`
+# locations (the earlier binding behind a duplicate definition, and its kin).
+# `mach build` renders all four; dropping them in the editor throws away the half
+# of the diagnostic that says what to DO about it. note and help ride the message
+# as trailing lines - the shape a terminal reader already knows - and the
+# secondary locations become `relatedInformation`, so the client can jump to them
+fun push_entry(b: *json.Buf, sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) {
+    json.buf_push(b, "{\"range\":");
+    push_range(b, sources, ?d.loc);
+    json.buf_push(b, ",\"severity\":");
+    json.buf_push_i64(b, map_severity(d.severity));
+    json.buf_push(b, ",\"source\":\"mach\",\"message\":");
+    push_message(b, d);
+    push_related(b, sources, d, alloc);
+    json.buf_push_byte(b, '}');
+}
+
+# append `{"start":{...},"end":{...}}` for `loc`, resolving its byte span
+# against the source map. an unresolvable file id degrades to the start of the
+# document rather than dropping the diagnostic
+fun push_range(b: *json.Buf, sources: *src.SourceMap, loc: *diag.Location) {
     var start_line: usize = 0;
     var start_char: usize = 0;
-    var end_line: usize = 0;
-    var end_char: usize = 0;
+    var end_line:   usize = 0;
+    var end_char:   usize = 0;
 
-    val so: Option[*src.SourceFile] = src.get(sources, d.loc.file_id);
+    val so: Option[*src.SourceFile] = src.get(sources, loc.file_id);
     if (is_some[*src.SourceFile](so)) {
         val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
-        val r: positions.LspRange = positions.range_of(sf, d.loc.span);
+        val r: positions.LspRange = positions.range_of(sf, loc.span);
         start_line = r.start_line;
         start_char = r.start_char;
-        end_line = r.end_line;
-        end_char = r.end_char;
+        end_line   = r.end_line;
+        end_char   = r.end_char;
     }
 
-    val severity: i64 = map_severity(d.severity);
-    ret build_diagnostic_json(start_line, start_char, end_line, end_char, severity, d.message, alloc);
+    json.buf_push(b, "{\"start\":{\"line\":");
+    json.buf_push_usize(b, start_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, start_char);
+    json.buf_push(b, "},\"end\":{\"line\":");
+    json.buf_push_usize(b, end_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, end_char);
+    json.buf_push(b, "}}");
+}
+
+# append the quoted message, with the note and help lines appended when
+# present. built through a scratch Buf so the three parts are escaped as one
+# JSON string
+fun push_message(b: *json.Buf, d: *diag.Diagnostic) {
+    if (d.note == nil && d.help == nil) {
+        json.buf_push_quoted(b, d.message);
+        ret;
+    }
+    var m: json.Buf = json.buf_init(b.a);
+    json.buf_push(?m, d.message);
+    if (d.note != nil) { json.buf_push(?m, "\nnote: "); json.buf_push(?m, d.note); }
+    if (d.help != nil) { json.buf_push(?m, "\nhelp: "); json.buf_push(?m, d.help); }
+    val text: str = json.buf_str(?m);
+    if (text != nil) { json.buf_push_quoted(b, text); }
+    or             { json.buf_push_quoted(b, d.message); }
+    json.buf_dnit(?m);
+}
+
+# append `,"relatedInformation":[...]` when the diagnostic carries secondary
+# locations. a secondary location may live in a different file than the primary
+# one, so each entry resolves its own URI from its SourceFile's path. an entry
+# whose file id or URI cannot be resolved is skipped rather than emitted with a
+# wrong location; a nil label renders as an empty caption, which the protocol
+# requires as a string
+fun push_related(b: *json.Buf, sources: *src.SourceMap, d: *diag.Diagnostic, alloc: *Allocator) {
+    if (d.related == nil || d.related_len == 0) { ret; }
+
+    var written: usize = 0;
+    var r: usize = 0;
+    for (r < d.related_len) {
+        val rel: *diag.Related = ?d.related[r];
+        val so: Option[*src.SourceFile] = src.get(sources, rel.loc.file_id);
+        if (is_some[*src.SourceFile](so)) {
+            val sf: *src.SourceFile = unwrap[*src.SourceFile](so);
+            val u: str = project.uri_of_path(alloc, sf.path);
+            if (u != nil) {
+                if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
+                or                { json.buf_push_byte(b, ','); }
+                json.buf_push(b, "{\"location\":{\"uri\":");
+                json.buf_push_quoted(b, u);
+                json.buf_push(b, ",\"range\":");
+                push_range(b, sources, ?rel.loc);
+                json.buf_push(b, "},\"message\":");
+                json.buf_push_quoted(b, rel.label);
+                json.buf_push_byte(b, '}');
+                written = written + 1;
+                json.free_str(u, alloc);
+            }
+        }
+        r = r + 1;
+    }
+    if (written > 0) { json.buf_push_byte(b, ']'); }
 }
 
 # translate a compiler Severity to the LSP severity scale
@@ -213,89 +235,164 @@ fun map_severity(sev: diag.Severity) i64 {
     ret LSP_HINT;
 }
 
-# assemble one `{ range, severity, source, message }`
-# object from its parts
-fun build_diagnostic_json(
-    start_line: usize, start_char: usize,
-    end_line: usize, end_char: usize,
-    severity: i64, message: str, alloc: *Allocator
-) str {
-    val sl: str = json.format_usize(start_line, alloc);
-    val sc: str = json.format_usize(start_char, alloc);
-    val el: str = json.format_usize(end_line, alloc);
-    val ec: str = json.format_usize(end_char, alloc);
-    val sev: str = json.format_i64(severity, alloc);
-    val qmsg: str = json.quote(message, alloc);
+# --- shaping ---
 
-    val p1: str = "{\"range\":{\"start\":{\"line\":";
-    val p2: str = ",\"character\":";
-    val p3: str = "},\"end\":{\"line\":";
-    val p4: str = ",\"character\":";
-    val p5: str = "}},\"severity\":";
-    val p6: str = ",\"source\":\"mach\",\"message\":";
-    val p7: str = "}";
-
-    val total: usize = str_len(p1) + slen(sl) + str_len(p2) + slen(sc) + str_len(p3) + slen(el) +
-                       str_len(p4) + slen(ec) + str_len(p5) + slen(sev) + str_len(p6) + slen(qmsg) + str_len(p7);
-
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) {
-        free_parts(sl, sc, el, ec, sev, qmsg, alloc);
-        ret nil;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, sl);
-    off = append(buf, off, p2);
-    off = append(buf, off, sc);
-    off = append(buf, off, p3);
-    off = append(buf, off, el);
-    off = append(buf, off, p4);
-    off = append(buf, off, ec);
-    off = append(buf, off, p5);
-    off = append(buf, off, sev);
-    off = append(buf, off, p6);
-    off = append(buf, off, qmsg);
-    off = append(buf, off, p7);
-    buf[off] = 0;
-
-    free_parts(sl, sc, el, ec, sev, qmsg, alloc);
-    ret buf::str;
+# an otherwise-empty error diagnostic over file 0 at [0,1)
+fun stub_diag(message: str) diag.Diagnostic {
+    var d: diag.Diagnostic;
+    d.severity        = diag.SEVERITY_ERROR;
+    d.loc.file_id     = 0::src.FileId;
+    d.loc.span.offset = 0;
+    d.loc.span.len    = 1;
+    d.message         = message;
+    d.note            = nil;
+    d.help            = nil;
+    d.related         = nil;
+    d.related_len     = 0;
+    d.related_cap     = 0;
+    ret d;
 }
 
-# length of `s`, treating nil as 0
-fun slen(s: str) usize {
-    if (s == nil) { ret 0; }
-    ret str_len(s);
+test "diagnostics: a diagnostic with no note or help renders its message alone" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: json.Buf = json.buf_init(?pa);
+    var d: diag.Diagnostic = stub_diag("unresolved identifier `x`");
+    push_message(?b, ?d);
+
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b), "\"unresolved identifier `x`\"")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
 }
 
-# copy `s` into `buf` at `offset`, returning the new offset
-fun append(buf: *u8, offset: usize, s: str) usize {
-    if (s == nil) { ret offset; }
-    val n: usize = str_len(s);
-    if (n > 0) { mem.raw_copy((buf::usize + offset)::ptr, s::ptr, n); }
-    ret offset + n;
+# the help line is the half of a mach diagnostic that says what to DO; it rode
+# nowhere before, so its presence in the rendered message is the regression pin
+test "diagnostics: note and help ride the message as trailing lines" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: json.Buf = json.buf_init(?pa);
+    var d: diag.Diagnostic = stub_diag("type mismatch");
+    d.note = "expected i32";
+    d.help = "cast with `v::i32`";
+    push_message(?b, ?d);
+
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b),
+        "\"type mismatch\\nnote: expected i32\\nhelp: cast with `v::i32`\"")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
 }
 
-# free an array of owned diagnostic JSON strings and the array
-fun free_entries(entries: *str, count: usize, alloc: *Allocator) {
-    if (entries == nil) { ret; }
-    var i: usize = 0;
-    for (i < count) {
-        json.free_str(entries[i], alloc);
-        i = i + 1;
-    }
-    deallocate[str](alloc, entries, count);
+test "diagnostics: help alone still renders, without an empty note line" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: json.Buf = json.buf_init(?pa);
+    var d: diag.Diagnostic = stub_diag("unknown key");
+    d.help = "did you mean `simd`?";
+    push_message(?b, ?d);
+
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b), "\"unknown key\\nhelp: did you mean `simd`?\"")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
 }
 
-# free the six fragment strings of one diagnostic object
-fun free_parts(sl: str, sc: str, el: str, ec: str, sev: str, qmsg: str, alloc: *Allocator) {
-    json.free_str(sl, alloc);
-    json.free_str(sc, alloc);
-    json.free_str(el, alloc);
-    json.free_str(ec, alloc);
-    json.free_str(sev, alloc);
-    json.free_str(qmsg, alloc);
+test "diagnostics: no secondary locations emits no relatedInformation key" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: json.Buf = json.buf_init(?pa);
+    var d: diag.Diagnostic = stub_diag("duplicate definition");
+    var m: src.SourceMap = stub_map(nil, 0);
+    push_related(?b, ?m, ?d, ?pa);
+
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b), "")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a secondary location carries the file it points INTO, which need not be the
+# primary's - so the entry resolves its own uri rather than reusing the request's
+test "diagnostics: a secondary location renders as a located relatedInformation entry" {
+    var pa: Allocator;
+    page.make(?pa);
+
+    # `src.position` indexes `line_starts` unconditionally, so a stub file needs
+    # a real line index: "ab\ncd" starts lines at 0 and 3
+    var starts: [2]usize;
+    starts[0] = 0;
+    starts[1] = 3;
+
+    # slot 0 is FILE_NIL and never resolves, so the real file sits at id 1
+    var files: [2]src.SourceFile;
+    files[1].path        = "file:///w/a.mach";
+    files[1].text        = "ab\ncd";
+    files[1].line_starts = ?starts[0];
+    files[1].line_len    = 2;
+    var m: src.SourceMap = stub_map(?files[0], 2);
+
+    var rels: [1]diag.Related;
+    rels[0].loc.file_id     = 1::src.FileId;
+    rels[0].loc.span.offset = 0;
+    rels[0].loc.span.len    = 2;
+    rels[0].label           = "previous definition here";
+
+    var d: diag.Diagnostic = stub_diag("duplicate definition");
+    d.related     = ?rels[0];
+    d.related_len = 1;
+    d.related_cap = 1;
+
+    var b: json.Buf = json.buf_init(?pa);
+    push_related(?b, ?m, ?d, ?pa);
+
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b),
+        ",\"relatedInformation\":[{\"location\":{\"uri\":\"file:///w/a.mach\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}}},\"message\":\"previous definition here\"}]")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# an unresolvable file id would otherwise render a well-formed entry pointing at
+# the wrong place, which is worse than no entry at all
+test "diagnostics: a secondary location with an unresolvable file is skipped" {
+    var pa: Allocator;
+    page.make(?pa);
+    var m: src.SourceMap = stub_map(nil, 0);
+
+    var rels: [1]diag.Related;
+    rels[0].loc.file_id     = 9::src.FileId;
+    rels[0].loc.span.offset = 0;
+    rels[0].loc.span.len    = 1;
+    rels[0].label           = "elsewhere";
+
+    var d: diag.Diagnostic = stub_diag("duplicate definition");
+    d.related     = ?rels[0];
+    d.related_len = 1;
+    d.related_cap = 1;
+
+    var b: json.Buf = json.buf_init(?pa);
+    push_related(?b, ?m, ?d, ?pa);
+
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b), "")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a SourceMap over a caller-owned files array. `src.get` reads only `files` and
+# `len`, so the path index stays unbuilt - a lookup by path would not answer
+fun stub_map(files: *src.SourceFile, len: usize) src.SourceMap {
+    var m: src.SourceMap;
+    m.a     = nil;
+    m.files = files;
+    m.len   = len;
+    m.cap   = len;
+    ret m;
 }
