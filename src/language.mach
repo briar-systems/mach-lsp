@@ -1,11 +1,11 @@
 # the rich language-feature request handlers
 #
 # hover, definition, references, rename, prepareRename, documentSymbol, and
-# completion. every request resolves the document's buffer against the loaded
-# project dependency graph (`project.resolve_doc`), pivots the cursor position
-# to a byte offset, joins it against the resolve side tables through `features`,
-# and shapes the LSP result with `json`. lifecycle and dispatch stay in
-# `server`; this module is the request bodies it routes to.
+# completion. semantic requests read the document's exact compiler-owned
+# ModuleEntry from a retained project snapshot, pivot the cursor position to a
+# byte offset, join it against the resolve side tables through `features`, and
+# shape the LSP result with `json`. documentSymbol stays on the syntax-only
+# editor parse path. lifecycle and dispatch stay in `server`.
 #
 # cross-module scope: the buffer is resolved with a populated dependency set, so
 # a symbol imported through a `use` binds to its declaration in a dependency Ast.
@@ -58,6 +58,7 @@ use sema:   mach.lang.fe.sema;
 
 use transport: mls.transport;
 use json:      mls.json;
+use sj:        std.data.json;
 use documents: mls.documents;
 use features:  mls.features;
 use positions: mls.positions;
@@ -67,7 +68,7 @@ use project:   mls.project;
 # ---
 # interner: the session's string interner, for resolving symbol-name StrIds
 # file:     the document's SourceFile (text + line index for offset/position)
-# fid:      the document's FileId (for the type-aware field path's sema_doc)
+# sr:       compiler-owned semantic result for this exact module snapshot
 # a:        the buffer's parsed Ast
 # rr:       the buffer's ResolveResult side tables
 # own:      this buffer's module id (Symbol.origin equals it for local symbols)
@@ -75,7 +76,7 @@ use project:   mls.project;
 rec Analyzed {
     interner: *intern.Interner;
     file:     *src.SourceFile;
-    fid:      src.FileId;
+    sr:       *sema.SemaResult;
     a:        *ast.Ast;
     rr:       *res.ResolveResult;
     own:      sess.ModuleId;
@@ -84,12 +85,12 @@ rec Analyzed {
 
 # answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol
-pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -159,9 +160,8 @@ fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, offset
     if (!is_some[features.FieldRef](fo)) { ret false; }
     val fr: features.FieldRef = unwrap[features.FieldRef](fo);
 
-    val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-    if (is_err[*sema.SemaResult, str](sr_r)) { ret false; }
-    val sr: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](sr_r);
+    val sr: *sema.SemaResult = an.sr;
+    if (sr == nil) { ret false; }
 
     val tid: type.TypeId = project.type_of(sr, fr.host);
     val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
@@ -463,12 +463,12 @@ fun compose_kind_name(sym: *res.Symbol, interner: *intern.Interner, alloc: *Allo
 # symbol's declaration. lands in the buffer for a local symbol and in the
 # defining dependency module's on-disk file for a cross-module one; null when
 # the position is not on a resolved symbol or its declaration cannot be located
-pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -531,9 +531,8 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     if (is_some[features.FieldRef](fo)) {
         val fr: features.FieldRef = unwrap[features.FieldRef](fo);
 
-        val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-        if (is_err[*sema.SemaResult, str](sr_r)) { ret false; }
-        val sr: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](sr_r);
+        val sr: *sema.SemaResult = an.sr;
+        if (sr == nil) { ret false; }
 
         val tid: type.TypeId = project.type_of(sr, fr.host);
         val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
@@ -667,9 +666,8 @@ fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
     if (is_some[features.FieldRef](fo)) {
         val fr: features.FieldRef = unwrap[features.FieldRef](fo);
-        val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-        if (is_err[*sema.SemaResult, str](sr_r)) { ret none[FieldTarget](); }
-        val tid: type.TypeId = project.type_of(unwrap_ok[*sema.SemaResult, str](sr_r), fr.host);
+        if (an.sr == nil) { ret none[FieldTarget](); }
+        val tid: type.TypeId = project.type_of(an.sr, fr.host);
         val rso: Option[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
         if (!is_some[project.RecordSite](rso)) { ret none[FieldTarget](); }
         val rs: project.RecordSite = unwrap[project.RecordSite](rso);
@@ -718,47 +716,43 @@ rec FieldXRef {
     file:      *src.SourceFile;
     uri:       str;
     declaring: bool;
+    owned:     bool;
 }
 
-# populate `out` with the modules that reference the keyed field
-# and return the count. `out[0]` is always the active buffer (live SemaResult);
-# each subsequent entry is a loaded module whose SemaResult types at least one
-# reference to the field, skipping the buffer's on-disk twin so its live edits are
-# not double-counted. every module is walked (a field is reachable wherever its
-# record is imported), so this is not gated on project ownership - the rename gate
-# is applied separately by the caller
+# populate `out` with each compiler-owned module exactly once. The active module
+# borrows the request URI; all other modules own their generated file URI. A
+# standalone buffer contributes its editor semantic result as the sole entry.
 # ---
 # ws:    the workspace
 # an:    the active buffer's analysis
 # uri:   the active buffer's document URI
 # t:     the resolved field target
 # out:   array of at least `cap` FieldXRef slots
-# cap:   capacity of `out` (module_count + 1)
+# cap:   capacity of `out` (module_count, or one for a standalone file)
 # ret:   number of populated entries (>= 1), or 0 when the buffer cannot be typed
 fun build_field_refs(ws: *project.Workspace, an: Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
-    val sr_r: Result[*sema.SemaResult, str] = project.sema_doc(ws, an.root, an.fid);
-    if (is_err[*sema.SemaResult, str](sr_r)) { ret 0; }
-    out[0].a         = an.a;
-    out[0].sr        = unwrap_ok[*sema.SemaResult, str](sr_r);
-    out[0].file      = an.file;
-    out[0].uri       = uri;
-    out[0].declaring = t.decl_in_buffer;
-    var n: usize = 1;
+    if (an.sr == nil) { ret 0; }
+    if (an.root == nil) {
+        out[0].a = an.a;
+        out[0].sr = an.sr;
+        out[0].file = an.file;
+        out[0].uri = uri;
+        out[0].declaring = t.decl_in_buffer;
+        out[0].owned = false;
+        ret 1;
+    }
 
-    val self_o: Option[sess.ModuleId] = project.module_for_uri(ws, an.root, uri);
-    val have_self: bool = is_some[sess.ModuleId](self_o);
-    var self_mid: sess.ModuleId = 0::sess.ModuleId;
-    if (have_self) { self_mid = unwrap[sess.ModuleId](self_o); }
-
+    var n: usize = 0;
     val mc: u32 = project.module_count(an.root);
     var mid: u32 = 0;
     for (mid < mc && n < cap) {
         val cur: sess.ModuleId = mid::sess.ModuleId;
-        if (have_self && cur == self_mid) { mid = mid + 1; cnt; }
         val mv_o: Option[project.ModuleView] = project.module_view(ws, an.root, cur);
         val ms_o: Option[*sema.SemaResult] = project.module_sema(ws, an.root, cur);
         if (!is_some[project.ModuleView](mv_o) || !is_some[*sema.SemaResult](ms_o)) { mid = mid + 1; cnt; }
-        val muri: str = project.module_uri(ws, an.root, cur);
+        var muri: str = nil;
+        if (cur == an.own) { muri = uri; }
+        or { muri = project.module_uri(ws, an.root, cur); }
         if (muri == nil) { mid = mid + 1; cnt; }
         val mv: project.ModuleView = unwrap[project.ModuleView](mv_o);
         out[n].a         = mv.a;
@@ -766,18 +760,18 @@ fun build_field_refs(ws: *project.Workspace, an: Analyzed, uri: str, t: FieldTar
         out[n].file      = mv.file;
         out[n].uri       = muri;
         out[n].declaring = cur == t.key.origin;
+        out[n].owned     = cur != an.own;
         n = n + 1;
         mid = mid + 1;
     }
     ret n;
 }
 
-# release the owned `file://` URIs of the graph-module entries.
-# refs[0] borrows the request URI and is skipped
+# release generated graph-module URIs; the active request URI is borrowed
 fun free_field_refs(ws: *project.Workspace, refs: *FieldXRef, n: usize) {
-    var i: usize = 1;
+    var i: usize = 0;
     for (i < n) {
-        if (refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
+        if (refs[i].owned && refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
         i = i + 1;
     }
 }
@@ -819,7 +813,8 @@ fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
 
-    val cap: usize = (project.module_count(an.root) + 1)::usize;
+    var cap: usize = project.module_count(an.root)::usize;
+    if (cap == 0) { cap = 1; }
     val ra: Result[*FieldXRef, str] = allocate[FieldXRef](alloc, cap);
     if (is_err[*FieldXRef, str](ra)) { ret false; }
     val refs: *FieldXRef = unwrap_ok[*FieldXRef, str](ra);
@@ -827,7 +822,7 @@ fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
     if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); ret false; }
 
-    emit_field_locations(ws, alloc, id_raw, refs, n, t);
+    emit_field_locations(ws, an.root, alloc, id_raw, refs, n, t);
     free_field_refs(ws, refs, n);
     deallocate[FieldXRef](alloc, refs, cap);
     ret true;
@@ -845,9 +840,10 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: 
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
 
-    if (!field_record_renameable(ws, an.root, uri, t)) { reply_empty_edit(alloc, id_raw); ret true; }
+    if (!field_record_renameable(ws, an.root, t)) { reply_empty_edit(alloc, id_raw); ret true; }
 
-    val cap: usize = (project.module_count(an.root) + 1)::usize;
+    var cap: usize = project.module_count(an.root)::usize;
+    if (cap == 0) { cap = 1; }
     val ra: Result[*FieldXRef, str] = allocate[FieldXRef](alloc, cap);
     if (is_err[*FieldXRef, str](ra)) { ret false; }
     val refs: *FieldXRef = unwrap_ok[*FieldXRef, str](ra);
@@ -855,24 +851,16 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: 
     val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
     if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); reply_empty_edit(alloc, id_raw); ret true; }
 
-    emit_field_rename(ws, alloc, id_raw, refs, n, t, new_name);
+    emit_field_rename(ws, an.root, alloc, id_raw, refs, n, t, new_name);
     free_field_refs(ws, refs, n);
     deallocate[FieldXRef](alloc, refs, cap);
     ret true;
 }
 
-# whether the field's record is the editor's to rewrite -
-# the same gate the symbol rename `renameable` applies, keyed on the record's
-# declaring module. a record declared in a loaded module keys directly on
-# `is_project_module`; a record declared in the active buffer keys on the buffer's
-# on-disk twin (a dependency source opened for editing has a loaded twin that is
-# not project-owned), and on the buffer's governing root not being a vendored
-# dependency project when it has no twin
-fun field_record_renameable(ws: *project.Workspace, root: *project.Root, uri: str, t: FieldTarget) bool {
-    if (!t.decl_in_buffer) { ret project.is_project_module(ws, root, t.key.origin); }
-    val twin_o: Option[sess.ModuleId] = project.module_for_uri(ws, root, uri);
-    if (!is_some[sess.ModuleId](twin_o)) { ret !project.root_vendored(root); }
-    ret project.is_project_module(ws, root, unwrap[sess.ModuleId](twin_o));
+# whether the field's canonical declaring module is owned by the user
+fun field_record_renameable(ws: *project.Workspace, root: *project.Root, t: FieldTarget) bool {
+    if (root == nil) { ret true; }
+    ret project.is_project_module(ws, root, t.key.origin);
 }
 
 # write the field-name span the cursor sits on into `out` and
@@ -882,7 +870,7 @@ fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: 
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
-    if (!field_record_renameable(ws, an.root, uri, t)) { ret false; }
+    if (!field_record_renameable(ws, an.root, t)) { ret false; }
     # the range reported is the cursor's own field-name token in the buffer; the
     # decl-site name lives in the record's module, which may not be the buffer
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -895,8 +883,8 @@ fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: 
 # send a Location[] of every field site across `refs` (each
 # module's member-access / struct-literal sites plus the field declaration). takes
 # ownership of `id_raw` and frees it
-fun emit_field_locations(ws: *project.Workspace, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget) {
-    val ti: *type.TypeInterner = project.type_interner(ws);
+fun emit_field_locations(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget) {
+    val ti: *type.TypeInterner = project.type_interner(ws, root);
     val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
     val mid:    str = ",\"result\":[";
     val suffix: str = "]}";
@@ -932,8 +920,8 @@ fun emit_field_locations(ws: *project.Workspace, alloc: *Allocator, id_raw: str,
 # member-access / struct-literal sites; the declaring module's entry also rewrites
 # the field declaration and the record's matching doc component. takes ownership of
 # `id_raw` and frees it
-fun emit_field_rename(ws: *project.Workspace, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget, new_name: str) {
-    val ti: *type.TypeInterner = project.type_interner(ws);
+fun emit_field_rename(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget, new_name: str) {
+    val ti: *type.TypeInterner = project.type_interner(ws, root);
     val qname: str = json.quote(new_name, alloc);
     if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
 
@@ -1024,12 +1012,12 @@ fun field_rename_group_json(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarge
 # the symbol at the cursor - its declaration plus every use-site across the
 # loaded project graph (the requesting buffer and every other module that
 # references the symbol). empty when the position is not on a resolved symbol
-pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1055,10 +1043,7 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     if (is_err[*XRef, str](ra)) { reply_empty_array(alloc, id_raw); ret; }
     val refs: *XRef = unwrap_ok[*XRef, str](ra);
 
-    # a failed bridge only degrades references to buffer-local results; rename
-    # is where it must refuse (see build_refs / BRIDGE_FAILED)
-    var status: i64 = BRIDGE_LOCAL;
-    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, false, refs, cap, ?status);
+    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, false, refs, cap);
     emit_locations(alloc, id_raw, refs, n, bind, has_bind);
     free_refs(ws, refs, n);
     deallocate[XRef](alloc, refs, cap);
@@ -1071,17 +1056,16 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
 # declared in the user's own project: a dependency's declaration is not the
 # editor's to rewrite (whether referenced cross-module or opened as the buffer
 # itself), so those yield an empty edit. an empty edit is also returned when a
-# module-scope pub symbol's cross-file identity cannot be recovered from its
-# stale on-disk twin - a buffer-local edit there would be a partial rename
-pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+# module-scope symbol resolves to a dependency owned by the user
+pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    val new_name: str = json.extract_string(body, "\"newName\"", alloc);
+    val new_name: str = json.text(json.member(params, "newName"), alloc);
     if (new_name == nil) { reply_null(alloc, id_raw); ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1097,7 +1081,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
-    if (!renameable(ws, an.root, uri, sym, sr)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (!renameable(ws, an.root, sym)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
 
     # the declared name guards the cross-file walk: only occurrences spelled with
     # it are rewritten, so an aliased import's references are left untouched
@@ -1115,22 +1099,13 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var doc: token.Span;
     val has_doc: bool = param_generic_doc_span(an, sym, name, ?doc);
 
-    val cap: usize = (project.module_count(an.root) + 1)::usize;
+    var cap: usize = project.module_count(an.root)::usize;
+    if (cap == 0) { cap = 1; }
     val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
     if (is_err[*XRef, str](ra)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val refs: *XRef = unwrap_ok[*XRef, str](ra);
 
-    var status: i64 = BRIDGE_LOCAL;
-    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, true, refs, cap, ?status);
-    if (status == BRIDGE_FAILED) {
-        # the pub declaration's cross-file identity is unrecoverable (stale
-        # twin); a buffer-local edit would be the partial rename #47 forbids.
-        free_refs(ws, refs, n);
-        deallocate[XRef](alloc, refs, cap);
-        json.free_str(new_name, alloc);
-        reply_empty_edit(alloc, id_raw);
-        ret;
-    }
+    val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, true, refs, cap);
     emit_rename(alloc, id_raw, refs, n, new_name, name, bind, has_bind, doc, has_doc);
     free_refs(ws, refs, n);
     deallocate[XRef](alloc, refs, cap);
@@ -1166,12 +1141,12 @@ fun param_generic_doc_span(an: Analyzed, sym: *res.Symbol, name: str, out: *toke
 # project-owned cross-module one) or a field of a known, project-owned record, or
 # null when it is not the editor's to rename (an unresolved position, a dependency
 # symbol, or a field of a vendored record)
-pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, body, uri, ?an);
+    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
     if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
@@ -1189,7 +1164,7 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
     if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
-    if (!renameable(ws, an.root, uri, unwrap[*res.Symbol](so), sr)) { reply_null(alloc, id_raw); ret; }
+    if (!renameable(ws, an.root, unwrap[*res.Symbol](so))) { reply_null(alloc, id_raw); ret; }
 
     reply_range(alloc, id_raw, an.file, sr.name_span);
 }
@@ -1209,21 +1184,27 @@ fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: tok
 # answer textDocument/documentSymbol with a flat list of the
 # file's top-level declarations as DocumentSymbol nodes (name, kind, range,
 # selectionRange)
-pub fun document_symbol(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
+    val d: *documents.Document = documents.find(docs, uri);
+    if (d == nil) { reply_empty_array(alloc, id_raw); ret; }
+    val ar: Result[*ast.Ast, str] = editor.parse(es, d.file_id);
+    if (is_err[*ast.Ast, str](ar)) { reply_empty_array(alloc, id_raw); ret; }
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, d.file_id);
+    if (!is_some[*src.SourceFile](fo)) { reply_empty_array(alloc, id_raw); ret; }
     var an: Analyzed;
-    val okd: bool = analyze(ws, es, docs, uri, ?an);
-    if (!okd) { reply_empty_array(alloc, id_raw); ret; }
+    an.a = unwrap_ok[*ast.Ast, str](ar);
+    an.file = unwrap[*src.SourceFile](fo);
 
     emit_document_symbols(an, alloc, id_raw);
 }
 
 # answer textDocument/completion with the in-scope top-level names
 # (module decls, `use` aliases / imports, primitives) as CompletionItems
-pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str) {
-    val id_raw: str = json.extract_raw(body, "\"id\"", alloc);
+pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: Analyzed;
@@ -1246,173 +1227,126 @@ fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
     ret true;
 }
 
-# whether the symbol at the cursor may be renamed. a cross-module
-# symbol must be declared in a project-owned module, and a buffer-local symbol
-# is only renameable when the buffer itself is the editor's to rewrite: its
-# on-disk twin (when the buffer is a loaded module's file - e.g. a dependency
-# source opened via go-to-definition, whose symbols all resolve buffer-locally)
-# must also be project-owned. a buffer with no twin renames buffer-local - unless
-# its governing root is a vendored dependency project, whose every file is
-# read-only even outside that root's own graph closure (a vendored dep source the
-# outer project never imports still routes to its own vendored root)
-fun renameable(ws: *project.Workspace, root: *project.Root, uri: str, sym: *res.Symbol, sr: features.SymbolRef) bool {
-    if (!sr.local) { ret project.is_project_module(ws, root, sym.origin); }
-    val twin_o: Option[sess.ModuleId] = project.module_for_uri(ws, root, uri);
-    if (!is_some[sess.ModuleId](twin_o)) { ret !project.root_vendored(root); }
-    ret project.is_project_module(ws, root, unwrap[sess.ModuleId](twin_o));
+# whether the symbol's canonical declaring module is owned by the user. A
+# standalone buffer has no project boundary and remains directly editable.
+fun renameable(ws: *project.Workspace, root: *project.Root, sym: *res.Symbol) bool {
+    if (root == nil) { ret true; }
+    ret project.is_project_module(ws, root, sym.origin);
 }
 
 # one file contributing references to a target symbol - its Ast, resolve
 # tables, source file, document URI, and the local SymbolId every reference in
-# it resolves to. the active buffer is always the first XRef (live resolve,
-# borrowed URI); each other loaded module that references the symbol is another
-# (graph snapshot, an owned `file://` URI freed by free_refs). see build_refs
+# it resolves to. Project modules are visited exactly once; the active module
+# borrows the request URI and other modules own their generated file URI.
 rec XRef {
     a:      *ast.Ast;
     rr:     *res.ResolveResult;
     file:   *src.SourceFile;
     uri:    str;
     target: res.SymbolId;
+    owned:  bool;
 }
 
-# bridge status of build_refs' buffer -> on-disk-twin identity translation
-# ---
-# BRIDGE_LOCAL:  the symbol has no cross-file identity (block-local, non-pub,
-#                or the buffer has no loaded twin); buffer-local results are
-#                complete on their own terms.
-# BRIDGE_OK:     a canonical (origin, decl) identity resolved; the graph walk
-#                ran and cross-file results are included.
-# BRIDGE_FAILED: the symbol is a module-scope pub declaration but its identity
-#                could not be recovered from the on-disk twin - e.g. unsaved
-#                edits renamed the declaration, so the stale twin does not
-#                export the name. rename must refuse rather than emit the
-#                compile-breaking partial edit a buffer-local fallback would be.
-val BRIDGE_LOCAL:  i64 = 0;
-val BRIDGE_OK:     i64 = 1;
-val BRIDGE_FAILED: i64 = 2;
-
-# populate `out` with the files that reference the symbol at the
-# cursor and return the count. `out[0]` is always the active buffer (resolved
-# live, matched by its own SymbolId). each subsequent entry is a loaded module
-# whose resolve result contains the symbol's canonical (origin, decl) identity,
-# skipping the buffer's on-disk twin so its live edits are not double-counted.
-# `project_only` restricts the walk to project-owned modules (rename); references
-# passes false to include dependency modules. the canonical identity is read
-# directly for a cross-module reference; for a buffer-local symbol it is bridged
-# through the buffer's on-disk twin, but only when the symbol is a module-scope
-# pub declaration - a block-local binding that shadows a pub symbol's name, or a
-# non-pub declaration, has no importers and must not bridge to one. the bridge
-# outcome is reported in `status` (see BRIDGE_*) so rename can refuse on a
-# failed bridge instead of degrading to a partial buffer-local edit
-# ---
-# ws:          the workspace
-# an:          the active buffer's analysis
-# uri:         the active buffer's document URI
-# sym:         the resolved symbol at the cursor
-# self_target: the symbol's SymbolId in the active buffer's resolve result
-# project_only:restrict the graph walk to project-owned modules
-# out:         array of at least `cap` XRef slots
-# cap:         capacity of `out` (module_count + 1)
-# status:      receives the BRIDGE_* outcome
-# ret:         number of populated entries (>= 1)
-fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize, status: *i64) usize {
-    out[0].a      = an.a;
-    out[0].rr     = an.rr;
-    out[0].file   = an.file;
-    out[0].uri    = uri;
-    out[0].target = self_target;
-    var n: usize = 1;
-    @status = BRIDGE_LOCAL;
-
-    val self_o: Option[sess.ModuleId] = project.module_for_uri(ws, an.root, uri);
-    val have_self: bool = is_some[sess.ModuleId](self_o);
-    var self_mid: sess.ModuleId = 0::sess.ModuleId;
-    if (have_self) { self_mid = unwrap[sess.ModuleId](self_o); }
-
-    var canon_origin: sess.ModuleId = sym.origin;
-    var canon_decl:   id.DeclId     = sym.decl;
-    if (sym.origin == an.own) {
-        if ((sym.flags & res.SYM_FLAG_MODULE) == 0 || (sym.flags & res.SYM_FLAG_PUB) == 0) { ret n; }
-        if (!have_self) { ret n; }
-        val mv_o: Option[project.ModuleView] = project.module_view(ws, an.root, self_mid);
-        if (!is_some[project.ModuleView](mv_o)) { @status = BRIDGE_FAILED; ret n; }
-        canon_decl   = features.export_decl_of(unwrap[project.ModuleView](mv_o).rr, sym.name, sym.kind);
-        canon_origin = self_mid;
-        if (canon_decl == id.DECL_NIL) { @status = BRIDGE_FAILED; ret n; }
+# collect each retained module whose resolver maps the target's canonical
+# (origin, declaration) identity. The active document is already that exact
+# ModuleEntry, so it uses the request URI and is neither bridged nor duplicated.
+fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
+    if (an.root == nil || sym.decl == id.DECL_NIL
+        || (sym.origin == an.own && ((sym.flags & res.SYM_FLAG_MODULE) == 0
+            || (sym.flags & res.SYM_FLAG_PUB) == 0))) {
+        out[0].a = an.a;
+        out[0].rr = an.rr;
+        out[0].file = an.file;
+        out[0].uri = uri;
+        out[0].target = self_target;
+        out[0].owned = false;
+        ret 1;
     }
-    if (canon_decl == id.DECL_NIL) { ret n; }
-    @status = BRIDGE_OK;
-
+    var n: usize = 0;
     val mc: u32 = project.module_count(an.root);
     var mid: u32 = 0;
     for (mid < mc && n < cap) {
         val cur: sess.ModuleId = mid::sess.ModuleId;
-        if ((have_self && cur == self_mid)
-            || (project_only && !project.is_project_module(ws, an.root, cur))) { mid = mid + 1; cnt; }
+        if (project_only && !project.is_project_module(ws, an.root, cur)) { mid = mid + 1; cnt; }
         val mv_o: Option[project.ModuleView] = project.module_view(ws, an.root, cur);
         if (!is_some[project.ModuleView](mv_o)) { mid = mid + 1; cnt; }
         val mv: project.ModuleView = unwrap[project.ModuleView](mv_o);
-        val tgt: res.SymbolId = features.symbol_by_decl(mv.rr, canon_origin, canon_decl);
+        val tgt: res.SymbolId = features.symbol_by_decl(mv.rr, sym.origin, sym.decl);
         if (tgt == res.SYMBOL_NIL) { mid = mid + 1; cnt; }
-        val muri: str = project.module_uri(ws, an.root, cur);
+        var muri: str = nil;
+        if (cur == an.own) { muri = uri; }
+        or { muri = project.module_uri(ws, an.root, cur); }
         if (muri == nil) { mid = mid + 1; cnt; }
-        out[n].a      = mv.a;
-        out[n].rr     = mv.rr;
-        out[n].file   = mv.file;
-        out[n].uri    = muri;
+        out[n].a = mv.a;
+        out[n].rr = mv.rr;
+        out[n].file = mv.file;
+        out[n].uri = muri;
         out[n].target = tgt;
+        out[n].owned = cur != an.own;
         n = n + 1;
         mid = mid + 1;
     }
     ret n;
 }
 
-# release the owned `file://` URIs of the graph-module entries in a
-# built XRef array. refs[0] borrows the request's URI and is skipped
+# release generated graph-module URIs; the active request URI is borrowed
 fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
-    var i: usize = 1;
+    var i: usize = 0;
     for (i < n) {
-        if (refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
+        if (refs[i].owned && refs[i].uri != nil) { json.free_str(refs[i].uri, ws.alloc); }
         i = i + 1;
     }
 }
-
-# resolve the document named by `uri` against the dependency graph of
 # the project root that governs it and populate `out` with its interner, file,
 # Ast, ResolveResult, governing root, and module id. false when the document is
-# unknown or resolution fails. the module id is the root's synthetic buffer id,
-# matching the one resolution bound local symbols under, so the local /
-# cross-module distinction holds
+# unknown or resolution fails. Project documents use their compiler-owned
+# ModuleId; standalone files use the editor FileId only within that fallback
+# Session.
 fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
     if (uri == nil) { ret false; }
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
 
-    val root: *project.Root = project.root_for(ws, uri);
-    val rr_r: Result[*res.ResolveResult, str] = project.resolve_doc(ws, root, doc.file_id);
-    if (is_err[*res.ResolveResult, str](rr_r)) { ret false; }
-    out.rr = unwrap_ok[*res.ResolveResult, str](rr_r);
-    out.a  = editor.ast_of(es, doc.file_id);
-    if (out.a == nil) { ret false; }
+    val vr: Result[project.DocumentView, str] = project.document_view(ws, doc);
+    if (!is_err[project.DocumentView, str](vr)) {
+        val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        out.rr       = v.rr;
+        out.a        = v.a;
+        out.sr       = v.sr;
+        out.interner = v.interner;
+        out.file     = v.file;
+        out.root     = v.root;
+        out.own      = v.module;
+        ret true;
+    }
+    if (project.has_project(ws, uri)) { ret false; }
 
-    val fo: Option[*src.SourceFile] = src.get(project.sources(ws), doc.file_id);
+    val rr: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
+    if (is_err[*res.ResolveResult, str](rr)) { ret false; }
+    out.rr = unwrap_ok[*res.ResolveResult, str](rr);
+    out.a = editor.ast_of(es, doc.file_id);
+    if (out.a == nil) { ret false; }
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
     if (!is_some[*src.SourceFile](fo)) { ret false; }
-    out.interner = project.interner(ws);
-    out.file     = unwrap[*src.SourceFile](fo);
-    out.fid      = doc.file_id;
-    out.root     = root;
-    out.own      = project.own_module(root, doc.file_id);
+    out.sr = nil;
+    val sr: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
+    if (!is_err[*sema.SemaResult, str](sr)) { out.sr = unwrap_ok[*sema.SemaResult, str](sr); }
+    out.interner = ?es.s.interner;
+    out.file = unwrap[*src.SourceFile](fo);
+    out.root = nil;
+    out.own = doc.file_id::sess.ModuleId;
     ret true;
 }
 
 # analyze the target document and resolve the request's cursor position
 # to a byte offset, or none when the document is unknown / unresolvable or the
 # position is invalid (callers fall back to a null / empty reply)
-fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, body: str, uri: str, out: *Analyzed) Option[usize] {
+fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, params: *sj.Value, uri: str, out: *Analyzed) Option[usize] {
     if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
 
-    val line: i64 = json.extract_number_after(body, "\"position\"", "\"line\"", alloc);
-    val ch:   i64 = json.extract_number_after(body, "\"position\"", "\"character\"", alloc);
+    val pos: *sj.Value = json.member(params, "position");
+    val line: i64 = json.number(json.member(pos, "line"), -1);
+    val ch:   i64 = json.number(json.member(pos, "character"), -1);
     if (line < 0 || ch < 0) { ret none[usize](); }
 
     ret positions.offset_at(out.file, line::usize, ch::usize);
@@ -2070,4 +2004,3 @@ fun free4(a: str, b: str, c: str, d: str, alloc: *Allocator) {
     json.free_str(c, alloc);
     json.free_str(d, alloc);
 }
-

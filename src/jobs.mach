@@ -1,0 +1,415 @@
+# a single-consumer job queue handing message bodies to an analysis thread
+#
+# the protocol loop must keep reading while the compiler works. a cold project
+# analysis takes seconds, and running it on the reading thread means the server
+# cannot see a cancellation, a newer edit, or a shutdown until it finishes -
+# which is how an editor concludes the server is dead and restarts it, only to
+# pay the same cost again.
+#
+# so the reading thread owns stdin and this queue, and one worker thread owns
+# everything the compiler touches: the sessions, the snapshots, the document
+# registry, and the feature handlers. exactly one thread ever reaches compiler
+# state, so nothing there needs locking; the queue is the only shared structure
+# and the only thing a lock protects.
+#
+# the worker blocks on a futex rather than polling, so an idle server costs no
+# CPU: `seq` advances on every push and on stop, and a waiter that saw the old
+# value sleeps until someone bumps it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+
+use mem:    std.memory;
+use os:     std.system.os;
+use atomic: std.sync.atomic;
+use mutex:  std.sync.mutex;
+use thread: std.sync.thread;
+
+# what the worker does with one dequeued body
+#
+# ctx is the opaque pointer handed to `start`; body is owned by the callback
+# for the duration of the call and released by the queue afterwards.
+pub def JobFn: fun(ptr, str, usize);
+
+# one queued message body, owned by the queue
+# ---
+# body: nul-terminated copy of the message body
+# len:  body length in bytes, excluding the terminator
+rec Job {
+    body: str;
+    len:  usize;
+}
+
+# the queue and the worker thread draining it
+#
+# `lock` guards `jobs`, `head`, `count`, and `closed`. `seq` is the futex word
+# the worker sleeps on and is written under the lock but read without it, so a
+# waiter can compare against a value it sampled before locking.
+# ---
+# alloc:  allocator backing the ring and every queued body
+# lock:   guards the ring and `closed`
+# jobs:   ring of `cap` slots
+# cap:    ring length
+# head:   index of the next job to pop
+# count:  queued jobs
+# seq:    futex word, advanced on every push and on close
+# closed: no further pushes are accepted and the worker should drain and exit
+# th:     the worker thread handle
+# live:   whether `th` was spawned and still needs joining
+pub rec Queue {
+    alloc:  *Allocator;
+    lock:   mutex.Mutex;
+    jobs:   *Job;
+    cap:    usize;
+    head:   usize;
+    count:  usize;
+    seq:    i64;
+    closed: bool;
+    th:     thread.Thread;
+    live:   bool;
+}
+
+# the queue a spawned worker drains
+#
+# `thread.spawn_with` hands the entry a single opaque pointer and std has no
+# thread-local storage, so the callback and its context ride the queue itself.
+# ---
+# q:  the queue to drain
+# f:  the callback to run per job
+# fx: opaque context handed to `f`
+rec Bound {
+    q:  *Queue;
+    f:  JobFn;
+    fx: ptr;
+}
+
+# bound state for the single worker, addressed by the spawned thread
+#
+# The handle must outlive the thread and std threads take one pointer, so the
+# binding lives here rather than in a caller frame. One server runs one queue.
+var BOUND: Bound;
+
+# how many messages may wait before a push is refused
+#
+# The queue holds whole message bodies, and `didChange` carries a document's
+# full text, so this bounds memory as well as latency. A client that outruns
+# the worker by more than this is answered rather than buffered without limit.
+pub val CAPACITY: usize = 256;
+
+# construct an empty queue over `alloc`
+# ---
+# q:     queue to initialize
+# alloc: allocator backing the ring and queued bodies; must outlive the queue
+# ret:   true on success
+pub fun init(q: *Queue, alloc: *Allocator) bool {
+    q.alloc  = alloc;
+    q.lock   = mutex.make();
+    q.jobs   = nil;
+    q.cap    = 0;
+    q.head   = 0;
+    q.count  = 0;
+    q.seq    = 0;
+    q.closed = false;
+    q.live   = false;
+
+    val r: Result[*Job, str] = allocate[Job](alloc, CAPACITY);
+    if (is_err[*Job, str](r)) { ret false; }
+    q.jobs = unwrap_ok[*Job, str](r);
+    q.cap  = CAPACITY;
+    var i: usize = 0;
+    for (i < q.cap) {
+        q.jobs[i].body = nil;
+        q.jobs[i].len  = 0;
+        i = i + 1;
+    }
+    ret true;
+}
+
+# spawn the worker thread draining `q` into `f`
+#
+# `f` runs on the worker for every pushed body, in push order, one at a time.
+# ---
+# q:   the initialized queue
+# f:   per-job callback
+# fx:  opaque context handed to `f`
+# ret: true when the thread started
+pub fun start(q: *Queue, f: JobFn, fx: ptr) bool {
+    if (q.jobs == nil || q.live) { ret false; }
+    BOUND.q  = q;
+    BOUND.f  = f;
+    BOUND.fx = fx;
+    thread.spawn_with(worker_main, (?BOUND)::*u8, ?q.th);
+    if (q.th.tid < 0) { ret false; }
+    q.live = true;
+    ret true;
+}
+
+# copy `body` onto the queue and wake the worker
+#
+# The body is copied because the caller's frame owns the transport buffer and
+# reuses it for the next frame.
+# ---
+# q:    the queue
+# body: nul-terminated message body
+# len:  body length in bytes
+# ret:  true when queued; false when closed, full, or out of memory
+pub fun push(q: *Queue, body: str, len: usize) bool {
+    if (body == nil) { ret false; }
+
+    val r: Result[*u8, str] = allocate[u8](q.alloc, len + 1);
+    if (is_err[*u8, str](r)) { ret false; }
+    val copy: *u8 = unwrap_ok[*u8, str](r);
+    if (len > 0) { mem.raw_copy(copy::ptr, body::ptr, len); }
+    copy[len] = 0;
+
+    mutex.lock(?q.lock);
+    if (q.closed || q.count == q.cap) {
+        mutex.unlock(?q.lock);
+        deallocate[u8](q.alloc, copy, len + 1);
+        ret false;
+    }
+    val slot: usize = (q.head + q.count) % q.cap;
+    q.jobs[slot].body = copy::str;
+    q.jobs[slot].len  = len;
+    q.count = q.count + 1;
+    atomic.store(?q.seq, atomic.load(?q.seq) + 1);
+    mutex.unlock(?q.lock);
+
+    os.thread_wake(?q.seq);
+    ret true;
+}
+
+# refuse further pushes and wake the worker so it drains and exits
+pub fun close(q: *Queue) {
+    mutex.lock(?q.lock);
+    q.closed = true;
+    atomic.store(?q.seq, atomic.load(?q.seq) + 1);
+    mutex.unlock(?q.lock);
+    os.thread_wake(?q.seq);
+}
+
+# close the queue and wait for the worker to finish the jobs already queued
+#
+# Every accepted message is handled before this returns, so a shutdown does not
+# strand a reply the client is waiting for.
+pub fun join(q: *Queue) {
+    close(q);
+    if (q.live) {
+        thread.join(?q.th);
+        q.live = false;
+    }
+}
+
+# release the ring and any body still queued
+pub fun dnit(q: *Queue) {
+    if (q.live) { join(q); }
+    if (q.jobs == nil) { ret; }
+    var i: usize = 0;
+    for (i < q.count) {
+        val slot: usize = (q.head + i) % q.cap;
+        free_job(q, ?q.jobs[slot]);
+        i = i + 1;
+    }
+    deallocate[Job](q.alloc, q.jobs, q.cap);
+    q.jobs  = nil;
+    q.cap   = 0;
+    q.count = 0;
+}
+
+# how many messages are waiting
+#
+# A sample, not a reservation: the worker may pop between the read and its use.
+pub fun depth(q: *Queue) usize {
+    mutex.lock(?q.lock);
+    val n: usize = q.count;
+    mutex.unlock(?q.lock);
+    ret n;
+}
+
+# release one job's owned body
+fun free_job(q: *Queue, j: *Job) {
+    if (j.body != nil) { deallocate[u8](q.alloc, j.body::*u8, j.len + 1); }
+    j.body = nil;
+    j.len  = 0;
+}
+
+# take the next job, blocking until one arrives or the queue closes
+#
+# The futex word is sampled before locking so a push that lands between the
+# empty check and the sleep changes the value the sleep compares against, and
+# the sleep returns immediately instead of missing the wake.
+# ---
+# q:   the queue
+# out: receives the popped job on success
+# ret: true when a job was taken; false once the queue is closed and drained
+fun pop_blocking(q: *Queue, out: *Job) bool {
+    for (true) {
+        val sampled: i64 = atomic.load(?q.seq);
+
+        mutex.lock(?q.lock);
+        if (q.count > 0) {
+            @out = q.jobs[q.head];
+            q.jobs[q.head].body = nil;
+            q.jobs[q.head].len  = 0;
+            q.head  = (q.head + 1) % q.cap;
+            q.count = q.count - 1;
+            mutex.unlock(?q.lock);
+            ret true;
+        }
+        val done: bool = q.closed;
+        mutex.unlock(?q.lock);
+
+        if (done) { ret false; }
+        os.thread_wait(?q.seq, sampled);
+    }
+    ret false;
+}
+
+# the worker thread entry: drain the queue into the bound callback until close
+fun worker_main(arg: *u8) {
+    val b: *Bound = arg::*Bound;
+    val q: *Queue = b.q;
+    for (true) {
+        var j: Job;
+        j.body = nil;
+        j.len  = 0;
+        if (!pop_blocking(q, ?j)) { brk; }
+        if (j.body != nil) { b.f(b.fx, j.body, j.len); }
+        free_job(q, ?j);
+    }
+}
+
+use page: std.allocator.page;
+use std.types.string.str_equals;
+
+# the queue's contract is that every accepted body reaches the callback exactly
+# once and in push order, so the tests assert the sequence rather than a count
+
+var SEEN:     [64]u8;
+var SEEN_LEN: i64 = 0;
+var SEEN_SUM: i64 = 0;
+
+fun record(ctx: ptr, body: str, len: usize) {
+    if (SEEN_LEN < 64) {
+        SEEN[SEEN_LEN::usize] = body[0];
+        SEEN_LEN = SEEN_LEN + 1;
+    }
+    SEEN_SUM = SEEN_SUM + len::i64;
+}
+
+test "jobs: every pushed body reaches the worker once, in order" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    SEEN_LEN = 0;
+    SEEN_SUM = 0;
+    if (!start(?q, record, nil)) { dnit(?q); ret 1; }
+
+    if (!push(?q, "a1", 2)) { dnit(?q); ret 1; }
+    if (!push(?q, "b22", 3)) { dnit(?q); ret 1; }
+    if (!push(?q, "c333", 4)) { dnit(?q); ret 1; }
+    join(?q);
+
+    var fail: bool = false;
+    if (SEEN_LEN != 3)   { fail = true; }
+    or {
+        if (SEEN[0] != 'a') { fail = true; }
+        if (SEEN[1] != 'b') { fail = true; }
+        if (SEEN[2] != 'c') { fail = true; }
+    }
+    if (SEEN_SUM != 9) { fail = true; }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the worker must sleep on the futex rather than spin, so a queue that is
+# started and immediately joined without work still terminates
+test "jobs: an idle worker joins without any job" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    SEEN_LEN = 0;
+    if (!start(?q, record, nil)) { dnit(?q); ret 1; }
+    join(?q);
+    var fail: bool = false;
+    if (SEEN_LEN != 0) { fail = true; }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a body is copied on push, so the caller's buffer may be reused immediately
+test "jobs: a pushed body is copied, not borrowed" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    SEEN_LEN = 0;
+    SEEN_SUM = 0;
+
+    var scratch: [8]u8;
+    scratch[0] = 'x';
+    scratch[1] = 'y';
+    scratch[2] = 0;
+    if (!push(?q, (?scratch[0])::str, 2)) { dnit(?q); ret 1; }
+    scratch[0] = 'z';
+
+    if (!start(?q, record, nil)) { dnit(?q); ret 1; }
+    join(?q);
+
+    var fail: bool = false;
+    if (SEEN_LEN != 1)  { fail = true; }
+    or { if (SEEN[0] != 'x') { fail = true; } }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the bound is what stops a client from buying unbounded memory with didChange
+test "jobs: a full queue refuses a push instead of growing" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+
+    var fail: bool = false;
+    var i: usize = 0;
+    for (i < CAPACITY) {
+        if (!push(?q, "j", 1)) { fail = true; }
+        i = i + 1;
+    }
+    if (push(?q, "overflow", 8)) { fail = true; }
+    if (depth(?q) != CAPACITY)   { fail = true; }
+
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a closed queue accepts nothing further, so a shutdown cannot be overtaken
+test "jobs: a closed queue refuses further pushes" {
+    var pa: Allocator;
+    page.make(?pa);
+    var q: Queue;
+    if (!init(?q, ?pa)) { ret 1; }
+    close(?q);
+    var fail: bool = false;
+    if (push(?q, "late", 4)) { fail = true; }
+    dnit(?q);
+    if (fail) { ret 1; }
+    ret 0;
+}

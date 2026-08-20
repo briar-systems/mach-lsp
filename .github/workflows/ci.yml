@@ -29,8 +29,11 @@ jobs:
       - name: Pull dependencies
         run: mach dep pull
 
-      - name: Build
-        run: mach build .
+      - name: Build (debug)
+        run: mach build . --target linux-x86_64 --profile debug
 
       - name: Test
         run: mach test .
+
+      - name: Protocol smoke
+        run: python3 test/lsp_protocol.py out/linux-x86_64/debug/bin/mls

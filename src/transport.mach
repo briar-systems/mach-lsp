@@ -1,9 +1,9 @@
-# LSP base-protocol framing over stdin/stdout
+# bounded LSP base-protocol framing over stdin/stdout
 #
-# every message is a set of `Header: value\r\n` lines, a blank line, then a
-# body of exactly `Content-Length` bytes. this module reads one framed message
-# at a time from stdin and writes one framed message to stdout. it owns no
-# protocol semantics - the body is opaque JSON the server layer interprets.
+# reads one `Content-Length` frame at a time, distinguishes clean EOF from a
+# truncated / malformed frame and an OS error, and caps both headers and bodies
+# before allocating from attacker-controlled lengths. writes are latched: once
+# stdout fails, every later send reports false without attempting more output.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -17,7 +17,6 @@ use std.types.result.unwrap_ok;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
-use std.allocator.reallocate;
 use std.allocator.deallocate;
 
 use os:  std.system.os;
@@ -25,230 +24,273 @@ use mem: std.memory;
 
 use trace: mls.trace;
 
-# one received LSP message. `body` is the owned, nil-terminated JSON
-# payload of length `body_len`; free it with `message_free`
-# ---
-# body:     owned nil-terminated JSON body
-# body_len: length of the body in bytes (excluding the terminator)
+# one received message. `body` is owned and nil-terminated
 pub rec Message {
     body:     str;
     body_len: usize;
 }
 
-# the only response header the server emits
-val HEADER_PREFIX: str = "Content-Length: ";
-# the header/body separator
-val CRLF_CRLF: str = "\r\n\r\n";
-# starting capacity for the header accumulation buffer
-val HEADER_BUF_INITIAL: usize = 256;
-# lowercased Content-Length header name for case-insensitive matching
-val CL_KEY: str = "content-length";
+# read_message outcomes
+pub def ReadStatus: u8;
+pub val READ_OK:        ReadStatus = 0;
+pub val READ_EOF:       ReadStatus = 1;
+pub val READ_MALFORMED: ReadStatus = 2;
+pub val READ_ERROR:     ReadStatus = 3;
 
-# release a message's owned body
+# protocol resource bounds. 8 KiB is ample for LSP headers; 16 MiB admits large
+# full-text didOpen/didChange messages without allowing an advertised length to
+# drive an unbounded allocation
+val HEADER_MAX: usize = 8 * 1024;
+val BODY_MAX:   usize = 16 * 1024 * 1024;
+
+val HEADER_PREFIX: str = "Content-Length: ";
+val CRLF_CRLF:     str = "\r\n\r\n";
+val CL_KEY:        str = "content-length";
+
+# output has one process-wide destination (stdout). latching its first failure
+# prevents later handlers from silently pretending that a response was sent
+var WRITE_FAILED: bool = false;
+
+# release a message's owned body and zero it
 # ---
-# msg:   message whose body is freed and zeroed
-# alloc: allocator the body was read with
+# msg:   message returned by read_message
+# alloc: allocator passed to read_message
 pub fun message_free(msg: *Message, alloc: *Allocator) {
-    if (msg.body != nil && msg.body_len > 0) {
-        deallocate[u8](alloc, msg.body::*u8, msg.body_len + 1);
-    }
+    if (msg.body != nil) { deallocate[u8](alloc, msg.body::*u8, msg.body_len + 1); }
     msg.body = nil;
     msg.body_len = 0;
 }
 
-# read one framed message from stdin into `msg`
+# whether any response write has failed during this process
 # ---
-# msg:   message to populate; its body is owned by `alloc` on success
-# alloc: allocator for the header scratch buffer and the body
-# ret:   true on a complete message, false on EOF or a malformed frame
-pub fun read_message(msg: *Message, alloc: *Allocator) bool {
+# ret: true after the first failed allocation or stdout write
+pub fun write_failed() bool {
+    ret WRITE_FAILED;
+}
+
+# read one bounded frame from stdin
+# ---
+# msg:   output message, owned on READ_OK and zeroed otherwise
+# alloc: allocator for bounded header and body storage
+# ret:   READ_OK, clean READ_EOF, READ_MALFORMED, or READ_ERROR
+pub fun read_message(msg: *Message, alloc: *Allocator) ReadStatus {
     msg.body = nil;
     msg.body_len = 0;
 
-    var hdr_cap: usize = HEADER_BUF_INITIAL;
-    val hr: Result[*u8, str] = allocate[u8](alloc, hdr_cap);
-    if (is_err[*u8, str](hr)) { ret false; }
-    var hdr_buf: *u8 = unwrap_ok[*u8, str](hr);
+    val hr: Result[*u8, str] = allocate[u8](alloc, HEADER_MAX);
+    if (is_err[*u8, str](hr)) { ret READ_ERROR; }
+    val header: *u8 = unwrap_ok[*u8, str](hr);
 
-    var hdr_len: usize = 0;
-    var done: bool = false;
-    for (!done) {
+    var header_len: usize = 0;
+    for (true) {
+        if (header_len >= HEADER_MAX) {
+            deallocate[u8](alloc, header, HEADER_MAX);
+            ret READ_MALFORMED;
+        }
         var c: u8;
-        val n: i64 = os.read(os.STDIN_FD, ?c, 1);
-        if (n <= 0) {
-            deallocate[u8](alloc, hdr_buf, hdr_cap);
-            ret false;
+        val n: i64 = read_retry(?c, 1);
+        if (n == 0) {
+            deallocate[u8](alloc, header, HEADER_MAX);
+            if (header_len == 0) { ret READ_EOF; }
+            ret READ_MALFORMED;
         }
-        hdr_buf[hdr_len] = c;
-        hdr_len = hdr_len + 1;
+        if (n < 0) {
+            deallocate[u8](alloc, header, HEADER_MAX);
+            ret READ_ERROR;
+        }
+        header[header_len] = c;
+        header_len = header_len + 1;
 
-        if (hdr_len >= hdr_cap) {
-            val new_cap: usize = hdr_cap * 2;
-            val gr: Result[*u8, str] = reallocate[u8](alloc, hdr_buf, hdr_cap, new_cap);
-            if (is_err[*u8, str](gr)) {
-                deallocate[u8](alloc, hdr_buf, hdr_cap);
-                ret false;
-            }
-            hdr_buf = unwrap_ok[*u8, str](gr);
-            hdr_cap = new_cap;
-        }
-
-        if (hdr_len >= 4 &&
-            hdr_buf[hdr_len - 4] == '\r' && hdr_buf[hdr_len - 3] == '\n' &&
-            hdr_buf[hdr_len - 2] == '\r' && hdr_buf[hdr_len - 1] == '\n') {
-            done = true;
-        }
+        if (header_len >= 4
+            && header[header_len - 4] == '\r' && header[header_len - 3] == '\n'
+            && header[header_len - 2] == '\r' && header[header_len - 1] == '\n') { brk; }
     }
 
-    val content_length: i64 = parse_content_length(hdr_buf, hdr_len);
-    deallocate[u8](alloc, hdr_buf, hdr_cap);
-    if (content_length <= 0) {
-        trace.log("transport: missing or invalid Content-Length\n");
-        ret false;
+    val body_len_r: i64 = parse_content_length(header, header_len);
+    deallocate[u8](alloc, header, HEADER_MAX);
+    if (body_len_r <= 0 || body_len_r::usize > BODY_MAX) {
+        trace.log("transport: missing, invalid, or oversized Content-Length\n");
+        ret READ_MALFORMED;
     }
-    val body_len: usize = content_length::usize;
+    val body_len: usize = body_len_r::usize;
 
+    # body_len is capped below usize max, so the terminator addition cannot wrap
     val br: Result[*u8, str] = allocate[u8](alloc, body_len + 1);
-    if (is_err[*u8, str](br)) { ret false; }
-    val body_buf: *u8 = unwrap_ok[*u8, str](br);
+    if (is_err[*u8, str](br)) { ret READ_ERROR; }
+    val body: *u8 = unwrap_ok[*u8, str](br);
 
     var got: usize = 0;
     for (got < body_len) {
-        val n: i64 = os.read(os.STDIN_FD, (body_buf::usize + got)::*u8, body_len - got);
-        if (n <= 0) {
-            deallocate[u8](alloc, body_buf, body_len + 1);
-            ret false;
+        val n: i64 = read_retry((body::usize + got)::*u8, body_len - got);
+        if (n == 0) {
+            deallocate[u8](alloc, body, body_len + 1);
+            ret READ_MALFORMED;
+        }
+        if (n < 0) {
+            deallocate[u8](alloc, body, body_len + 1);
+            ret READ_ERROR;
         }
         got = got + n::usize;
     }
-    body_buf[body_len] = 0;
-
-    msg.body = body_buf::str;
+    body[body_len] = 0;
+    msg.body = body::str;
     msg.body_len = body_len;
-    ret true;
+    ret READ_OK;
 }
 
-# write `body` as one framed message to stdout
+# frame and write `body`
 # ---
-# body:  nil-terminated JSON body to send; nil / empty is a no-op
-# alloc: allocator for the send buffer
-pub fun send_message(body: str, alloc: *Allocator) {
-    if (body == nil) { ret; }
+# body:  nil-terminated JSON payload
+# alloc: allocator for the combined header/body frame
+# ret:   true when fully written, false on allocation or stdout failure
+pub fun send_message(body: str, alloc: *Allocator) bool {
+    if (WRITE_FAILED) { ret false; }
+    if (body == nil || str_len(body) == 0) { ret true; }
     val body_len: usize = str_len(body);
-    if (body_len == 0) { ret; }
 
     var digits: [20]u8;
     val digit_len: usize = usize_to_buf(?digits[0], 20, body_len);
     val digit_start: usize = 20 - digit_len;
-
     val prefix_len: usize = str_len(HEADER_PREFIX);
     val sep_len: usize = str_len(CRLF_CRLF);
-    val total: usize = prefix_len + digit_len + sep_len + body_len;
+    # the response body is server-owned and bounded by available address space;
+    # guard the two fixed-size additions before allocating the frame
+    val fixed: usize = prefix_len + digit_len + sep_len;
+    val usize_max: usize = ~(0::usize);
+    if (body_len > usize_max - fixed) { WRITE_FAILED = true; ret false; }
+    val total: usize = fixed + body_len;
 
     val r: Result[*u8, str] = allocate[u8](alloc, total);
-    if (is_err[*u8, str](r)) { ret; }
+    if (is_err[*u8, str](r)) { WRITE_FAILED = true; ret false; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
-
     var off: usize = 0;
-    mem.raw_copy((buf::usize + off)::ptr, HEADER_PREFIX::ptr, prefix_len);
-    off = off + prefix_len;
-    mem.raw_copy((buf::usize + off)::ptr, (?digits[digit_start])::ptr, digit_len);
-    off = off + digit_len;
-    mem.raw_copy((buf::usize + off)::ptr, CRLF_CRLF::ptr, sep_len);
-    off = off + sep_len;
+    mem.raw_copy((buf::usize + off)::ptr, HEADER_PREFIX::ptr, prefix_len); off = off + prefix_len;
+    mem.raw_copy((buf::usize + off)::ptr, (?digits[digit_start])::ptr, digit_len); off = off + digit_len;
+    mem.raw_copy((buf::usize + off)::ptr, CRLF_CRLF::ptr, sep_len); off = off + sep_len;
     mem.raw_copy((buf::usize + off)::ptr, body::ptr, body_len);
 
-    trace.log("send: ");
-    trace.log(body);
-    trace.log("\n");
-
-    write_all(buf, total);
+    trace.log("send: "); trace.log(body); trace.log("\n");
+    val ok: bool = write_all(buf, total);
     deallocate[u8](alloc, buf, total);
+    if (!ok) { WRITE_FAILED = true; }
+    ret ok;
 }
 
-# write exactly `len` bytes of `buf` to stdout, retrying short writes
-fun write_all(buf: *u8, len: usize) {
+# write exactly `len`, accepting short writes. os.write retries EINTR on every
+# supported backend; a zero/negative result is a terminal output failure
+fun write_all(buf: *u8, len: usize) bool {
     var off: usize = 0;
     for (off < len) {
-        val n: i64 = os.write(os.STDOUT_FD, (buf::usize + off)::*u8, len - off);
-        if (n <= 0) { ret; }
+        val n: i64 = write_retry((buf::usize + off)::*u8, len - off);
+        if (n <= 0) { ret false; }
         off = off + n::usize;
     }
+    ret true;
 }
 
-# scan accumulated header bytes for a Content-Length value
-# (case-insensitive key), or -1 when absent / unparseable
-fun parse_content_length(hdr: *u8, hdr_len: usize) i64 {
-    val cl_len: usize = str_len(CL_KEY);
+# std.system.os retries EINTR internally with a bounded guard. If signals exhaust
+# that guard, retry the operation rather than turning an interruption into an LSP
+# transport failure
+fun read_retry(buf: *u8, len: usize) i64 {
+    for (true) {
+        val n: i64 = os.read(os.STDIN_FD, buf, len);
+        if (n != os.EINTR) { ret n; }
+    }
+    ret os.EINTR;
+}
+
+fun write_retry(buf: *u8, len: usize) i64 {
+    for (true) {
+        val n: i64 = os.write(os.STDOUT_FD, buf, len);
+        if (n != os.EINTR) { ret n; }
+    }
+    ret os.EINTR;
+}
+
+# parse exactly one decimal Content-Length, rejecting duplicate fields, trailing
+# junk, values outside BODY_MAX, and overflow before multiplication
+fun parse_content_length(header: *u8, header_len: usize) i64 {
+    val key_len: usize = str_len(CL_KEY);
+    var found: bool = false;
+    var result: usize = 0;
     var line_start: usize = 0;
     var i: usize = 0;
-    for (i <= hdr_len) {
-        val at_end: bool = (i == hdr_len);
-        val is_nl: bool = (!at_end && hdr[i] == '\n');
-        if (at_end || is_nl) {
+    for (i <= header_len) {
+        val at_end: bool = i == header_len;
+        val at_nl: bool = !at_end && header[i] == '\n';
+        if (at_end || at_nl) {
             var line_end: usize = i;
-            if (line_end > line_start && hdr[line_end - 1] == '\r') { line_end = line_end - 1; }
-
-            var colon: i64 = -1;
+            if (line_end > line_start && header[line_end - 1] == '\r') { line_end = line_end - 1; }
+            var colon: usize = line_end;
             var j: usize = line_start;
             for (j < line_end) {
-                if (hdr[j] == ':') { colon = j::i64; brk; }
+                if (header[j] == ':') { colon = j; brk; }
                 j = j + 1;
             }
-            if (colon >= 0) {
-                val key_len: usize = (colon::usize) - line_start;
-                if (key_len == cl_len) {
-                    var match: bool = true;
-                    var k: usize = 0;
-                    for (k < key_len) {
-                        var ch: u8 = hdr[line_start + k];
-                        if (ch >= 'A' && ch <= 'Z') { ch = ch + 32; }
-                        if (ch != CL_KEY[k]) { match = false; brk; }
-                        k = k + 1;
-                    }
-                    if (match) {
-                        var vs: usize = (colon::usize) + 1;
-                        for (vs < line_end) {
-                            val c: u8 = hdr[vs];
-                            if (c != ' ' && c != '\t') { brk; }
-                            vs = vs + 1;
-                        }
-                        var result: i64 = 0;
-                        var valid: bool = false;
-                        var d: usize = vs;
-                        for (d < line_end) {
-                            val digit: u8 = hdr[d];
-                            if (digit >= '0' && digit <= '9') {
-                                result = result * 10 + ((digit - '0')::i64);
-                                valid = true;
-                            }
-                            or { brk; }
-                            d = d + 1;
-                        }
-                        if (valid) { ret result; }
-                    }
+            if (colon < line_end && colon - line_start == key_len && key_equals(header, line_start, key_len)) {
+                if (found) { ret -1; }
+                found = true;
+                var d: usize = colon + 1;
+                for (d < line_end && (header[d] == ' ' || header[d] == '\t')) { d = d + 1; }
+                if (d == line_end) { ret -1; }
+                for (d < line_end) {
+                    val digit: u8 = header[d];
+                    if (digit < '0' || digit > '9') { ret -1; }
+                    val value: usize = (digit - '0')::usize;
+                    # cap while parsing: this bounds arithmetic as well as allocation
+                    if (result > (BODY_MAX - value) / 10) { ret -1; }
+                    result = result * 10 + value;
+                    d = d + 1;
                 }
             }
             line_start = i + 1;
         }
         i = i + 1;
     }
-    ret -1;
+    if (!found || result == 0 || result > BODY_MAX) { ret -1; }
+    ret result::i64;
 }
 
-# write `value` in base 10 right-aligned into the tail of `buf`,
-# returning the number of digits written
-fun usize_to_buf(buf: *u8, buf_cap: usize, value: usize) usize {
-    if (value == 0) {
-        buf[buf_cap - 1] = '0';
-        ret 1;
+fun key_equals(header: *u8, start: usize, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        var c: u8 = header[start + i];
+        if (c >= 'A' && c <= 'Z') { c = c + 32; }
+        if (c != CL_KEY[i]) { ret false; }
+        i = i + 1;
     }
+    ret true;
+}
+
+fun usize_to_buf(buf: *u8, cap: usize, value: usize) usize {
+    if (value == 0) { buf[cap - 1] = '0'; ret 1; }
     var v: usize = value;
-    var pos: usize = buf_cap;
+    var pos: usize = cap;
     for (v > 0 && pos > 0) {
         pos = pos - 1;
-        buf[pos] = ('0' + (v % 10))::u8;
+        buf[pos] = ('0'::usize + (v % 10))::u8;
         v = v / 10;
     }
-    ret buf_cap - pos;
+    ret cap - pos;
+}
+
+test "mls.transport.parse_content_length:bounded_strict_decimal" {
+    val valid: str = "content-type: application/vscode-jsonrpc; charset=utf-8\r\nCoNtEnT-LeNgTh:\t 42\r\n\r\n";
+    if (parse_content_length(valid::*u8, str_len(valid)) != 42) { ret 1; }
+
+    val boundary: str = "Content-Length: 16777216\r\n\r\n";
+    if (parse_content_length(boundary::*u8, str_len(boundary)) != BODY_MAX::i64) { ret 1; }
+
+    val duplicate: str = "Content-Length: 4\r\ncontent-length: 4\r\n\r\n";
+    if (parse_content_length(duplicate::*u8, str_len(duplicate)) >= 0) { ret 1; }
+
+    val trailing: str = "Content-Length: 12junk\r\n\r\n";
+    if (parse_content_length(trailing::*u8, str_len(trailing)) >= 0) { ret 1; }
+
+    val oversized: str = "Content-Length: 16777217\r\n\r\n";
+    if (parse_content_length(oversized::*u8, str_len(oversized)) >= 0) { ret 1; }
+
+    val overflow: str = "Content-Length: 999999999999999999999999999999999999\r\n\r\n";
+    if (parse_content_length(overflow::*u8, str_len(overflow)) >= 0) { ret 1; }
+    ret 0;
 }

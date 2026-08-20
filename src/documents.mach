@@ -1,10 +1,8 @@
 # the open-document registry bridging LSP URIs to editor buffers
 #
-# the LSP identifies documents by URI; the editor surface identifies buffers by
-# `source.FileId`. this module owns that mapping. `didOpen` registers a URI's
-# text as an editor buffer and records the assigned FileId; `didChange`
-# replaces the buffer text in place; `didClose` retires the entry. each entry
-# keeps its own owned URI copy so it survives the request that created it.
+# the LSP identifies documents by URI while compiler overlays are keyed by
+# canonical filesystem paths. this module owns the live document text, path,
+# and revision; the editor FileId is only the single-file fallback.
 #
 # the editor session is borrowed from the server and reused across documents -
 # it owns the per-buffer analysis and the underlying session owns the source
@@ -16,6 +14,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 use std.types.result.Result;
 use std.types.result.ok;
 use std.types.result.err;
@@ -35,13 +34,21 @@ use editor: mach.lang.editor;
 
 # one tracked open document
 # ---
-# uri:     owned document URI
-# file_id: editor FileId the buffer is registered under
-# in_use:  whether this slot holds a live document
+# uri:       owned document URI
+# path:      owned canonical filesystem path
+# text:      owned current buffer text
+# file_id:   editor FileId used only for the single-file fallback
+# revision:  server-assigned monotonic input revision
+# version:   latest client document version, or -1 when omitted
+# in_use:    whether this slot holds a live document
 pub rec Document {
-    uri:     str;
-    file_id: src.FileId;
-    in_use:  bool;
+    uri:      str;
+    path:     str;
+    text:     str;
+    file_id:  src.FileId;
+    revision: u64;
+    version:  i64;
+    in_use:   bool;
 }
 
 # the registry of tracked documents over a borrowed editor session
@@ -55,6 +62,7 @@ pub rec Store {
     alloc: *Allocator;
     docs:  *Document;
     len:   usize;
+    revision: u64;
 }
 
 # construct an empty document store over an editor session
@@ -68,6 +76,7 @@ pub fun init(es: *editor.EditorSession, alloc: *Allocator) Store {
     st.alloc = alloc;
     st.docs = nil;
     st.len = 0;
+    st.revision = 0;
     ret st;
 }
 
@@ -80,13 +89,14 @@ pub fun dnit(st: *Store) {
         var i: usize = 0;
         for (i < st.len) {
             val d: *Document = ?st.docs[i];
-            if (d.uri != nil) { strutil.str_free(st.alloc, d.uri); }
+            free_owned(st, d);
             i = i + 1;
         }
         deallocate[Document](st.alloc, st.docs, st.len);
     }
     st.docs = nil;
     st.len = 0;
+    st.revision = 0;
 }
 
 # register a document's text as an editor buffer, returning its entry.
@@ -96,26 +106,44 @@ pub fun dnit(st: *Store) {
 # uri:  document URI
 # text: full document text
 # ret:  the tracked Document on success, or an error string
-pub fun open(st: *Store, uri: str, text: str) Result[*Document, str] {
+pub fun open(st: *Store, uri: str, path: str, text: str, version: i64) Result[*Document, str] {
     val existing: *Document = find(st, uri);
     if (existing != nil) {
-        val ur: Result[bool, str] = editor.update(st.es, existing.file_id, text);
-        if (is_err[bool, str](ur)) { ret err[*Document, str](unwrap_err[bool, str](ur)); }
-        ret ok[*Document, str](existing);
+        ret replace(st, existing, path, text, version);
     }
-
-    val fr: Result[src.FileId, str] = editor.open(st.es, uri, text);
-    if (is_err[src.FileId, str](fr)) { ret err[*Document, str](unwrap_err[src.FileId, str](fr)); }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
 
     val slot_r: Result[*Document, str] = ensure_slot(st);
     if (is_err[*Document, str](slot_r)) { ret slot_r; }
     val d: *Document = unwrap_ok[*Document, str](slot_r);
 
-    val dup: Result[str, str] = strutil.str_dup(st.alloc, uri);
-    if (is_err[str, str](dup)) { ret err[*Document, str]("documents: failed to copy uri"); }
-    d.uri = unwrap_ok[str, str](dup);
+    val dup_uri: Result[str, str] = strutil.str_dup(st.alloc, uri);
+    if (is_err[str, str](dup_uri)) { ret err[*Document, str]("documents: failed to copy uri"); }
+    val dup_path: Result[str, str] = strutil.str_dup(st.alloc, path);
+    if (is_err[str, str](dup_path)) {
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup_uri));
+        ret err[*Document, str]("documents: failed to copy path");
+    }
+    val dup_text: Result[str, str] = strutil.str_dup(st.alloc, text);
+    if (is_err[str, str](dup_text)) {
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup_uri));
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup_path));
+        ret err[*Document, str]("documents: failed to copy text");
+    }
+    val fr: Result[src.FileId, str] = editor.open(st.es, uri, text);
+    if (is_err[src.FileId, str](fr)) {
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup_uri));
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup_path));
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup_text));
+        ret err[*Document, str](unwrap_err[src.FileId, str](fr));
+    }
+    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    d.uri = unwrap_ok[str, str](dup_uri);
+    d.path = unwrap_ok[str, str](dup_path);
+    d.text = unwrap_ok[str, str](dup_text);
     d.file_id = fid;
+    st.revision = st.revision + 1;
+    d.revision = st.revision;
+    d.version = version;
     d.in_use = true;
     ret ok[*Document, str](d);
 }
@@ -126,11 +154,50 @@ pub fun open(st: *Store, uri: str, text: str) Result[*Document, str] {
 # uri:  document URI; must already be open
 # text: replacement text
 # ret:  the tracked Document on success, or an error string
-pub fun change(st: *Store, uri: str, text: str) Result[*Document, str] {
+pub fun change(st: *Store, uri: str, text: str, version: i64) Result[*Document, str] {
     val d: *Document = find(st, uri);
     if (d == nil) { ret err[*Document, str]("documents: change of unopened document"); }
+    if (version >= 0 && d.version >= 0 && version <= d.version) {
+        ret err[*Document, str]("documents: stale document version");
+    }
+    val dup: Result[str, str] = strutil.str_dup(st.alloc, text);
+    if (is_err[str, str](dup)) { ret err[*Document, str]("documents: failed to copy text"); }
     val ur: Result[bool, str] = editor.update(st.es, d.file_id, text);
-    if (is_err[bool, str](ur)) { ret err[*Document, str](unwrap_err[bool, str](ur)); }
+    if (is_err[bool, str](ur)) {
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dup));
+        ret err[*Document, str](unwrap_err[bool, str](ur));
+    }
+    strutil.str_free(st.alloc, d.text);
+    d.text = unwrap_ok[str, str](dup);
+    st.revision = st.revision + 1;
+    d.revision = st.revision;
+    d.version = version;
+    ret ok[*Document, str](d);
+}
+
+# replace a reopened document's owned path and text after updating the fallback
+# editor buffer
+fun replace(st: *Store, d: *Document, path: str, text: str, version: i64) Result[*Document, str] {
+    val dp: Result[str, str] = strutil.str_dup(st.alloc, path);
+    if (is_err[str, str](dp)) { ret err[*Document, str]("documents: failed to copy path"); }
+    val dt: Result[str, str] = strutil.str_dup(st.alloc, text);
+    if (is_err[str, str](dt)) {
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dp));
+        ret err[*Document, str]("documents: failed to copy text");
+    }
+    val ur: Result[bool, str] = editor.update(st.es, d.file_id, text);
+    if (is_err[bool, str](ur)) {
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dp));
+        strutil.str_free(st.alloc, unwrap_ok[str, str](dt));
+        ret err[*Document, str](unwrap_err[bool, str](ur));
+    }
+    strutil.str_free(st.alloc, d.path);
+    strutil.str_free(st.alloc, d.text);
+    d.path = unwrap_ok[str, str](dp);
+    d.text = unwrap_ok[str, str](dt);
+    st.revision = st.revision + 1;
+    d.revision = st.revision;
+    d.version = version;
     ret ok[*Document, str](d);
 }
 
@@ -143,9 +210,31 @@ pub fun change(st: *Store, uri: str, text: str) Result[*Document, str] {
 pub fun close(st: *Store, uri: str) {
     val d: *Document = find(st, uri);
     if (d == nil) { ret; }
-    if (d.uri != nil) { strutil.str_free(st.alloc, d.uri); }
-    d.uri = nil;
+    free_owned(st, d);
     d.in_use = false;
+}
+
+# stamp a close in the store's monotonic mutation domain while the document's
+# path is still available for compiler-overlay removal
+# ---
+# st:  document store
+# uri: closing document URI
+# ret: live document stamped with the close revision, or nil
+pub fun closing(st: *Store, uri: str) *Document {
+    val d: *Document = find(st, uri);
+    if (d == nil) { ret nil; }
+    st.revision = st.revision + 1;
+    d.revision = st.revision;
+    ret d;
+}
+
+fun free_owned(st: *Store, d: *Document) {
+    if (d.uri != nil) { strutil.str_free(st.alloc, d.uri); }
+    if (d.path != nil) { strutil.str_free(st.alloc, d.path); }
+    if (d.text != nil) { strutil.str_free(st.alloc, d.text); }
+    d.uri = nil;
+    d.path = nil;
+    d.text = nil;
 }
 
 # the number of Document slots in the store. paired with `at` to
@@ -211,7 +300,11 @@ fun ensure_slot(st: *Store) Result[*Document, str] {
     for (z < new_len) {
         val nb: *Document = ?st.docs[z];
         nb.uri = nil;
+        nb.path = nil;
+        nb.text = nil;
         nb.file_id = 0::src.FileId;
+        nb.revision = 0;
+        nb.version = 0 - 1;
         nb.in_use = false;
         z = z + 1;
     }

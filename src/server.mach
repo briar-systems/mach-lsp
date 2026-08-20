@@ -32,6 +32,10 @@ use editor: mach.lang.editor;
 
 use transport:   mls.transport;
 use json:        mls.json;
+use sj:          std.data.json;
+use jobs:        mls.jobs;
+use atomic:      std.sync.atomic;
+use exec:        std.process.exec;
 use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
 use language:    mls.language;
@@ -43,6 +47,18 @@ pub val STATUS_UNINITIALIZED: u8 = 0;
 pub val STATUS_RUNNING:       u8 = 1;
 pub val STATUS_SHUTTING_DOWN: u8 = 2;
 pub val STATUS_EXITED:        u8 = 3;
+# language features, as dispatch selectors
+val FEATURE_HOVER:           u8 = 0;
+val FEATURE_DEFINITION:      u8 = 1;
+val FEATURE_REFERENCES:      u8 = 2;
+val FEATURE_RENAME:          u8 = 3;
+val FEATURE_PREPARE_RENAME:  u8 = 4;
+val FEATURE_DOCUMENT_SYMBOL: u8 = 5;
+val FEATURE_COMPLETION:      u8 = 6;
+
+val WATCH_FALLBACK: u8 = 0;
+val WATCH_PENDING:  u8 = 1;
+val WATCH_ACTIVE:   u8 = 2;
 
 # the long-lived server state
 # ---
@@ -53,6 +69,11 @@ pub val STATUS_EXITED:        u8 = 3;
 # es:            editor session over `s` (per-buffer analysis)
 # docs:          URI -> editor buffer registry
 # ws:            per-root project graphs backing cross-module analysis
+# rd:            per-message JSON parse arena, owned by the analysis thread
+# q:             message queue feeding the analysis thread
+# stop:          set once the reading thread should stop; read atomically
+# deferred:      a document changed but its analysis was postponed behind newer
+#                input, and must run once the queue drains
 # watch_dynamic: whether the client supports dynamic file-watch registration
 #                (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
@@ -63,7 +84,12 @@ pub rec Server {
     es:            editor.EditorSession;
     docs:          documents.Store;
     ws:            project.Workspace;
+    rd:            json.Reader;
+    q:             jobs.Queue;
+    stop:          i64;
+    deferred:      bool;
     watch_dynamic: bool;
+    watch_state:   u8;
 }
 
 # build a server over the given allocator
@@ -76,6 +102,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.exit_code = 0;
     srv.alloc = alloc;
     srv.watch_dynamic = false;
+    srv.watch_state = WATCH_FALLBACK;
 
     val sr: Result[sess.Session, str] = sess.init(alloc);
     if (is_err[sess.Session, str](sr)) { ret false; }
@@ -83,7 +110,12 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 
     srv.es = editor.init(?srv.s);
     srv.docs = documents.init(?srv.es, alloc);
-    srv.ws = project.init(?srv.s, ?srv.es, alloc);
+    srv.ws = project.init(?srv.s, alloc);
+    project.attach_documents(?srv.ws, ?srv.docs);
+    if (!json.reader_init(?srv.rd, alloc)) { ret false; }
+    srv.stop = 0;
+    srv.deferred = false;
+    if (!jobs.init(?srv.q, alloc)) { ret false; }
     ret true;
 }
 
@@ -91,6 +123,8 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # ---
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
+    jobs.dnit(?srv.q);
+    json.reader_dnit(?srv.rd);
     documents.dnit(?srv.docs);
     project.dnit(?srv.ws);
     editor.dnit(?srv.es);
@@ -98,199 +132,203 @@ pub fun dnit(srv: *Server) {
     srv.status = STATUS_EXITED;
 }
 
-# read and dispatch framed messages until the server exits
+# read framed messages until input ends, handing each to the analysis thread
+#
+# This thread owns stdin and nothing else. Every message - parsing included -
+# is handled on the worker, so the compiler's state has exactly one owner and
+# needs no locking, and a cold analysis cannot stop the server from reading the
+# cancellation, edit, or shutdown that follows it.
+#
+# The worker decides the exit code, so the read loop drains the queue before
+# reading it: an EOF arriving while `shutdown` is still queued must not be
+# mistaken for input closing before shutdown.
 # ---
 # srv: the server to drive
 # ret: the process exit code
 pub fun run(srv: *Server) i64 {
     trace.log("=== mach-lsp started ===\n");
 
-    for (srv.status != STATUS_EXITED) {
+    if (!jobs.start(?srv.q, handle_job, (srv)::ptr)) {
+        trace.log("server: could not start the analysis thread\n");
+        ret 1;
+    }
+
+    var last_read: transport.ReadStatus = transport.READ_OK;
+    for (true) {
         var msg: transport.Message;
-        val ok: bool = transport.read_message(?msg, srv.alloc);
-        if (!ok) {
-            if (srv.status == STATUS_SHUTTING_DOWN) {
-                srv.status = STATUS_EXITED;
-                brk;
-            }
-            trace.log("transport: read failed\n");
-            srv.exit_code = 1;
-            srv.status = STATUS_EXITED;
+        last_read = transport.read_message(?msg, srv.alloc);
+        if (last_read != transport.READ_OK) {
+            if (last_read == transport.READ_EOF)        { trace.log("transport: input closed\n"); }
+            or (last_read == transport.READ_MALFORMED)  { trace.log("transport: malformed input frame\n"); }
+            or                                          { trace.log("transport: input error\n"); }
             brk;
         }
 
-        trace.log("recv: ");
-        trace.log(msg.body);
-        trace.log("\n");
-
-        dispatch(srv, ?msg);
+        if (!jobs.push(?srv.q, msg.body, msg.body_len)) {
+            trace.logf("server: analysis queue full at {} messages, dropping input",
+                       jobs.depth(?srv.q)::i64);
+        }
         transport.message_free(?msg, srv.alloc);
+        if (atomic.load(?srv.stop) != 0) { brk; }
     }
 
+    # every accepted message is answered before the exit code is decided
+    jobs.join(?srv.q);
     trace.log("=== mach-lsp exiting ===\n");
-    ret srv.exit_code;
+
+    if (transport.write_failed()) { ret 1; }
+    if (srv.status == STATUS_EXITED)       { ret srv.exit_code; }
+    if (last_read == transport.READ_EOF && srv.status == STATUS_SHUTTING_DOWN) { ret 0; }
+    ret 1;
 }
 
-# route one message body by its `method` field
-fun dispatch(srv: *Server, msg: *transport.Message) {
-    val body: str = msg.body;
-    val method: str = json.extract_string(body, "\"method\"", srv.alloc);
-    if (method == nil) { ret; }
+# handle one queued message on the analysis thread
+#
+# The parse arena and every compiler-owned structure belong to this thread.
+fun handle_job(ctx: ptr, body: str, len: usize) {
+    val srv: *Server = ctx::*Server;
 
-    if (str_equals(method, "initialize")) {
-        json.free_str(method, srv.alloc);
-        handle_initialize(srv, body);
-        ret;
+    trace.log("recv: ");
+    trace.log(body);
+    trace.log("\n");
+
+    val started_ns: i64 = trace.now_ns();
+    var parsed: json.Message = json.read(?srv.rd, body, len);
+    if (parsed.valid) { dispatch(srv, ?parsed.root); }
+    or { reply_parse_error(srv); }
+    json.release(?srv.rd);
+
+    # a coalesced burst leaves the newest text unanalyzed; the moment the queue
+    # drains is when that debt comes due, whatever the last message happened to
+    # be. deferring analysis must never mean skipping it.
+    if (srv.deferred && jobs.depth(?srv.q) == 0 && srv.status == STATUS_RUNNING) {
+        srv.deferred = false;
+        republish_all(srv);
     }
-    if (str_equals(method, "initialized")) {
-        json.free_str(method, srv.alloc);
-        handle_initialized(srv);
-        ret;
+    trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
+
+    if (srv.status == STATUS_EXITED || transport.write_failed()) {
+        atomic.store(?srv.stop, 1);
     }
-    if (str_equals(method, "shutdown")) {
-        json.free_str(method, srv.alloc);
-        handle_shutdown(srv, body);
-        ret;
-    }
-    if (str_equals(method, "exit")) {
-        json.free_str(method, srv.alloc);
-        handle_exit(srv);
-        ret;
-    }
+}
+
+# route one parsed message by its `method` member
+#
+# a message with no `method` is a response to something the server asked for.
+# an unknown method gets a JSON-RPC method-not-found error when it carries an
+# id, and is dropped when it does not - a notification owes no response.
+fun dispatch(srv: *Server, root: *sj.Value) {
+    val a: *Allocator = srv.alloc;
+    val method_v: *sj.Value = json.member(root, "method");
+    if (method_v == nil) { handle_response(srv, root); ret; }
+    val method: str = json.text(method_v, a);
+    if (method == nil) { reply_invalid_request(srv, root); ret; }
+    val params: *sj.Value = json.member(root, "params");
+
+    if (str_equals(method, "initialize"))  { json.free_str(method, a); handle_initialize(srv, root, params); ret; }
+    if (str_equals(method, "initialized")) { json.free_str(method, a); handle_initialized(srv); ret; }
+    if (str_equals(method, "shutdown"))    { json.free_str(method, a); handle_shutdown(srv, root); ret; }
+    if (str_equals(method, "exit"))        { json.free_str(method, a); handle_exit(srv); ret; }
 
     if (srv.status != STATUS_RUNNING) {
-        json.free_str(method, srv.alloc);
-        reply_error(srv, body, -32002, "server not initialized");
+        json.free_str(method, a);
+        reply_error(srv, root, -32002, "server not initialized");
         ret;
     }
 
-    if (str_equals(method, "textDocument/didOpen")) {
-        json.free_str(method, srv.alloc);
-        handle_did_open(srv, body);
-        ret;
-    }
-    if (str_equals(method, "textDocument/didChange")) {
-        json.free_str(method, srv.alloc);
-        handle_did_change(srv, body);
-        ret;
-    }
-    if (str_equals(method, "textDocument/didClose")) {
-        json.free_str(method, srv.alloc);
-        handle_did_close(srv, body);
-        ret;
-    }
-    if (str_equals(method, "textDocument/didSave")) {
-        json.free_str(method, srv.alloc);
-        ret;
-    }
-    if (str_equals(method, "workspace/didChangeConfiguration")) {
-        json.free_str(method, srv.alloc);
-        ret;
-    }
-    if (str_equals(method, "workspace/didChangeWatchedFiles")) {
-        json.free_str(method, srv.alloc);
-        handle_did_change_watched_files(srv, body);
-        ret;
-    }
+    if (str_equals(method, "textDocument/didOpen"))   { json.free_str(method, a); handle_did_open(srv, params); ret; }
+    if (str_equals(method, "textDocument/didChange")) { json.free_str(method, a); handle_did_change(srv, params); ret; }
+    if (str_equals(method, "textDocument/didClose"))  { json.free_str(method, a); handle_did_close(srv, params); ret; }
+    if (str_equals(method, "textDocument/didSave"))   { json.free_str(method, a); handle_did_save(srv, params); ret; }
+    if (str_equals(method, "workspace/didChangeConfiguration")) { json.free_str(method, a); ret; }
+    if (str_equals(method, "workspace/didChangeWatchedFiles"))  { json.free_str(method, a); handle_did_change_watched_files(srv, params); ret; }
 
-    if (str_equals(method, "textDocument/hover")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 0);
-        ret;
-    }
-    if (str_equals(method, "textDocument/definition")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 1);
-        ret;
-    }
-    if (str_equals(method, "textDocument/references")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 2);
-        ret;
-    }
-    if (str_equals(method, "textDocument/rename")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 3);
-        ret;
-    }
-    if (str_equals(method, "textDocument/prepareRename")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 4);
-        ret;
-    }
-    if (str_equals(method, "textDocument/documentSymbol")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 5);
-        ret;
-    }
-    if (str_equals(method, "textDocument/completion")) {
-        json.free_str(method, srv.alloc);
-        handle_feature(srv, body, 6);
-        ret;
-    }
+    if (str_equals(method, "textDocument/hover"))          { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_HOVER); ret; }
+    if (str_equals(method, "textDocument/definition"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DEFINITION); ret; }
+    if (str_equals(method, "textDocument/references"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_REFERENCES); ret; }
+    if (str_equals(method, "textDocument/rename"))         { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_RENAME); ret; }
+    if (str_equals(method, "textDocument/prepareRename"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_PREPARE_RENAME); ret; }
+    if (str_equals(method, "textDocument/documentSymbol")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_SYMBOL); ret; }
+    if (str_equals(method, "textDocument/completion"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_COMPLETION); ret; }
 
-    trace.log("unhandled method: ");
-    trace.log(method);
-    trace.log("\n");
-    json.free_str(method, srv.alloc);
-    reply_error(srv, body, -32601, "method not found");
+    trace.logf("server: unhandled method {}", method);
+    json.free_str(method, a);
+    if (json.member(root, "id") != nil) { reply_error(srv, root, -32601, "method not found"); }
 }
 
-# answer the initialize request with the server's
-# capabilities (full-text document sync) and mark the server running
-fun handle_initialize(srv: *Server, body: str) {
-    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
-    if (id == nil) { ret; }
-
+# answer the initialize request with the server's capabilities (full-text
+# document sync) and mark the server running
+fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     # remember whether the client can accept a dynamic watch registration, so
     # `initialized` only sends one when it will be honoured.
-    srv.watch_dynamic = json.extract_bool_after(body, "\"didChangeWatchedFiles\"", "\"dynamicRegistration\"", srv.alloc);
+    val watched: *sj.Value = json.member(
+        json.member2(params, "capabilities", "workspace"), "didChangeWatchedFiles");
+    srv.watch_dynamic = json.boolean(json.member(watched, "dynamicRegistration"), false);
 
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val result: str = ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}";
-    send_concat2(srv, prefix, id, result);
-    json.free_str(id, srv.alloc);
+    var b: json.Buf = json.buf_init(srv.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push_id(?b, json.member(root, "id"));
+    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
     trace.log("initialized\n");
 }
 
-# once the client signals it is ready, register file
-# watchers for the manifest, lockfile, and source trees so a dep-graph change
-# (pulling deps, editing a dep source) triggers `workspace/didChangeWatchedFiles`
-# and the affected project root is rebuilt. only sent when the client advertised
-# dynamic registration; clients without it fall back to the server's mtime check
+# once the client signals it is ready, register file watchers for the manifest,
+# lockfile, and source trees so a dep-graph change (pulling deps, editing a dep
+# source) triggers `workspace/didChangeWatchedFiles` and the affected project
+# root is rebuilt. only sent when the client advertised dynamic registration;
+# clients without it fall back to the server's fingerprint check
 fun handle_initialized(srv: *Server) {
     if (!srv.watch_dynamic) { ret; }
     val reg: str = "{\"jsonrpc\":\"2.0\",\"id\":\"mls/registerWatchers\",\"method\":\"client/registerCapability\",\"params\":{\"registrations\":[{\"id\":\"mls-watched-files\",\"method\":\"workspace/didChangeWatchedFiles\",\"registerOptions\":{\"watchers\":[{\"globPattern\":\"**/mach.toml\"},{\"globPattern\":\"**/mach.lock\"},{\"globPattern\":\"**/*.mach\"}]}}]}}";
     transport.send_message(reg, srv.alloc);
-    # the watcher now covers manifest / lockfile changes; skip the per-request
-    # mtime fallback check.
-    project.set_watch_active(?srv.ws, true);
+    srv.watch_state = WATCH_PENDING;
 }
 
-# invalidate every project root whose tree
-# contains a changed file, so the next request rebuilds it from disk. each
-# `uri` in the notification's `changes` array is invalidated in turn
-fun handle_did_change_watched_files(srv: *Server, body: str) {
-    var i: u32 = 0;
-    for (true) {
-        val uri: str = json.extract_string_seq(body, "\"uri\"", i, srv.alloc);
-        if (uri == nil) { brk; }
-        project.invalidate_uri(?srv.ws, uri);
-        json.free_str(uri, srv.alloc);
+# accept dynamic watching only after the client acknowledges registration;
+# rejection keeps conservative fallback invalidation enabled
+fun handle_response(srv: *Server, root: *sj.Value) {
+    if (srv.watch_state != WATCH_PENDING) { ret; }
+    if (!json.text_equals(json.member(root, "id"), "mls/registerWatchers", srv.alloc)) { ret; }
+    if (json.member(root, "error") != nil) { srv.watch_state = WATCH_FALLBACK; ret; }
+    srv.watch_state = WATCH_ACTIVE;
+}
+
+# a save makes the buffer's disk state authoritative again for its root
+fun handle_did_save(srv: *Server, params: *sj.Value) {
+    val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
+    if (uri == nil) { ret; }
+    project.invalidate_uri(?srv.ws, uri);
+    json.free_str(uri, srv.alloc);
+}
+
+# invalidate every project root whose tree contains a changed file, so the next
+# request rebuilds it from disk. each entry of the notification's `changes`
+# array is invalidated in turn
+fun handle_did_change_watched_files(srv: *Server, params: *sj.Value) {
+    val changes: *sj.Value = json.member(params, "changes");
+    val n: usize = json.count(changes);
+    var i: usize = 0;
+    for (i < n) {
+        val uri: str = json.text(json.member(json.element(changes, i), "uri"), srv.alloc);
+        if (uri != nil) {
+            project.invalidate_uri(?srv.ws, uri);
+            json.free_str(uri, srv.alloc);
+        }
         i = i + 1;
     }
 }
 
 # acknowledge a shutdown request and enter the shutting-down phase
-fun handle_shutdown(srv: *Server, body: str) {
-    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
-    if (id != nil) {
-        val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-        val result: str = ",\"result\":null}";
-        send_concat2(srv, prefix, id, result);
-        json.free_str(id, srv.alloc);
+fun handle_shutdown(srv: *Server, root: *sj.Value) {
+    if (json.member(root, "id") != nil) {
+        var b: json.Buf = json.buf_init(srv.alloc);
+        json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+        json.buf_push_id(?b, json.member(root, "id"));
+        json.buf_push(?b, ",\"result\":null}");
+        send_buf(srv, ?b);
     }
     srv.status = STATUS_SHUTTING_DOWN;
 }
@@ -300,94 +338,125 @@ fun handle_exit(srv: *Server) {
     if (srv.status == STATUS_SHUTTING_DOWN) { srv.exit_code = 0; }
     or { srv.exit_code = 1; }
     srv.status = STATUS_EXITED;
+    atomic.store(?srv.stop, 1);
+
+    # `exit` means terminate, and the client is entitled to keep its end of the
+    # pipe open while it waits for that. The reading thread is parked in
+    # `read(2)` on stdin and nothing this thread can do reliably wakes it -
+    # closing the descriptor under a blocked reader does not - so the orderly
+    # return through `run` is not reachable here. Ending the process is what the
+    # notification asked for; responses are written unbuffered, so nothing that
+    # was owed to the client is still pending.
+    trace.log("=== mach-lsp exiting ===\n");
+    exec.exit(srv.exit_code);
 }
 
 # register the opened document and publish its diagnostics
-fun handle_did_open(srv: *Server, body: str) {
-    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+fun handle_did_open(srv: *Server, params: *sj.Value) {
+    val doc: *sj.Value = json.member(params, "textDocument");
+    val uri: str = json.text(json.member(doc, "uri"), srv.alloc);
     if (uri == nil) { ret; }
-    val text: str = json.extract_after(body, "\"textDocument\"", "\"text\"", srv.alloc);
+    val text: str = json.text(json.member(doc, "text"), srv.alloc);
     if (text == nil) { json.free_str(uri, srv.alloc); ret; }
-
-    publish_for(srv, uri, text, true);
-
+    val version_v: *sj.Value = json.member(doc, "version");
+    if (version_v != nil) { publish_for(srv, uri, text, json.number(version_v, 0), true); }
     json.free_str(text, srv.alloc);
     json.free_str(uri, srv.alloc);
 }
 
-# apply the document's new full text and republish diagnostics.
-# only full-document sync (textDocumentSync = 1) is advertised, so the change is
-# the entire new text
-fun handle_did_change(srv: *Server, body: str) {
-    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+# apply the document's new full text and republish diagnostics. only
+# full-document sync (textDocumentSync = 1) is advertised, so the last change
+# entry carries the entire new text
+fun handle_did_change(srv: *Server, params: *sj.Value) {
+    val doc: *sj.Value = json.member(params, "textDocument");
+    val uri: str = json.text(json.member(doc, "uri"), srv.alloc);
     if (uri == nil) { ret; }
-    val text: str = json.extract_after(body, "\"contentChanges\"", "\"text\"", srv.alloc);
+    val changes: *sj.Value = json.member(params, "contentChanges");
+    val n: usize = json.count(changes);
+    if (n == 0) { json.free_str(uri, srv.alloc); ret; }
+    val text: str = json.text(json.member(json.element(changes, n - 1), "text"), srv.alloc);
     if (text == nil) { json.free_str(uri, srv.alloc); ret; }
-
-    publish_for(srv, uri, text, false);
-
+    val version_v: *sj.Value = json.member(doc, "version");
+    if (version_v != nil) { publish_for(srv, uri, text, json.number(version_v, 0), false); }
     json.free_str(text, srv.alloc);
     json.free_str(uri, srv.alloc);
 }
 
-# retire the document, reclaim its cached resolve result, and
-# clear its diagnostics
-fun handle_did_close(srv: *Server, body: str) {
-    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+# retire the document, reclaim its cached analysis, and clear its diagnostics
+fun handle_did_close(srv: *Server, params: *sj.Value) {
+    val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
     if (uri == nil) { ret; }
-    val doc: *documents.Document = documents.find(?srv.docs, uri);
-    if (doc != nil) { project.free_cached(?srv.ws, doc.file_id); }
+    val doc: *documents.Document = documents.closing(?srv.docs, uri);
+    if (doc != nil) { project.document_closed(?srv.ws, doc); }
     documents.close(?srv.docs, uri);
     diagnostics.clear(srv.alloc, uri);
+    republish_all(srv);
     json.free_str(uri, srv.alloc);
 }
 
-# route a language-feature request to its handler in `language`.
-# the document uri is extracted once here and passed through; the feature code
-# resolves the buffer, pivots the cursor, and replies. `which` selects the
-# feature: 0 hover, 1 definition, 2 references, 3 rename, 4 prepareRename,
-# 5 documentSymbol, 6 completion. an unknown / unopened uri still gets a
-# null / empty reply from the feature so the client is never left waiting
-fun handle_feature(srv: *Server, body: str, which: i64) {
-    val uri: str = json.extract_after(body, "\"textDocument\"", "\"uri\"", srv.alloc);
+# route a language-feature request to its handler in `language`
+#
+# the document uri is read once here and passed through; the feature code
+# resolves the buffer, pivots the cursor, and replies. an unknown or unopened
+# uri still gets a null / empty reply, so the client is never left waiting
+fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) {
+    val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
+    val id: *sj.Value = json.member(root, "id");
 
-    # a feature request resolves dep-aware via project.root_for, which loads the
-    # governing project lazily on first use; a type-aware feature additionally
-    # sema's the closure lazily (ensure_sema). snapshot both the load epoch and the
-    # sema epoch so a load (#96) or a first sema (#113) triggered here re-publishes
-    # the now-loaded / now-typed buffers' diagnostics
+    # snapshot compiler epochs so a feature-triggered rebuild republishes the
+    # now-current diagnostics for every affected open document
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
-    if (which == 0) { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 1) { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 2) { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 3) { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 4) { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 5) { language.document_symbol(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
-    or (which == 6) { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, body, uri); }
+    if (which == FEATURE_HOVER)           { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_DEFINITION)      { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_REFERENCES)      { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_RENAME)          { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_PREPARE_RENAME)  { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_DOCUMENT_SYMBOL) { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_COMPLETION)      { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
-    if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_loaded(srv); }
+    if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
 }
 
-# re-publish diagnostics for every open document now governed
-# by a loaded project root. run after a feature request triggers a lazy load (#96)
-# or the first whole-closure sema (#113): the buffers under the freshly-loaded root
-# were published parse-only on open, so a load upgrades them to dep-aware
-# resolution diagnostics - including any out-of-closure import the load now flags -
-# and a completed sema further layers their type diagnostics, all without the user
-# touching the file. the publish path is load-free, so a buffer under no loaded
-# root simply re-publishes its parse-only diagnostics (unchanged), and nothing new
-# is built
-fun republish_loaded(srv: *Server) {
+# re-publish diagnostics for every open document the given root governs
+#
+# A rebuild can move diagnostics for any document mirrored into that root's
+# session - an unsaved export change in one module introduces or clears errors
+# in the modules importing it - so the whole root is republished, not just the
+# document that changed. Documents under OTHER roots are untouched: their
+# snapshots did not move, and republishing them would emit one notification per
+# open buffer per keystroke.
+#
+# A nil root is the standalone case, where `only` is the whole set.
+fun republish_root(srv: *Server, root: *project.Root, only: *documents.Document) {
     val n: usize = documents.slot_count(?srv.docs);
     var i: usize = 0;
     for (i < n) {
         val d: *documents.Document = documents.at(?srv.docs, i);
         if (d != nil && d.in_use && d.uri != nil) {
-            diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, d.uri, d.file_id);
+            if (root == nil) {
+                if (d == only) { diagnostics.publish(?srv.ws, ?srv.es, srv.alloc, d); }
+            }
+            or (project.root_covers_document(?srv.ws, root, d)) {
+                diagnostics.publish(?srv.ws, ?srv.es, srv.alloc, d);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# re-publish every open document, for the events that can move any root at once
+# (a watched-file change, a close that returns a buffer to disk authority)
+fun republish_all(srv: *Server) {
+    val n: usize = documents.slot_count(?srv.docs);
+    var i: usize = 0;
+    for (i < n) {
+        val d: *documents.Document = documents.at(?srv.docs, i);
+        if (d != nil && d.in_use && d.uri != nil) {
+            diagnostics.publish(?srv.ws, ?srv.es, srv.alloc, d);
         }
         i = i + 1;
     }
@@ -395,10 +464,13 @@ fun republish_loaded(srv: *Server) {
 
 # register/update `uri`'s buffer and publish its diagnostics.
 # `is_open` selects open vs change registration; both end in a publish
-fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
+fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) {
+    val path: str = project.path_of_uri(srv.alloc, uri);
+    if (path == nil) { ret; }
     var dr: Result[*documents.Document, str];
-    if (is_open) { dr = documents.open(?srv.docs, uri, text); }
-    or { dr = documents.change(?srv.docs, uri, text); }
+    if (is_open) { dr = documents.open(?srv.docs, uri, path, text, version); }
+    or { dr = documents.change(?srv.docs, uri, text, version); }
+    json.free_str(path, srv.alloc);
 
     if (is_err[*documents.Document, str](dr)) {
         trace.log("documents: ");
@@ -407,66 +479,64 @@ fun publish_for(srv: *Server, uri: str, text: str, is_open: bool) {
         ret;
     }
     val doc: *documents.Document = unwrap_ok[*documents.Document, str](dr);
-    diagnostics.publish(?srv.ws, ?srv.es, project.sources(?srv.ws), srv.alloc, uri, doc.file_id);
+    val cr: Result[bool, str] = project.document_changed(?srv.ws, doc);
+    if (is_err[bool, str](cr)) {
+        trace.log("project: failed to mirror document overlay\n");
+        ret;
+    }
+
+    # The document's text and revision are recorded above; analyzing it is what
+    # costs. While more input is already queued, that analysis would be thrown
+    # away by the very next message, so a burst of keystrokes coalesces into one
+    # analysis of the newest text instead of one per revision. The message that
+    # finds the queue empty is the one that publishes, so the newest state is
+    # always analyzed - deferring is never dropping.
+    if (jobs.depth(?srv.q) > 0) {
+        srv.deferred = true;
+        trace.log("server: newer input queued, deferring analysis\n");
+        ret;
+    }
+    srv.deferred = false;
+    republish_root(srv, project.root_for(?srv.ws, doc.uri), doc);
 }
 
-# send a JSON-RPC error response for a request that carries an id;
-# a no-op for a notification (no id)
-fun reply_error(srv: *Server, body: str, code: i64, message: str) {
-    val id: str = json.extract_raw(body, "\"id\"", srv.alloc);
+# send a JSON-RPC error response for a request that carries an id
+#
+# a notification owes no response, so one without an id is dropped.
+fun reply_error(srv: *Server, root: *sj.Value, code: i64, message: str) {
+    val id: *sj.Value = json.member(root, "id");
     if (id == nil) { ret; }
-
-    val code_str: str = json.format_i64(code, srv.alloc);
-    val qmsg: str = json.quote(message, srv.alloc);
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"error\":{\"code\":";
-    val p3: str = ",\"message\":";
-    val p4: str = "}}";
-
-    send_concat(srv, p1, id, p2, code_str, p3, qmsg, p4);
-
-    json.free_str(qmsg, srv.alloc);
-    json.free_str(code_str, srv.alloc);
-    json.free_str(id, srv.alloc);
+    send_error(srv, id, code, message);
 }
 
-# frame and send `a + b + c`
-fun send_concat2(srv: *Server, a: str, b: str, c: str) {
-    send_concat(srv, a, b, c, nil, nil, nil, nil);
+# a parse error names no id: the body never became a tree, so there is nothing
+# to echo. the spec answers this with a null id
+fun reply_parse_error(srv: *Server) {
+    trace.log("server: message body is not valid JSON\n");
+    send_error(srv, nil, -32700, "parse error");
 }
 
-# frame and send the concatenation of up to seven fragments,
-# skipping nil fragments
-fun send_concat(srv: *Server, a: str, b: str, c: str, d: str, e: str, f: str, g: str) {
-    val total: usize = flen(a) + flen(b) + flen(c) + flen(d) + flen(e) + flen(f) + flen(g);
-    val r: Result[*u8, str] = allocate[u8](srv.alloc, total + 1);
-    if (is_err[*u8, str](r)) { ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-
-    var off: usize = 0;
-    off = fappend(buf, off, a);
-    off = fappend(buf, off, b);
-    off = fappend(buf, off, c);
-    off = fappend(buf, off, d);
-    off = fappend(buf, off, e);
-    off = fappend(buf, off, f);
-    off = fappend(buf, off, g);
-    buf[off] = 0;
-
-    transport.send_message(buf::str, srv.alloc);
-    deallocate[u8](srv.alloc, buf, total + 1);
+# a tree that is not a usable JSON-RPC envelope
+fun reply_invalid_request(srv: *Server, root: *sj.Value) {
+    send_error(srv, json.member(root, "id"), -32600, "invalid request");
 }
 
-# length of `s`, treating nil as 0
-fun flen(s: str) usize {
-    if (s == nil) { ret 0; }
-    ret str_len(s);
+# frame and send one JSON-RPC error object
+fun send_error(srv: *Server, id: *sj.Value, code: i64, message: str) {
+    var b: json.Buf = json.buf_init(srv.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push_id(?b, id);
+    json.buf_push(?b, ",\"error\":{\"code\":");
+    json.buf_push_i64(?b, code);
+    json.buf_push(?b, ",\"message\":");
+    json.buf_push_quoted(?b, message);
+    json.buf_push(?b, "}}");
+    send_buf(srv, ?b);
 }
 
-# copy `s` into `buf` at `offset`, returning the new offset
-fun fappend(buf: *u8, offset: usize, s: str) usize {
-    if (s == nil) { ret offset; }
-    val n: usize = str_len(s);
-    if (n > 0) { mem.raw_copy((buf::usize + offset)::ptr, s::ptr, n); }
-    ret offset + n;
+# frame and send a buffer's contents, then release it
+fun send_buf(srv: *Server, b: *json.Buf) {
+    val msg: str = json.buf_str(b);
+    if (msg != nil) { transport.send_message(msg, srv.alloc); }
+    json.buf_dnit(b);
 }

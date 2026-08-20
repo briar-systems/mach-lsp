@@ -32,6 +32,7 @@ use transport: mls.transport;
 use json:      mls.json;
 use positions: mls.positions;
 use project:   mls.project;
+use documents: mls.documents;
 
 # LSP diagnostic severities (1 = Error ... 4 = Hint)
 val LSP_ERROR:   i64 = 1;
@@ -42,63 +43,60 @@ val LSP_HINT:    i64 = 4;
 # cap on diagnostics published per document, to bound message size
 val MAX_DIAGNOSTICS: usize = 200;
 
-# analyze `uri`'s buffer and send its current diagnostics. a document
-# governed by an already-loaded project root is analyzed dep-aware
-# (`project.diagnose_doc`) so its name-resolution diagnostics - including an
-# import of a module outside the project's dep closure - are surfaced, keeping
-# the published diagnostics consistent with what go-to-definition can resolve
-# (#78). a document under no loaded project resolves single-file
-# (`editor.diagnostics`, parse-only), so its cross-module `use`s are not flagged
-# against an empty dep set. the governing-root lookup is load-free
-# (`root_for_loaded`): publishing must never trigger a project build, so opening
-# or editing a buffer stays instant - the project loads lazily on the first
-# feature request, after which the server re-publishes the now-loaded buffers
-# (#96).
-# semantic (type) diagnostics are layered on when - and only when - the governing
-# root's dep closure has already been sema'd (`project.sema_ready`, a load-free
-# check that never triggers a build or the heavy whole-closure `ensure_sema`).
-# `sema_doc` then types the active buffer against the closure's retained dep typing
-# (bounded - one module) and emits its type diagnostics onto the same session
-# DiagList `diagnose_doc` populated, so parse + resolve + type diagnostics publish
-# together. a loaded-but-un-sema'd root publishes parse + resolve only (instant);
-# the server re-publishes with types once a feature request sema's the closure (the
-# sema epoch) (#113)
+# publish compiler-owned diagnostics for a document's exact snapshot, falling
+# back to isolated editor diagnostics outside a project
+#
+# The analysis is DRIVEN here rather than merely read. Publishing used to take
+# whatever snapshot a previous request happened to leave behind, so a file with
+# a type error opened clean and only started reporting once some unrelated
+# hover or definition request built the project - and stopped again when that
+# snapshot was invalidated. Diagnostics are the one output that must not depend
+# on what the user asked for, so they own the pipeline: `document_view` loads
+# or refreshes the root, and the result is parse, resolve, and sema at the same
+# fidelity `mach build` reports.
+#
+# `project.refresh_inputs` makes this a revision check once the snapshot is
+# current, so republishing every open document after a change costs one
+# comparison per document rather than one analysis.
 # ---
-# w:       the workspace, for routing the document to its governing root
-# es:      editor session holding the buffer
-# sources: source map whose SourceFiles resolve spans to positions
-# alloc:   allocator for the message buffers
-# uri:     document URI to report on
-# fid:     editor FileId of the document's buffer
-pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.SourceMap, alloc: *Allocator, uri: str, fid: src.FileId) {
-    val root: *project.Root = project.root_for_loaded(w, uri);
-    var dr: Result[*diag.DiagList, str];
-    if (root != nil) { dr = project.diagnose_doc(w, root, fid); }
-    or              { dr = editor.diagnostics(es, fid); }
-    if (is_err[*diag.DiagList, str](dr)) {
-        clear(alloc, uri);
-        ret;
+# w:     project workspace
+# es:    standalone editor fallback
+# alloc: message allocator
+# d:     live document and version
+pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, d: *documents.Document) {
+    var list: *diag.DiagList = nil;
+    var sources: *src.SourceMap = nil;
+    var own: src.FileId = d.file_id;
+    val vr: Result[project.DocumentView, str] = project.document_view(w, d);
+    if (!is_err[project.DocumentView, str](vr)) {
+        val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        list = ?v.root.s.diags;
+        sources = ?v.root.s.sources;
+        own = v.file_id;
     }
-    val list: *diag.DiagList = unwrap_ok[*diag.DiagList, str](dr);
-
-    # append the buffer's type diagnostics when the closure is already sema'd. the
-    # gate is load-free (never `ensure_sema`), so this stays off the build/whole-
-    # closure path - `sema_doc`'s internal `ensure_sema` is a no-op on a ready root.
-    # the type diagnostics land on the same session DiagList `list` points into;
-    # `sema_doc`'s returned typing is the feature layer's, discarded here.
-    if (project.sema_ready(root)) { project.sema_doc(w, root, fid); }
-
-    var count: usize = list.len;
-    if (count > MAX_DIAGNOSTICS) { count = MAX_DIAGNOSTICS; }
+    or {
+        val dr: Result[*diag.DiagList, str] = editor.diagnostics(es, d.file_id);
+        if (is_err[*diag.DiagList, str](dr)) { clear(alloc, d.uri); ret; }
+        list = unwrap_ok[*diag.DiagList, str](dr);
+        sources = ?es.s.sources;
+    }
 
     var b: json.Buf = json.buf_init(alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
-    json.buf_push_quoted(?b, uri);
+    json.buf_push_quoted(?b, d.uri);
+    if (d.version >= 0) {
+        json.buf_push(?b, ",\"version\":");
+        json.buf_push_i64(?b, d.version);
+    }
     json.buf_push(?b, ",\"diagnostics\":[");
     var i: usize = 0;
-    for (i < count) {
-        if (i > 0) { json.buf_push_byte(?b, ','); }
-        push_entry(?b, sources, ?list.items[i], alloc);
+    var written: usize = 0;
+    for (i < list.len && written < MAX_DIAGNOSTICS) {
+        if (list.items[i].loc.file_id == own) {
+            if (written > 0) { json.buf_push_byte(?b, ','); }
+            push_entry(?b, sources, ?list.items[i], alloc);
+            written = written + 1;
+        }
         i = i + 1;
     }
     json.buf_push(?b, "]}}");
@@ -108,7 +106,8 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, sources: *src.
     json.buf_dnit(?b);
 }
 
-# publish an empty diagnostics array for `uri` (e.g. on close)
+# publish an unversioned empty diagnostics array for `uri` on close; omitting a
+# version prevents the client from rejecting the final clear as an older snapshot
 # ---
 # alloc: allocator for the message buffer
 # uri:   document URI to clear

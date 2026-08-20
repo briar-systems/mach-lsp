@@ -266,28 +266,6 @@ pub fun symbol_by_decl(rr: *res.ResolveResult, origin: sess.ModuleId, decl: id.D
     ret res.SYMBOL_NIL;
 }
 
-# the DeclId of the pub symbol in `rr` named `name` with kind
-# `kind`, or DECL_NIL. translates a buffer-local pub declaration to the canonical
-# (origin, decl) identity in the on-disk module the buffer mirrors, so the
-# workspace walk can locate importers of that symbol. pub symbols occupy the
-# front of the table ([0, pub_count)); a non-pub symbol has no cross-file
-# use-sites and yields DECL_NIL
-# ---
-# rr:   the on-disk module's resolve side tables
-# name: interned identifier of the declaration
-# kind: the declaration's symbol kind
-# ret:  the declaration's DeclId, or DECL_NIL
-pub fun export_decl_of(rr: *res.ResolveResult, name: intern.StrId, kind: res.SymKind) id.DeclId {
-    if (name == intern.STR_NIL) { ret id.DECL_NIL; }
-    var i: u32 = 0;
-    for (i < rr.pub_count) {
-        val sym: *res.Symbol = ?rr.symbols[i];
-        if (sym.name == name && sym.kind == kind && sym.decl != id.DECL_NIL) { ret sym.decl; }
-        i = i + 1;
-    }
-    ret id.DECL_NIL;
-}
-
 # the number of declarations at the buffer's module scope -
 # the count documentSymbol enumerates. zero when the Ast has no root module
 # ---
@@ -517,6 +495,7 @@ pub fun kind_label(kind: res.SymKind) str {
     if (kind == res.SYM_IMPORTED) { ret "import"; }
     if (kind == res.SYM_TEST)     { ret "test"; }
     if (kind == res.SYM_PRIM)     { ret "type"; }
+    if (kind == res.SYM_VECTOR)   { ret "type"; }
     ret "symbol";
 }
 

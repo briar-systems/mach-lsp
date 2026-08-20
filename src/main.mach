@@ -14,11 +14,14 @@ use std.types.option.is_some;
 
 use std.allocator.Allocator;
 use page: std.allocator.page;
+use os:   std.system.os;
 
 use server: mls.server;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
+    if (os.ignore_sigpipe() != 0) { ret 1; }
+
     var alloc: Allocator;
     val pe: Option[str] = page.make(?alloc);
     if (is_some[str](pe)) { ret 1; }

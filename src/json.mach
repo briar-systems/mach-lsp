@@ -1,13 +1,21 @@
-# minimal JSON extraction and construction for LSP messages
+# JSON-RPC message reading and LSP payload construction
 #
-# the server never builds a full JSON tree: requests are small, flat objects
-# and the fields it needs (method, id, uri, text, version, position) are read
-# by key with a forgiving string scanner, and responses are assembled from
-# string fragments. this keeps the protocol layer dependency-free and avoids a
-# general parser the diagnostics slice does not need.
+# reading goes through `std.data.json`: a message is parsed once into a real
+# Value tree and every field is reached by navigating it. the server used to
+# scan the raw body for a quoted key, which matched that key ANYWHERE in the
+# document - including inside an opened file's own source text, which for a
+# language server is attacker-shaped input. structure, ordering, nesting, and
+# escapes are now the parser's problem, not a scanner's.
 #
-# every accessor returns owned `str` allocated from the caller's allocator (or
-# nil on miss / allocation failure); callers free with `free_str`.
+# a parsed tree borrows its string bytes from the message body and the std
+# parser has no free entry, so a message is parsed into a per-message arena
+# that `Reader` resets once the message is handled. that also retires the
+# per-field owned-string bookkeeping the scanner required.
+#
+# writing stays a `Buf` append sink: LSP payloads are shaped by the data
+# (a diagnostic's related locations, a rename's per-file edits), so the
+# fragment count is only known while emitting. string escaping is the std
+# emitter's, so a control byte or a non-ASCII identifier survives the trip.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -20,14 +28,20 @@ use std.types.string.str_equals;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
+use std.types.result.ok;
+use std.types.option.Option;
+use std.types.option.is_some;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
 
-use mem:  std.memory;
-use page: std.allocator.page;
+use mem:   std.memory;
+use page:  std.allocator.page;
+use arena: std.allocator.arena;
+use sj:    std.data.json;
+use writer: std.io.writer;
 
 # a growable byte buffer for assembling one JSON payload
 #
@@ -121,24 +135,33 @@ pub fun buf_push_byte(b: *Buf, ch: u8) {
     b.len = b.len + 1;
 }
 
-# append `s` as a quoted, escaped JSON string. nil renders as `""`
+# writer callback appending into the Buf behind `ctx`
+fun buf_write(ctx: ptr, p: *u8, len: usize) Result[usize, str] {
+    val b: *Buf = ctx::*Buf;
+    if (!buf_reserve(b, len)) { ret ok[usize, str](len); }
+    mem.raw_copy((b.data::usize + b.len)::ptr, p::ptr, len);
+    b.len = b.len + len;
+    ret ok[usize, str](len);
+}
+
+# a `std.io.writer` view over `b`, so the std JSON escaper can emit into it
+# ---
+# b: the buffer to wrap
+# w: writer initialized in place; borrows `b`, which must outlive it
+pub fun buf_writer(b: *Buf, w: *writer.Writer) {
+    w.ctx     = b::ptr;
+    w.f_write = buf_write;
+}
+
+# append `s` as a quoted JSON string, escaped by the std emitter
+#
+# escaping is `ESCAPE_ENSURE_ASCII`, so every emitted byte is printable ASCII
+# and a non-ASCII identifier or path survives as a `\uXXXX` escape rather than
+# raw bytes. nil renders as `""`.
 pub fun buf_push_quoted(b: *Buf, s: str) {
-    buf_push_byte(b, '"');
-    if (s == nil) { buf_push_byte(b, '"'); ret; }
-    val n: usize = str_len(s);
-    var i: usize = 0;
-    for (i < n) {
-        val ch: u8 = s[i];
-        if (ch == '"')  { buf_push(b, "\\\""); }
-        or (ch == '\\') { buf_push(b, "\\\\"); }
-        or (ch == '\n') { buf_push(b, "\\n"); }
-        or (ch == '\r') { buf_push(b, "\\r"); }
-        or (ch == '\t') { buf_push(b, "\\t"); }
-        or (ch < 32)    { buf_push_byte(b, '?'); }
-        or              { buf_push_byte(b, ch); }
-        i = i + 1;
-    }
-    buf_push_byte(b, '"');
+    var w: writer.Writer;
+    buf_writer(b, ?w);
+    sj.write_json_string(?w, s::*u8);
 }
 
 # append `value` in base 10
@@ -150,7 +173,7 @@ pub fun buf_push_usize(b: *Buf, value: usize) {
     or {
         for (v > 0 && pos > 0) {
             pos = pos - 1;
-            tmp[pos] = ('0' + (v % 10))::u8;
+            tmp[pos] = ('0'::usize + (v % 10))::u8;
             v = v / 10;
         }
     }
@@ -179,458 +202,283 @@ pub fun buf_str(b: *Buf) str {
     ret b.data::str;
 }
 
-# read the string value of `key` in `data`, decoding JSON
-# escapes. returns owned text, or nil when the key is absent or not a string
+
+# one parsed JSON-RPC message and the arena its tree lives in
+#
+# `root` borrows string bytes from the body the caller still owns, so the body
+# must outlive the Message. `arena_reset` releases the tree.
 # ---
-# data:  JSON text to scan
-# key:   quoted key to find, e.g. `"method"`
-# alloc: allocator backing the returned string
-# ret:   owned decoded value, or nil
-pub fun extract_string(data: str, key: str, alloc: *Allocator) str {
-    val idx: isize = find_key(data, key);
-    if (idx < 0) { ret nil; }
-
-    val data_len: usize = str_len(data);
-    val key_len: usize = str_len(key);
-    var pos: usize = (idx::usize) + key_len;
-
-    pos = skip_ws(data, pos);
-    if (pos >= data_len || data[pos] != ':') { ret nil; }
-    pos = pos + 1;
-
-    pos = skip_ws(data, pos);
-    if (pos >= data_len || data[pos] != '"') { ret nil; }
-    pos = pos + 1;
-
-    var scan: usize = pos;
-    var out_len: usize = 0;
-    for (scan < data_len) {
-        val ch: u8 = data[scan];
-        if (ch == '\\') { scan = scan + 2; out_len = out_len + 1; }
-        or (ch == '"') { brk; }
-        or { scan = scan + 1; out_len = out_len + 1; }
-    }
-    if (scan >= data_len) { ret nil; }
-    if (out_len == 0) { ret nil; }
-
-    val r: Result[*u8, str] = allocate[u8](alloc, out_len + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-
-    scan = pos;
-    var w: usize = 0;
-    for (scan < data_len && w < out_len) {
-        val ch: u8 = data[scan];
-        if (ch == '\\') {
-            scan = scan + 1;
-            if (scan >= data_len) { brk; }
-            val esc: u8 = data[scan];
-            if (esc == 'n')  { buf[w] = '\n'; }
-            or (esc == 'r')  { buf[w] = '\r'; }
-            or (esc == 't')  { buf[w] = '\t'; }
-            or (esc == '"')  { buf[w] = '"'; }
-            or (esc == '\\') { buf[w] = '\\'; }
-            or (esc == '/')  { buf[w] = '/'; }
-            or               { buf[w] = esc; }
-            scan = scan + 1;
-            w = w + 1;
-        }
-        or (ch == '"') { brk; }
-        or { buf[w] = ch; scan = scan + 1; w = w + 1; }
-    }
-
-    buf[w] = 0;
-    ret buf::str;
+# root:   parsed root value; an object for any well-formed message
+# valid:  whether the body parsed at all
+pub rec Message {
+    root:  sj.Value;
+    valid: bool;
 }
 
-# read the raw token of `key` (a quoted string copied verbatim, or
-# a bare number / literal). returns owned text, or nil on miss
+# a reusable per-message parse arena
+#
+# one server owns one Reader. `read` parses a body into it, `release` rolls the
+# arena back so the next message reuses the same chunks instead of allocating.
 # ---
-# data:  JSON text to scan
-# key:   quoted key to find
-# alloc: allocator backing the returned string
-# ret:   owned raw token, or nil
-pub fun extract_raw(data: str, key: str, alloc: *Allocator) str {
-    val idx: isize = find_key(data, key);
-    if (idx < 0) { ret nil; }
-
-    val data_len: usize = str_len(data);
-    val key_len: usize = str_len(key);
-    var pos: usize = (idx::usize) + key_len;
-
-    pos = skip_ws(data, pos);
-    if (pos >= data_len || data[pos] != ':') { ret nil; }
-    pos = pos + 1;
-
-    pos = skip_ws(data, pos);
-    if (pos >= data_len) { ret nil; }
-    val start: usize = pos;
-
-    if (data[pos] == '"') {
-        pos = pos + 1;
-        for (pos < data_len) {
-            val ch: u8 = data[pos];
-            if (ch == '\\') { pos = pos + 2; }
-            or (ch == '"') { pos = pos + 1; brk; }
-            or { pos = pos + 1; }
-        }
-        ret copy_range(data, start, pos, alloc);
-    }
-
-    for (pos < data_len) {
-        val ch: u8 = data[pos];
-        if (ch == ',' || ch == '}' || ch == ']' ||
-            ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') { brk; }
-        pos = pos + 1;
-    }
-    if (pos == start) { ret nil; }
-    ret copy_range(data, start, pos, alloc);
+# ar:    the arena backing every parsed tree
+# ready: whether `ar` was initialized
+pub rec Reader {
+    ar:    arena.Arena;
+    ready: bool;
 }
 
-# read the integer value of `key`, or 0 when absent
+# seed capacity for the message arena, sized so an ordinary request parses
+# without growing
+val READER_ARENA_CAP: usize = 64 * 1024;
+
+# construct a message reader over `backing`
 # ---
-# data:  JSON text to scan
-# key:   quoted key to find
-# alloc: scratch allocator (the raw token is freed before return)
-# ret:   the parsed integer, or 0
-pub fun extract_number_i64(data: str, key: str, alloc: *Allocator) i64 {
-    val raw: str = extract_raw(data, key, alloc);
-    if (raw == nil) { ret 0; }
-    val result: i64 = parse_i64(raw);
-    free_str(raw, alloc);
-    ret result;
-}
-
-# the tail of `data` starting just past the first occurrence of
-# `anchor` as an object key, or nil when the anchor is absent or ends the text.
-# the shared prologue of the *_after accessors; the returned pointer borrows
-# `data`
-fun seek_after(data: str, anchor: str) str {
-    val idx: isize = find_key(data, anchor);
-    if (idx < 0) { ret nil; }
-    val offset: usize = (idx::usize) + str_len(anchor);
-    if (offset >= str_len(data)) { ret nil; }
-    ret (data::usize + offset)::str;
-}
-
-# read string `key` that appears after the first occurrence of
-# `anchor` (scopes a key lookup to a nested object whose opening key is known)
-# ---
-# data:   JSON text to scan
-# anchor: quoted key marking where to start scanning
-# key:    quoted key to read after the anchor
-# alloc:  allocator backing the returned string
-# ret:    owned decoded value, or nil
-pub fun extract_after(data: str, anchor: str, key: str, alloc: *Allocator) str {
-    val sub: str = seek_after(data, anchor);
-    if (sub == nil) { ret nil; }
-    ret extract_string(sub, key, alloc);
-}
-
-# read integer `key` after `anchor`, or 0 on miss
-# ---
-# data:   JSON text to scan
-# anchor: quoted key marking where to start scanning
-# key:    quoted key to read after the anchor
-# alloc:  scratch allocator
-# ret:    the parsed integer, or 0
-pub fun extract_number_after(data: str, anchor: str, key: str, alloc: *Allocator) i64 {
-    val sub: str = seek_after(data, anchor);
-    if (sub == nil) { ret 0; }
-    ret extract_number_i64(sub, key, alloc);
-}
-
-# decode the string value of the `index`-th occurrence of
-# `key` in `data` (0-based), or nil when there are fewer than index+1
-# occurrences. lets a caller iterate a repeated key - e.g. every `"uri"` in a
-# `workspace/didChangeWatchedFiles` changes array - by bumping `index` until nil
-# ---
-# data:  JSON text to scan
-# key:   quoted key to find, e.g. `"uri"`
-# index: zero-based occurrence to read
-# alloc: allocator backing the returned string
-# ret:   owned decoded value, or nil
-pub fun extract_string_seq(data: str, key: str, index: u32, alloc: *Allocator) str {
-    var sub: str = data;
-    var i: u32 = 0;
-    for (i < index) {
-        sub = seek_after(sub, key);
-        if (sub == nil) { ret nil; }
-        i = i + 1;
-    }
-    ret extract_string(sub, key, alloc);
-}
-
-# whether the boolean `key` inside the object value of
-# `anchor` is the literal `true`. the scan is scoped to the anchor's balanced
-# object, so an equally-named key in a later sibling object is never misread -
-# e.g. another capability's `dynamicRegistration` after an empty
-# `"didChangeWatchedFiles":{}`. false when the anchor is absent, its value is
-# not an object, or the key is absent / non-true, so a missing capability reads
-# as unsupported
-# ---
-# data:   JSON text to scan
-# anchor: quoted key whose object value scopes the lookup
-# key:    quoted boolean key to read inside the anchor's object
-# alloc:  scratch allocator (the window and raw token are freed before return)
-# ret:    true only when the value is the literal `true`
-pub fun extract_bool_after(data: str, anchor: str, key: str, alloc: *Allocator) bool {
-    val sub: str = seek_after(data, anchor);
-    if (sub == nil) { ret false; }
-    val sub_len: usize = str_len(sub);
-    var pos: usize = skip_ws(sub, 0);
-    if (pos >= sub_len || sub[pos] != ':') { ret false; }
-    pos = skip_ws(sub, pos + 1);
-    if (pos >= sub_len || sub[pos] != '{') { ret false; }
-    val end: usize = object_end(sub, pos);
-    if (end == 0) { ret false; }
-
-    val window: str = copy_range(sub, pos, end, alloc);
-    if (window == nil) { ret false; }
-    val raw: str = extract_raw(window, key, alloc);
-    var is_true: bool = false;
-    if (raw != nil) {
-        is_true = str_equals(raw, "true");
-        free_str(raw, alloc);
-    }
-    free_str(window, alloc);
-    ret is_true;
-}
-
-# the index one past the matching `}` of the `{` at `start`,
-# skipping string contents, or 0 when the object is unbalanced
-fun object_end(data: str, start: usize) usize {
-    val n: usize = str_len(data);
-    var depth: usize = 0;
-    var in_str: bool = false;
-    var i: usize = start;
-    for (i < n) {
-        val c: u8 = data[i];
-        if (in_str) {
-            if (c == '\\') { i = i + 2; }
-            or {
-                if (c == '"') { in_str = false; }
-                i = i + 1;
-            }
-        }
-        or {
-            if (c == '"')  { in_str = true; }
-            or (c == '{')  { depth = depth + 1; }
-            or (c == '}')  {
-                depth = depth - 1;
-                if (depth == 0) { ret i + 1; }
-            }
-            i = i + 1;
-        }
-    }
-    ret 0;
-}
-
-# JSON-encode `s` as a quoted, escaped string literal (including the
-# surrounding quotes). returns owned text, or nil on allocation failure
-# ---
-# s:     raw text to encode
-# alloc: allocator backing the returned string
-# ret:   owned quoted literal, or nil
-pub fun quote(s: str, alloc: *Allocator) str {
-    var s_len: usize = 0;
-    if (s != nil) { s_len = str_len(s); }
-
-    var encoded_len: usize = 2;
-    var i: usize = 0;
-    for (i < s_len) {
-        val ch: u8 = s[i];
-        if (ch == '"' || ch == '\\' || ch == '\n' || ch == '\r' || ch == '\t') {
-            encoded_len = encoded_len + 2;
-        }
-        or { encoded_len = encoded_len + 1; }
-        i = i + 1;
-    }
-
-    val r: Result[*u8, str] = allocate[u8](alloc, encoded_len + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-
-    var pos: usize = 0;
-    buf[pos] = '"';
-    pos = pos + 1;
-
-    i = 0;
-    for (i < s_len) {
-        val ch: u8 = s[i];
-        if (ch == '"')        { buf[pos] = '\\'; buf[pos + 1] = '"';  pos = pos + 2; }
-        or (ch == '\\')       { buf[pos] = '\\'; buf[pos + 1] = '\\'; pos = pos + 2; }
-        or (ch == '\n')       { buf[pos] = '\\'; buf[pos + 1] = 'n';  pos = pos + 2; }
-        or (ch == '\r')       { buf[pos] = '\\'; buf[pos + 1] = 'r';  pos = pos + 2; }
-        or (ch == '\t')       { buf[pos] = '\\'; buf[pos + 1] = 't';  pos = pos + 2; }
-        or (ch < 32)          { buf[pos] = '?';  pos = pos + 1; }
-        or                    { buf[pos] = ch;   pos = pos + 1; }
-        i = i + 1;
-    }
-
-    buf[pos] = '"';
-    pos = pos + 1;
-    buf[pos] = 0;
-    ret buf::str;
-}
-
-# render `value` in base 10. returns owned text, or nil on failure
-# ---
-# value: number to render
-# alloc: allocator backing the returned string
-# ret:   owned decimal text, or nil
-pub fun format_usize(value: usize, alloc: *Allocator) str {
-    var tmp: [20]u8;
-    var pos: usize = 20;
-    var v: usize = value;
-    if (v == 0) { pos = pos - 1; tmp[pos] = '0'; }
-    or {
-        for (v > 0 && pos > 0) {
-            pos = pos - 1;
-            tmp[pos] = ('0' + (v % 10))::u8;
-            v = v / 10;
-        }
-    }
-    val len: usize = 20 - pos;
-    val r: Result[*u8, str] = allocate[u8](alloc, len + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
-    buf[len] = 0;
-    ret buf::str;
-}
-
-# render `value` in base 10 with a leading sign for negatives
-# ---
-# value: number to render
-# alloc: allocator backing the returned string
-# ret:   owned decimal text, or nil
-pub fun format_i64(value: i64, alloc: *Allocator) str {
-    var tmp: [21]u8;
-    var pos: usize = 21;
-    var negative: bool = false;
-    var v: i64 = value;
-    if (v < 0) { negative = true; v = -v; }
-    if (v == 0) { pos = pos - 1; tmp[pos] = '0'; }
-    or {
-        for (v > 0 && pos > 0) {
-            pos = pos - 1;
-            tmp[pos] = ('0' + (v % 10))::u8;
-            v = v / 10;
-        }
-    }
-    if (negative && pos > 0) { pos = pos - 1; tmp[pos] = '-'; }
-    val len: usize = 21 - pos;
-    val r: Result[*u8, str] = allocate[u8](alloc, len + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    mem.raw_copy(buf::ptr, (?tmp[pos])::ptr, len);
-    buf[len] = 0;
-    ret buf::str;
-}
-
-# release a string returned by this module
-# ---
-# s:     string to free; nil is a no-op
-# alloc: allocator the string was allocated from
-pub fun free_str(s: str, alloc: *Allocator) {
-    if (s == nil) { ret; }
-    val len: usize = str_len(s);
-    deallocate[u8](alloc, s::*u8, len + 1);
-}
-
-# byte offset of the opening quote of `key` as an object key in
-# `data` (a `"key"` token outside any string value), or -1 when absent
-fun find_key(data: str, key: str) isize {
-    val key_len: usize = str_len(key);
-    val data_len: usize = str_len(data);
-    if (key_len == 0 || key_len > data_len) { ret -1; }
-
-    var in_string: bool = false;
-    var i: usize = 0;
-    val limit: usize = data_len - key_len;
-    for (i <= limit) {
-        val ch: u8 = data[i];
-        if (ch == '"' && !is_escaped(data, i)) {
-            if (!in_string) {
-                if (match_at(data, i, key)) { ret i::isize; }
-                in_string = true;
-            }
-            or { in_string = false; }
-        }
-        i = i + 1;
-    }
-    ret -1;
-}
-
-# whether the byte at `index` is preceded by an odd run of backslashes
-fun is_escaped(data: str, index: usize) bool {
-    if (index == 0) { ret false; }
-    var back: usize = index - 1;
-    var count: usize = 0;
-    for {
-        if (data[back] != '\\') { brk; }
-        count = count + 1;
-        if (back == 0) { brk; }
-        back = back - 1;
-    }
-    ret (count & 1) == 1;
-}
-
-# whether `pattern` occurs verbatim at `offset` in `data`
-fun match_at(data: str, offset: usize, pattern: str) bool {
-    val pattern_len: usize = str_len(pattern);
-    val data_len: usize = str_len(data);
-    if (offset + pattern_len > data_len) { ret false; }
-    var i: usize = 0;
-    for (i < pattern_len) {
-        if (data[offset + i] != pattern[i]) { ret false; }
-        i = i + 1;
-    }
+# rd:      reader to initialize
+# backing: allocator the arena draws chunks from; must outlive the reader
+# ret:     true when the arena was created
+pub fun reader_init(rd: *Reader, backing: *Allocator) bool {
+    rd.ready = false;
+    var opt: Option[*u8] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
+    if (is_some[*u8](opt)) { ret false; }
+    rd.ready = true;
     ret true;
 }
 
-# advance past JSON whitespace starting at `pos`
-fun skip_ws(data: str, pos: usize) usize {
-    val data_len: usize = str_len(data);
-    var p: usize = pos;
-    for (p < data_len) {
-        val ch: u8 = data[p];
-        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') { brk; }
-        p = p + 1;
-    }
-    ret p;
+# release the reader's arena
+pub fun reader_dnit(rd: *Reader) {
+    if (!rd.ready) { ret; }
+    arena.dnit(?rd.ar);
+    rd.ready = false;
 }
 
-# parse a leading optionally-signed decimal integer from `s`
-fun parse_i64(s: str) i64 {
-    if (s == nil) { ret 0; }
-    val s_len: usize = str_len(s);
-    if (s_len == 0) { ret 0; }
-    var pos: usize = 0;
-    var negative: bool = false;
-    if (s[pos] == '-') { negative = true; pos = pos + 1; }
-    var result: i64 = 0;
-    for (pos < s_len) {
-        val ch: u8 = s[pos];
-        if (ch >= '0' && ch <= '9') { result = result * 10 + ((ch - '0')::i64); }
-        or { brk; }
-        pos = pos + 1;
-    }
-    if (negative) { ret -result; }
-    ret result;
+# the reader's arena as an Allocator, for values that live as long as the message
+# ---
+# rd:  the reader
+# ret: the arena allocator, or nil when the reader failed to initialize
+pub fun reader_alloc(rd: *Reader) *Allocator {
+    if (!rd.ready) { ret nil; }
+    ret ?rd.ar.backing;
 }
 
-# owned copy of `data[start..end)`, nil-terminated
-fun copy_range(data: str, start: usize, end: usize, alloc: *Allocator) str {
-    val len: usize = end - start;
-    if (len == 0) { ret nil; }
-    val r: Result[*u8, str] = allocate[u8](alloc, len + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    mem.raw_copy(buf::ptr, (data::usize + start)::ptr, len);
-    buf[len] = 0;
+# parse one message body into the reader's arena
+#
+# `body` is borrowed: the returned tree points into it and stays valid until
+# `release`. an unparseable body yields a Message with `valid` false, which the
+# caller answers with a JSON-RPC parse error rather than ignoring.
+# ---
+# rd:   the reader owning the arena
+# body: nul-terminated message body, retained by the caller
+# len:  body length in bytes
+# ret:  the parsed message
+pub fun read(rd: *Reader, body: str, len: usize) Message {
+    var m: Message;
+    m.valid = false;
+    if (!rd.ready || body == nil) { ret m; }
+    var a: Allocator;
+    arena.make(?a, ?rd.ar);
+    val r: Result[sj.Value, str] = sj.parse(body::*u8, len, ?a);
+    if (is_err[sj.Value, str](r)) { ret m; }
+    m.root  = unwrap_ok[sj.Value, str](r);
+    m.valid = true;
+    ret m;
+}
+
+# roll the arena back, retiring every tree parsed since the last release
+pub fun release(rd: *Reader) {
+    if (!rd.ready) { ret; }
+    arena.reset(?rd.ar);
+}
+
+# the object member `key` of `v`, or nil when absent or `v` is not an object
+# ---
+# v:   value to read
+# key: member name
+# ret: borrowed member value, or nil
+pub fun member(v: *sj.Value, key: str) *sj.Value {
+    if (v == nil) { ret nil; }
+    ret sj.value_find(v, key);
+}
+
+# the member `key` of the member `outer` of `v`, or nil at any miss
+# ---
+# v:     value to read
+# outer: outer member name
+# key:   inner member name
+# ret:   borrowed member value, or nil
+pub fun member2(v: *sj.Value, outer: str, key: str) *sj.Value {
+    ret member(member(v, outer), key);
+}
+
+# the `index`-th element of array `v`, or nil when out of range
+pub fun element(v: *sj.Value, index: usize) *sj.Value {
+    if (v == nil || !sj.value_is_array(v)) { ret nil; }
+    ret sj.value_get(v, index);
+}
+
+# the number of elements in array or object `v`, 0 for anything else
+pub fun count(v: *sj.Value) usize {
+    if (v == nil) { ret 0; }
+    ret sj.value_count(v);
+}
+
+# whether `v` is present and JSON null
+pub fun is_null(v: *sj.Value) bool {
+    if (v == nil) { ret false; }
+    ret sj.value_is_null(v);
+}
+
+# the decoded text of string value `v`, allocated from `alloc`
+#
+# JSON escapes are resolved, so the result is the logical text the client sent.
+# nil when `v` is absent or not a string.
+# ---
+# v:     value to decode
+# alloc: allocator backing the returned string
+# ret:   owned nul-terminated text, or nil
+pub fun text(v: *sj.Value, alloc: *Allocator) str {
+    if (v == nil || !sj.value_is_string(v)) { ret nil; }
+    val sr: Result[usize, str] = sj.value_string_decode(v, nil, 0);
+    if (is_err[usize, str](sr)) { ret nil; }
+    val n: usize = unwrap_ok[usize, str](sr);
+    val br: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](br)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](br);
+    val dr: Result[usize, str] = sj.value_string_decode(v, buf, n);
+    if (is_err[usize, str](dr)) { deallocate[u8](alloc, buf, n + 1); ret nil; }
+    buf[n] = 0;
     ret buf::str;
+}
+
+# the integer value of number `v`, or `fallback` when absent or not a number
+pub fun number(v: *sj.Value, fallback: i64) i64 {
+    if (v == nil || !sj.value_is_number(v)) { ret fallback; }
+    ret sj.value_number(v);
+}
+
+# the boolean value of `v`, or `fallback` when absent or not a boolean
+pub fun boolean(v: *sj.Value, fallback: bool) bool {
+    if (v == nil || !sj.value_is_bool(v)) { ret fallback; }
+    ret sj.value_bool(v);
+}
+
+# whether string value `v` equals `s` after decoding
+#
+# compares against the DECODED text, so a client that escapes an ASCII byte in
+# a method name still matches.
+# ---
+# v:     value to compare
+# s:     expected text
+# alloc: scratch allocator for the decode
+# ret:   true when `v` is a string equal to `s`
+pub fun text_equals(v: *sj.Value, s: str, alloc: *Allocator) bool {
+    val got: str = text(v, alloc);
+    if (got == nil) { ret false; }
+    val eq: bool = str_equals(got, s);
+    free_str(got, alloc);
+    ret eq;
+}
+
+# append a JSON-RPC id verbatim, preserving its wire type
+#
+# an id is a string, an integer, or null, and the response MUST echo the type
+# the request used. a parsed string's bytes are already wire-escaped, so they
+# are re-emitted as-is rather than decoded and re-escaped.
+# ---
+# b:  buffer to append to
+# id: the request's id value, or nil for a message that carried none
+pub fun buf_push_id(b: *Buf, id: *sj.Value) {
+    if (id == nil) { buf_push(b, "null"); ret; }
+    if (sj.value_is_string(id)) {
+        var n: usize = 0;
+        val raw: *u8 = sj.value_string(id, ?n);
+        buf_push_byte(b, '"');
+        if (raw != nil && n > 0) {
+            if (buf_reserve(b, n)) {
+                mem.raw_copy((b.data::usize + b.len)::ptr, raw::ptr, n);
+                b.len = b.len + n;
+            }
+        }
+        buf_push_byte(b, '"');
+        ret;
+    }
+    if (sj.value_is_number(id)) { buf_push_i64(b, sj.value_number(id)); ret; }
+    buf_push(b, "null");
+}
+
+# release a string returned by `text`
+# ---
+# s:     the string to release; nil is a no-op
+# alloc: the allocator it was taken from
+pub fun free_str(s: str, alloc: *Allocator) {
+    if (s == nil) { ret; }
+    deallocate[u8](alloc, s::*u8, str_len(s) + 1);
+}
+
+# `s` as an owned, quoted, escaped JSON string literal
+#
+# the allocating counterpart to `buf_push_quoted`, for the fragment-assembled
+# payloads that still size themselves before filling.
+# ---
+# s:     the text to quote; nil renders as `""`
+# alloc: allocator backing the result
+# ret:   owned nul-terminated literal including its quotes, or nil
+pub fun quote(s: str, alloc: *Allocator) str {
+    var b: Buf = buf_init(alloc);
+    buf_push_quoted(?b, s);
+    val view: str = buf_str(?b);
+    if (view == nil) { buf_dnit(?b); ret nil; }
+    val n: usize = str_len(view);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { buf_dnit(?b); ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
+    out[n] = 0;
+    buf_dnit(?b);
+    ret out::str;
+}
+
+# `value` rendered in base 10 as an owned string
+pub fun format_usize(value: usize, alloc: *Allocator) str {
+    var b: Buf = buf_init(alloc);
+    buf_push_usize(?b, value);
+    ret buf_take(?b, alloc);
+}
+
+# `value` rendered in base 10 as an owned string, with a sign for negatives
+pub fun format_i64(value: i64, alloc: *Allocator) str {
+    var b: Buf = buf_init(alloc);
+    buf_push_i64(?b, value);
+    ret buf_take(?b, alloc);
+}
+
+# copy a buffer's contents into a fresh owned string and release the buffer
+fun buf_take(b: *Buf, alloc: *Allocator) str {
+    val view: str = buf_str(b);
+    if (view == nil) { buf_dnit(b); ret nil; }
+    val n: usize = str_len(view);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { buf_dnit(b); ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
+    out[n] = 0;
+    buf_dnit(b);
+    ret out::str;
+}
+
+# a request id rendered as its JSON token text, owned by `alloc`
+#
+# the response must echo the id with the wire type the request used, and the
+# fragment-assembled replies splice it in as text. nil when the message carried
+# no id, which marks a notification the server owes no response.
+# ---
+# id:    the request's id value, or nil
+# alloc: allocator backing the result
+# ret:   owned token text (`"abc"`, `7`, `null`), or nil when there is no id
+pub fun id_text(id: *sj.Value, alloc: *Allocator) str {
+    if (id == nil) { ret nil; }
+    var b: Buf = buf_init(alloc);
+    buf_push_id(?b, id);
+    ret buf_take(?b, alloc);
 }
 
 # --- Buf ---
@@ -680,7 +528,6 @@ test "json: content survives growth past the initial capacity" {
     if (s == nil)               { fail = true; }
     or {
         if (str_len(s) != 2000) { fail = true; }
-        # spot-check both ends and the first doubling boundary
         if (s[0] != 'x')        { fail = true; }
         if (s[1] != 'y')        { fail = true; }
         if (s[256] != 'x')      { fail = true; }
@@ -691,7 +538,9 @@ test "json: content survives growth past the initial capacity" {
     ret 0;
 }
 
-test "json: buf_push_quoted escapes the JSON control set" {
+# escaping is the std emitter's, so a control byte survives as an escape rather
+# than the `?` placeholder the hand-rolled escaper substituted
+test "json: buf_push_quoted escapes the JSON control set losslessly" {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf = buf_init(?pa);
@@ -703,8 +552,6 @@ test "json: buf_push_quoted escapes the JSON control set" {
     ret 0;
 }
 
-# a nil string is a valid JSON value only as `""` - a diagnostic's optional
-# `related` label arrives nil and the protocol requires a string there
 test "json: buf_push_quoted renders nil as an empty JSON string" {
     var pa: Allocator;
     page.make(?pa);
@@ -722,32 +569,168 @@ test "json: numbers render in base 10 with a sign only where negative" {
     page.make(?pa);
     var b: Buf = buf_init(?pa);
     buf_push_usize(?b, 0);
-    buf_push_byte(?b, ',');
-    buf_push_usize(?b, 1234);
-    buf_push_byte(?b, ',');
-    buf_push_i64(?b, -7);
-    buf_push_byte(?b, ',');
+    buf_push_byte(?b, ' ');
+    buf_push_i64(?b, -42);
+    buf_push_byte(?b, ' ');
     buf_push_i64(?b, 42);
     var fail: bool = false;
-    if (!str_equals(buf_str(?b), "0,1234,-7,42")) { fail = true; }
+    if (!str_equals(buf_str(?b), "0 -42 42")) { fail = true; }
     buf_dnit(?b);
     if (fail) { ret 1; }
     ret 0;
 }
 
-# the failure latch is what lets callers check once at the end instead of at
-# every push, so a latched buffer must stay latched and read as nil
-test "json: a failed Buf latches and reads nil" {
+# --- reading ---
+
+# the scanner this replaced looked for a quoted key ANYWHERE in the body, so a
+# key spelled inside an opened file's own source text could win over the real
+# envelope member. a language server is handed exactly that input on didOpen
+test "json: a key spelled inside a string value never shadows a real member" {
     var pa: Allocator;
     page.make(?pa);
-    var b: Buf = buf_init(?pa);
-    buf_push(?b, "kept");
-    b.failed = true;
-    buf_push(?b, "dropped");
+    var rd: Reader;
+    if (!reader_init(?rd, ?pa)) { ret 1; }
+    val body: str = "{\"jsonrpc\":\"2.0\",\"params\":{\"text\":\"val s = \\\"method\\\": fake;\"},\"method\":\"textDocument/didOpen\"}";
+    var m: Message = read(?rd, body, str_len(body));
     var fail: bool = false;
-    if (b.len != 4)          { fail = true; }
-    if (buf_str(?b) != nil)  { fail = true; }
-    buf_dnit(?b);
+    if (!m.valid) { fail = true; }
+    or {
+        val method: str = text(member(?m.root, "method"), ?pa);
+        if (method == nil)                                    { fail = true; }
+        or {
+            if (!str_equals(method, "textDocument/didOpen"))  { fail = true; }
+            free_str(method, ?pa);
+        }
+    }
+    release(?rd);
+    reader_dnit(?rd);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "json: member2 walks one level and misses report nil" {
+    var pa: Allocator;
+    page.make(?pa);
+    var rd: Reader;
+    if (!reader_init(?rd, ?pa)) { ret 1; }
+    val body: str = "{\"textDocument\":{\"uri\":\"file:///a.mach\",\"version\":7}}";
+    var m: Message = read(?rd, body, str_len(body));
+    var fail: bool = false;
+    if (!m.valid) { fail = true; }
+    or {
+        val uri: str = text(member2(?m.root, "textDocument", "uri"), ?pa);
+        if (uri == nil)                                 { fail = true; }
+        or {
+            if (!str_equals(uri, "file:///a.mach"))     { fail = true; }
+            free_str(uri, ?pa);
+        }
+        if (number(member2(?m.root, "textDocument", "version"), -1) != 7) { fail = true; }
+        if (member2(?m.root, "textDocument", "absent") != nil)            { fail = true; }
+        if (member2(?m.root, "absent", "uri") != nil)                     { fail = true; }
+    }
+    release(?rd);
+    reader_dnit(?rd);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "json: string escapes in a value decode to their logical bytes" {
+    var pa: Allocator;
+    page.make(?pa);
+    var rd: Reader;
+    if (!reader_init(?rd, ?pa)) { ret 1; }
+    val body: str = "{\"text\":\"a\\nb\\tc\\\"d\"}";
+    var m: Message = read(?rd, body, str_len(body));
+    var fail: bool = false;
+    if (!m.valid) { fail = true; }
+    or {
+        val v: str = text(member(?m.root, "text"), ?pa);
+        if (v == nil)                        { fail = true; }
+        or {
+            if (!str_equals(v, "a\nb\tc\"d")) { fail = true; }
+            free_str(v, ?pa);
+        }
+    }
+    release(?rd);
+    reader_dnit(?rd);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a response must echo the request id with the type it arrived as; a string id
+# is re-emitted from its wire bytes rather than decoded and re-escaped
+test "json: an id round-trips with its wire type preserved" {
+    var pa: Allocator;
+    page.make(?pa);
+    var rd: Reader;
+    if (!reader_init(?rd, ?pa)) { ret 1; }
+    var fail: bool = false;
+
+    val numeric: str = "{\"id\":12}";
+    var mn: Message = read(?rd, numeric, str_len(numeric));
+    val tn: str = id_text(member(?mn.root, "id"), ?pa);
+    if (tn == nil)                { fail = true; }
+    or { if (!str_equals(tn, "12")) { fail = true; } free_str(tn, ?pa); }
+
+    val quoted: str = "{\"id\":\"mls/registerWatchers\"}";
+    var mq: Message = read(?rd, quoted, str_len(quoted));
+    val tq: str = id_text(member(?mq.root, "id"), ?pa);
+    if (tq == nil)                { fail = true; }
+    or { if (!str_equals(tq, "\"mls/registerWatchers\"")) { fail = true; } free_str(tq, ?pa); }
+
+    val nulled: str = "{\"id\":null}";
+    var mz: Message = read(?rd, nulled, str_len(nulled));
+    val tz: str = id_text(member(?mz.root, "id"), ?pa);
+    if (tz == nil)                  { fail = true; }
+    or { if (!str_equals(tz, "null")) { fail = true; } free_str(tz, ?pa); }
+
+    # a notification carries no id and must not be answered
+    val notif: str = "{\"method\":\"exit\"}";
+    var mv: Message = read(?rd, notif, str_len(notif));
+    if (id_text(member(?mv.root, "id"), ?pa) != nil) { fail = true; }
+
+    release(?rd);
+    reader_dnit(?rd);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "json: a malformed body reports invalid rather than a partial tree" {
+    var pa: Allocator;
+    page.make(?pa);
+    var rd: Reader;
+    if (!reader_init(?rd, ?pa)) { ret 1; }
+    var fail: bool = false;
+    val truncated: str = "{\"method\":\"initialize\"";
+    var m: Message = read(?rd, truncated, str_len(truncated));
+    if (m.valid) { fail = true; }
+    val trailing: str = "{\"a\":1} garbage";
+    var m2: Message = read(?rd, trailing, str_len(trailing));
+    if (m2.valid) { fail = true; }
+    release(?rd);
+    reader_dnit(?rd);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the arena is what makes per-message parsing affordable: releasing must return
+# the chunks rather than grow without bound across a session's messages
+test "json: releasing a message reuses the arena instead of growing it" {
+    var pa: Allocator;
+    page.make(?pa);
+    var rd: Reader;
+    if (!reader_init(?rd, ?pa)) { ret 1; }
+    val body: str = "{\"method\":\"textDocument/didChange\",\"params\":{\"a\":[1,2,3,4,5,6,7,8]}}";
+    var i: usize = 0;
+    for (i < 200) {
+        var m: Message = read(?rd, body, str_len(body));
+        if (!m.valid) { release(?rd); reader_dnit(?rd); ret 1; }
+        release(?rd);
+        i = i + 1;
+    }
+    var fail: bool = false;
+    if (rd.ar.first_chunk != rd.ar.chunk) { fail = true; }
+    reader_dnit(?rd);
     if (fail) { ret 1; }
     ret 0;
 }

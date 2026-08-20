@@ -17,9 +17,14 @@ use std.types.size.usize;
 use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
+use std.types.result.Result;
+use std.types.result.ok;
 
-use os:  std.system.os;
-use env: std.process.env;
+use os:     std.system.os;
+use env:    std.process.env;
+use chrono: std.chrono.time;
+use fmtstr: std.format;
+use writer: std.io.writer;
 
 # fixed file the trace log is appended to
 val LOG_PATH: str = "/tmp/mach-lsp.log";
@@ -74,4 +79,42 @@ pub fun log(msg: str) {
     if (len == 0) { ret; }
 
     os.write(LOG_FD::i32, msg::*u8, len);
+}
+
+# whether tracing is on, so a caller can skip building a message it would drop
+# ---
+# ret: true when MLS_TRACE is set and the log is open
+pub fun enabled() bool {
+    if (!LOG_CHECKED) {
+        LOG_CHECKED = true;
+        LOG_ENABLED = trace_enabled();
+        if (LOG_ENABLED) { LOG_FD = trace_open(); }
+    }
+    ret LOG_ENABLED && LOG_FD >= 0;
+}
+
+# monotonic nanoseconds, for span timing
+# ---
+# ret: the monotonic clock reading in nanoseconds
+pub fun now_ns() i64 {
+    ret chrono.time_unix_nsec(chrono.monotonic());
+}
+
+# writer sink appending straight to the open trace descriptor
+fun trace_sink(ctx: ptr, p: *u8, len: usize) Result[usize, str] {
+    os.write(LOG_FD::i32, p, len);
+    ret ok[usize, str](len);
+}
+
+# append one formatted line to the trace log; a no-op when tracing is off
+# ---
+# fmt: std.format hole syntax
+# va:  comptime variadic argument pack
+pub fun logf(fmt: str, va: ...) {
+    if (!enabled()) { ret; }
+    var w: writer.Writer;
+    w.ctx = nil;
+    w.f_write = trace_sink;
+    fmtstr.vformat(?w, fmt, va...);
+    os.write(LOG_FD::i32, "\n"::*u8, 1);
 }
