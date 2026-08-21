@@ -1512,6 +1512,88 @@ def run_incremental_sync(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_code_actions(server: Path, timeout: float) -> None:
+    """Quick fixes come from the compiler's fixes, not from parsing its prose."""
+    with tempfile.TemporaryDirectory(prefix="mls-ca-") as directory:
+        root = Path(directory).resolve()
+        main, _, _ = write_project(root, "ca", 1)
+        # a near-miss identifier: the resolver knows the candidate exactly, so
+        # the diagnostic carries the replacement as an edit rather than a sentence
+        text = ("pub fun helper() i32 { ret 1; }\n"
+                "pub fun main() i32 { ret helpr(); }\n")
+        main.write_text(text, encoding="utf-8")
+
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            provider = result.get("capabilities", {}).get("codeActionProvider")
+            require(isinstance(provider, dict)
+                    and "quickfix" in provider.get("codeActionKinds", []),
+                    f"codeActionProvider is not advertised: {provider!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            published = session.diagnostics(main.as_uri(), 1)
+            entries = published["params"]["diagnostics"]
+            require(entries, "the misspelling produced no diagnostic")
+            target = next((d for d in entries if "helpr" in d["message"]), entries[0])
+
+            def actions(rng: dict[str, Any], only: list[str] | None = None) -> list[dict[str, Any]]:
+                ctx: dict[str, Any] = {"diagnostics": [target]}
+                if only is not None:
+                    ctx["only"] = only
+                response = session.request(
+                    "textDocument/codeAction",
+                    {"textDocument": {"uri": main.as_uri()}, "range": rng, "context": ctx})
+                items = response.get("result")
+                require(isinstance(items, list), f"codeAction is not a list: {items!r}")
+                return items
+
+            found = actions(target["range"])
+            require(found, "the diagnostic carried a fix but no action was offered")
+            action = found[0]
+            require(action.get("kind") == "quickfix", f"wrong kind: {action!r}")
+            require("helper" in action.get("title", ""),
+                    f"the title does not name the replacement: {action!r}")
+            require(action.get("diagnostics"),
+                    "the action does not carry its originating diagnostic")
+
+            changes = (action.get("edit") or {}).get("changes") or {}
+            edits = changes.get(main.as_uri())
+            require(edits, f"no edits for the requested document: {changes!r}")
+            for e in edits:
+                assert_range(e.get("range"), "edit.range")
+                require(isinstance(e.get("newText"), str), f"edit without text: {e!r}")
+            require(any(e["newText"] == "helper" for e in edits),
+                    f"no edit inserts the candidate: {edits!r}")
+
+            # a cursor is a zero-length range, and the fix under it must still be
+            # offered even though nothing is selected
+            caret = {"start": target["range"]["start"], "end": target["range"]["start"]}
+            require(actions(caret), "a zero-length range offered nothing")
+
+            # an `only` filter naming something this server does not provide
+            require(actions(target["range"], ["refactor"]) == [],
+                    "an unrelated only-filter still returned quickfixes")
+            require(actions(target["range"], ["quickfix"]),
+                    "an explicit quickfix filter returned nothing")
+
+            # a range with no diagnostic offers nothing
+            empty = {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
+            require(actions(empty) == [], "a clean range offered actions")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1636,7 +1718,16 @@ def run_crash_containment(server: Path, timeout: float) -> None:
     The compiler front end runs over buffers the user is actively breaking, and
     `std` exposes no way to trap an in-process fault, so the process the editor
     talks to does not run it. Killing the worker stands in for the fault.
+
+    The CONTAINMENT is portable; standing in for a fault is not. Finding the
+    child needs `pgrep` and killing it needs `SIGKILL`, neither of which exists
+    on Windows, so this is skipped there rather than rewritten around a weaker
+    signal that would prove something different.
     """
+    if os.name != "posix":
+        print("  crash containment: skipped (needs pgrep and SIGKILL)")
+        return
+
     with tempfile.TemporaryDirectory(prefix="mls-crash-") as directory:
         root = Path(directory).resolve()
         main, _, text = write_project(root, "crash", 5)
@@ -1817,6 +1908,7 @@ def main() -> int:
         run_semantic_tokens(server, args.timeout)
         run_cancellation(server, args.timeout)
         run_incremental_sync(server, args.timeout)
+        run_code_actions(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1840,6 +1932,7 @@ def main() -> int:
     print("  semanticTokens decode in order, within the legend and the file")
     print("  a withdrawn request is answered RequestCancelled")
     print("  incremental sync patches ranges, ordered, in UTF-16 columns")
+    print("  codeAction offers the compiler's own fixes as applicable edits")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  a worker crash is answered, explained, and exits 3")

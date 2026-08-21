@@ -1,0 +1,229 @@
+# quick fixes, from the compiler's own fixes rather than its prose
+#
+# A mach diagnostic carries two forms of the same advice. `help` is the sentence
+# a person reads in a terminal; `fixes` is that advice as spans and replacement
+# text. This binds to the second.
+#
+# The distinction is the whole reason this module waited. Building quick fixes
+# from `help` would mean pattern-matching the compiler's English and rebuilding
+# the edit from it, which couples the editor to diagnostic WORDING - every
+# rephrasing upstream silently breaking a fix here, with no compile error and no
+# test to catch it. briar-systems/mach#3023 added the structured form for
+# exactly that reason.
+#
+# A fix's edits apply together or not at all: wrapping an expression in a cast
+# needs `(` before it and `)::T` after, and applying half produces source that
+# does not parse. So one `Fix` becomes one `CodeAction` carrying all of its
+# edits, and alternatives - cast the value versus change the declared type - are
+# separate actions, because those are a choice a person makes.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+
+use sess:  mach.lang.session;
+use src:   mach.lang.source;
+use diag:  mach.lang.diagnostic;
+use token: mach.lang.fe.token;
+use editor: mach.lang.editor;
+use sj:    std.data.json;
+use strutil: std.text.string;
+
+use json:      mls.json;
+use render:    mls.render;
+use project:   mls.project;
+use positions: mls.positions;
+use documents: mls.documents;
+
+# LSP CodeActionKind.QuickFix, spelled as the protocol spells it
+val KIND_QUICKFIX: str = "quickfix";
+
+# answer textDocument/codeAction for the requested range
+#
+# Reads the retained snapshot's diagnostics; requesting actions analyses nothing
+# and publishes nothing, which is the invariant #142 established for this
+# server - what the editor shows must not depend on what was asked for.
+pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+                     docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(req_id, alloc);
+    if (id_raw == nil) { ret; }
+    if (uri == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    val d: *documents.Document = documents.find(docs, uri);
+    if (d == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    val vr: Result[project.DocumentView, str] = project.document_view(ws, d);
+    if (is_err[project.DocumentView, str](vr)) { render.reply_empty_array(alloc, id_raw); ret; }
+    val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+    val s: *sess.Session = project.root_session(v.root);
+    if (s == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    var lo: usize = 0;
+    var hi: usize = 0;
+    if (!request_range(params, v.file, ?lo, ?hi)) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    # a client may ask for only certain kinds; this server offers quickfix alone,
+    # so a filter that excludes it excludes everything
+    if (!wants_quickfix(params, alloc)) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+
+    var emitted: usize = 0;
+    var i: usize = 0;
+    for (i < s.diags.len) {
+        val dg: *diag.Diagnostic = ?s.diags.items[i];
+        if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
+            var f: usize = 0;
+            for (f < dg.fix_len) {
+                push_action(?b, ws, alloc, ?s.sources, v.file, uri, dg, ?dg.fixes[f], emitted > 0);
+                emitted = emitted + 1;
+                f = f + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# append one CodeAction for `fix`
+#
+# The originating diagnostic rides along so a client can associate the action
+# with the squiggle it is offered under, and so applying it can clear that entry.
+fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
+                file: *src.SourceFile, uri: str, dg: *diag.Diagnostic, fix: *diag.Fix, comma: bool) {
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"title\":");
+    json.buf_push_quoted(b, fix.label);
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_quoted(b, KIND_QUICKFIX);
+
+    json.buf_push(b, ",\"diagnostics\":[{\"range\":");
+    render.span_range(b, file, dg.loc.span);
+    json.buf_push(b, ",\"severity\":");
+    json.buf_push_i64(b, severity_of(dg.severity));
+    json.buf_push(b, ",\"source\":\"mach\",\"message\":");
+    json.buf_push_quoted(b, dg.message);
+    json.buf_push(b, "}]");
+
+    # every edit of one fix lands in the same WorkspaceEdit, because they apply
+    # together or not at all
+    json.buf_push(b, ",\"edit\":{\"changes\":{");
+    push_edits(b, ws, alloc, sources, file, uri, fix);
+    json.buf_push(b, "}}}");
+}
+
+# append the `changes` map for a fix's edits, grouped by document
+#
+# Edits are almost always in the requested document, so that URI is emitted
+# without a lookup; an edit naming another file resolves its own URI through the
+# source map rather than being silently dropped into the wrong document.
+fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
+               file: *src.SourceFile, uri: str, fix: *diag.Fix) {
+    var wrote_group: bool = false;
+    var e: usize = 0;
+    for (e < fix.edit_len) {
+        val ed: *diag.Edit = ?fix.edits[e];
+        val same: bool = edit_file(sources, ed) == file;
+        if (same) {
+            if (!wrote_group) {
+                json.buf_push_quoted(b, uri);
+                json.buf_push_byte(b, ':');
+                json.buf_push_byte(b, '[');
+                wrote_group = true;
+            }
+            or { json.buf_push_byte(b, ','); }
+            render.text_edit(b, file, ed.loc.span, ed.replacement);
+        }
+        e = e + 1;
+    }
+    if (wrote_group) { json.buf_push_byte(b, ']'); }
+}
+
+# the source file an edit addresses, or nil
+fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
+    val fo: Option[*src.SourceFile] = src.get(sources, ed.loc.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret nil; }
+    ret unwrap[*src.SourceFile](fo);
+}
+
+# whether a diagnostic's span touches the requested range
+#
+# Touching rather than containing: a client asks for actions at a cursor, which
+# is a zero-length range, and a fix for the error under that cursor must be
+# offered even though nothing is selected.
+fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
+    val start: usize = span.offset;
+    var end: usize = span.offset + span.len;
+    if (span.len == 0) { end = start; }
+    if (end < lo) { ret false; }
+    if (start > hi) { ret false; }
+    ret true;
+}
+
+# resolve the request's `range` to byte offsets
+fun request_range(params: *sj.Value, file: *src.SourceFile, lo: *usize, hi: *usize) bool {
+    val rng: *sj.Value = json.member(params, "range");
+    if (rng == nil) { ret false; }
+    val so: Option[usize] = offset_of(rng, "start", file);
+    val eo: Option[usize] = offset_of(rng, "end", file);
+    if (!is_some[usize](so) || !is_some[usize](eo)) { ret false; }
+    @lo = unwrap[usize](so);
+    @hi = unwrap[usize](eo);
+    if (@hi < @lo) { @hi = @lo; }
+    ret true;
+}
+
+fun offset_of(rng: *sj.Value, key: str, file: *src.SourceFile) Option[usize] {
+    val p: *sj.Value = json.member(rng, key);
+    val line: i64 = json.number(json.member(p, "line"), -1);
+    val ch:   i64 = json.number(json.member(p, "character"), -1);
+    if (line < 0 || ch < 0) { ret positions.offset_at(file, 0, 0); }
+    ret positions.offset_at(file, line::usize, ch::usize);
+}
+
+# whether the request's `only` filter admits quickfix
+#
+# An absent filter admits everything. A present one that does not name quickfix
+# (or a prefix of it) means the client wants refactors or source actions, which
+# this server does not offer.
+fun wants_quickfix(params: *sj.Value, alloc: *Allocator) bool {
+    val ctx: *sj.Value = json.member(params, "context");
+    val only: *sj.Value = json.member(ctx, "only");
+    if (only == nil) { ret true; }
+    val n: usize = json.count(only);
+    if (n == 0) { ret true; }
+    var i: usize = 0;
+    for (i < n) {
+        val k: str = json.text(json.element(only, i), alloc);
+        if (k != nil) {
+            val ok: bool = str_equals(k, KIND_QUICKFIX);
+            json.free_str(k, alloc);
+            if (ok) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the LSP severity for a compiler severity
+fun severity_of(sev: diag.Severity) i64 {
+    if (sev == diag.SEVERITY_ERROR)   { ret 1; }
+    if (sev == diag.SEVERITY_WARNING) { ret 2; }
+    if (sev == diag.SEVERITY_INFO)    { ret 3; }
+    ret 4;
+}

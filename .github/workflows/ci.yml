@@ -37,3 +37,43 @@ jobs:
 
       - name: Protocol smoke
         run: python3 test/lsp_protocol.py out/linux-x86_64/debug/bin/mls
+
+  # windows path identity is lexical - drive roots, UNC authorities, native
+  # separators - and none of it is exercised by a linux build, where `\` is an
+  # ordinary character and every root is `/`. #157 is about that difference, so
+  # it needs a runner that actually has it.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install mach
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path machdl | Out-Null
+          gh release download --repo briar-systems/mach `
+            --pattern 'mach-*-x86_64-windows.zip' --dir machdl --clobber
+          Expand-Archive -Path (Get-ChildItem machdl\*.zip)[0].FullName -DestinationPath machdl -Force
+          "$PWD\machdl" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$PWD\machdl\mach.exe" info
+
+      - name: Pull dependencies
+        run: mach dep pull
+
+      - name: Build (debug)
+        run: mach build . --target windows-x86_64 --profile debug
+
+      - name: Test
+        run: mach test .
+
+      - name: Protocol smoke
+        shell: pwsh
+        run: |
+          $bin = Get-ChildItem -Path out\windows-x86_64\debug\bin -Filter 'mls*' |
+                 Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
+          if (-not $bin) { throw "no mls binary was produced" }
+          python test/lsp_protocol.py $bin.FullName

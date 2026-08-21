@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-21
+
+The last three upstream blockers landed, so the work they held up shipped
+together.
+
+### Added
+- codeAction: quick fixes, built from the compiler's structured `fixes` rather
+  than by parsing its prose. mach#3023 added spans and replacement text
+  alongside `help`, which is what made this safe to build - reconstructing an
+  edit from the compiler's English would couple the editor to diagnostic
+  wording, so every rephrasing upstream broke a fix here silently. One `Fix`
+  becomes one action carrying all its edits, since they apply together or not at
+  all. (#165)
+- ci: a windows-latest job. Windows path identity is lexical - drive roots, UNC
+  authorities, native separators - and none of it is exercised by a Linux build.
+  It failed three times before passing, each on something a Linux runner cannot
+  see. (#157)
+
+### Fixed
+- paths: file URI identity is portable in both directions. `normalize_path`
+  delegates to `std.types.path.clean` rather than a hand-rolled POSIX cleaner. A
+  non-empty authority is a UNC host rather than a path segment, so
+  `file://server/share` no longer decodes a remote path as local; a drive URI
+  loses the leading slash the URI form adds; an encoded NUL is refused rather
+  than truncating every later comparison. Outbound, URIs are built rather than
+  concatenated: `C:\src\x` produced `file://C:\src\x`, where a client reads
+  `C:` as the host. (#157)
+- supervisor: the worker inherits this process's environment. It was spawned
+  with a nil envp, so the child ran with none at all - `PATH`, locale,
+  `MLS_TRACE` - which was invisible until a trace produced no output from it.
+- deps: advanced the vendored mach pin to `v4.24.0` and mach-std to `v0.28.1`.
+
 ## [0.13.0] - 2026-08-21
 
 ### Added

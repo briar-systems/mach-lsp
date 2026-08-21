@@ -49,6 +49,7 @@ use workspace:   mls.workspace;
 use signature:   mls.signature;
 use hints:       mls.hints;
 use tokens:      mls.tokens;
+use actions:     mls.actions;
 use project:     mls.project;
 use trace:       mls.trace;
 use render:      mls.render;
@@ -71,6 +72,7 @@ val FEATURE_DOCUMENT_HIGHLIGHT: u8 = 7;
 val FEATURE_SIGNATURE_HELP:     u8 = 8;
 val FEATURE_INLAY_HINT:         u8 = 9;
 val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
+val FEATURE_CODE_ACTION:        u8 = 11;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
@@ -333,6 +335,7 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
     if (str_equals(method, "textDocument/signatureHelp"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_SIGNATURE_HELP); ret; }
     if (str_equals(method, "textDocument/inlayHint"))      { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_INLAY_HINT); ret; }
     if (str_equals(method, "textDocument/semanticTokens/full")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_SEMANTIC_TOKENS); ret; }
+    if (str_equals(method, "textDocument/codeAction"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_CODE_ACTION); ret; }
     if (str_equals(method, "workspace/symbol"))            { json.free_str(method, a); handle_workspace_symbol(srv, root, params); ret; }
 
     trace.logf("server: unhandled method {}", method);
@@ -356,7 +359,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -594,6 +597,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_SIGNATURE_HELP)  { signature.signature_help(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_INLAY_HINT)      { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_SEMANTIC_TOKENS) { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_CODE_ACTION)     { actions.code_actions(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 

@@ -32,6 +32,7 @@ use std.allocator.Allocator;
 
 use os:     std.system.os;
 use exec:   std.process.exec;
+use env:    std.process.env;
 use thread: std.sync.thread;
 use atomic: std.sync.atomic;
 
@@ -76,7 +77,11 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     argv[1] = WORKER_FLAG::*u8;
     argv[2] = nil;
 
-    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], nil,
+    # the worker inherits this process's environment. Handing it nil gives the
+    # child an EMPTY environment, which silently drops everything a tool reads
+    # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
+    # until something that depends on one of them stops working.
+    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
                                        to_worker[0], from_worker[1], 2);
     # the child owns its ends now; holding them here would keep the pipes open
     # past the child's exit and turn a crash into a hang
