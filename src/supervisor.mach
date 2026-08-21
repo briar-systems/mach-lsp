@@ -1,0 +1,269 @@
+# crash containment: the client-facing half of the server
+#
+# The analysis worker runs the compiler front end over buffers the user is
+# actively breaking. A front-end defect there is an in-process fault - a bad
+# dereference, a failed assertion - and `std` exposes no way to trap one, so a
+# single-process server dies with it. What the client sees is a closed pipe: no
+# error, no message, no indication of which file or which request was involved.
+#
+# So the process the editor talks to does not run the compiler. It owns the
+# client's stdin and stdout, spawns a second copy of this executable with
+# `--worker`, and relays frames between them. A fault in the worker is then an
+# ordinary child exit, which the parent survives and can explain: the in-flight
+# request is answered, the user is told, and the exit code says what happened.
+#
+# Restart with state replay is deliberately NOT here. Replaying a session means
+# the parent owning document text - reconstructing it through incremental edits
+# it would otherwise never parse - which is the design in #154/#155 and a much
+# larger change than containment. Reporting a crash honestly and exiting is
+# worth having on its own, and an editor restarts a server that exits.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+
+use os:     std.system.os;
+use exec:   std.process.exec;
+use thread: std.sync.thread;
+use atomic: std.sync.atomic;
+
+use sj:        std.data.json;
+use json:      mls.json;
+use transport: mls.transport;
+use trace:     mls.trace;
+
+# the argument that selects the worker role
+pub val WORKER_FLAG: str = "--worker";
+
+# exit code when the worker died on a signal, distinct from a clean protocol
+# exit (0) and a transport failure (1) so a wrapper can tell them apart
+pub val EXIT_WORKER_CRASHED: i64 = 3;
+
+# the relay's shared state
+#
+# `to_worker` is written by the pump thread and read by nobody else; the fields
+# here are what the two halves genuinely share.
+rec Relay {
+    alloc:      *Allocator;
+    to_worker:  i32;
+    stop:       i64;
+    last_id:    i64;
+    have_id:    i64;
+}
+
+# one relay per process; the pump thread is handed its address
+var RELAY: Relay;
+
+# run as the client-facing supervisor, returning the process exit code
+#
+# `self` is this executable's path, re-spawned with `--worker`.
+pub fun run(alloc: *Allocator, self: str) i64 {
+    var to_worker:   [2]i32;
+    var from_worker: [2]i32;
+    if (os.pipe(?to_worker[0]) < 0)   { trace.log("supervisor: pipe failed\n"); ret 1; }
+    if (os.pipe(?from_worker[0]) < 0) { trace.log("supervisor: pipe failed\n"); ret 1; }
+
+    var argv: [3]*u8;
+    argv[0] = self::*u8;
+    argv[1] = WORKER_FLAG::*u8;
+    argv[2] = nil;
+
+    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], nil,
+                                       to_worker[0], from_worker[1], 2);
+    # the child owns its ends now; holding them here would keep the pipes open
+    # past the child's exit and turn a crash into a hang
+    os.close(to_worker[0]);
+    os.close(from_worker[1]);
+    if (pid < 0) {
+        os.close(to_worker[1]);
+        os.close(from_worker[0]);
+        trace.log("supervisor: could not start the analysis worker\n");
+        ret 1;
+    }
+
+    RELAY.alloc     = alloc;
+    RELAY.to_worker = to_worker[1];
+    RELAY.stop      = 0;
+    RELAY.last_id   = 0;
+    RELAY.have_id   = 0;
+
+    var pump: thread.Thread;
+    thread.spawn_with(pump_client, (?RELAY)::*u8, ?pump);
+    if (pump.tid < 0) {
+        os.close(to_worker[1]);
+        os.close(from_worker[0]);
+        trace.log("supervisor: could not start the client pump\n");
+        ret 1;
+    }
+
+    # relay the worker's output to the client until the worker's end closes
+    val clean: bool = pump_worker(alloc, from_worker[0]);
+    atomic.store(?RELAY.stop, 1);
+
+    var child: exec.Child;
+    child.pid = pid;
+    val wr: Result[exec.ExitStatus, str] = exec.wait(child);
+    os.close(to_worker[1]);
+    os.close(from_worker[0]);
+
+    if (is_err[exec.ExitStatus, str](wr)) { ret 1; }
+    var status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](wr);
+
+    if (exec.signaled(status)) {
+        report_crash(alloc, exec.signal(status)::i64);
+        ret EXIT_WORKER_CRASHED;
+    }
+    if (!clean) { trace.log("supervisor: worker output ended mid-frame\n"); }
+    ret exec.code(status)::i64;
+}
+
+# forward client frames to the worker, recording the newest request id
+#
+# The id is what lets a crash be attributed to a request rather than reported
+# as an anonymous failure. Only the newest is kept: with one worker executing in
+# order, the newest request is the one that was running.
+fun pump_client(arg: *u8) {
+    val r: *Relay = arg::*Relay;
+    for (atomic.load(?r.stop) == 0) {
+        var msg: transport.Message;
+        val st: transport.ReadStatus = transport.read_message(?msg, r.alloc);
+        if (st != transport.READ_OK) { brk; }
+        note_request(r, msg.body, msg.body_len);
+        if (!write_frame(r.to_worker, msg.body, msg.body_len)) {
+            transport.message_free(?msg, r.alloc);
+            brk;
+        }
+        transport.message_free(?msg, r.alloc);
+    }
+    # closing the worker's input is how it learns the client is gone
+    os.close(r.to_worker);
+}
+
+# forget a request the worker has answered
+#
+# Without this the parent reports a crash against whichever id it saw last,
+# even when the worker had already answered it - two responses for one id,
+# which is exactly the rule the worker's own dispatcher backstop exists to
+# keep. The parent must know what is actually outstanding, not what was recent.
+fun note_response(r: *Relay, body: str, len: usize) {
+    if (atomic.load(?r.have_id) == 0) { ret; }
+    var rd: json.Reader;
+    if (!json.reader_init(?rd, r.alloc)) { ret; }
+    var parsed: json.Message = json.read(?rd, body, len);
+    if (parsed.valid) {
+        val idv: *sj.Value = json.member(?parsed.root, "id");
+        val answered: bool = json.member(?parsed.root, "result") != nil
+                          || json.member(?parsed.root, "error") != nil;
+        if (idv != nil && answered) {
+            val id: str = json.id_text(idv, r.alloc);
+            if (id != nil) {
+                if (parse_id(id) == atomic.load(?r.last_id)) { atomic.store(?r.have_id, 0); }
+                json.free_str(id, r.alloc);
+            }
+        }
+    }
+    json.release(?rd);
+    json.reader_dnit(?rd);
+}
+
+# remember the newest request id seen on the client stream
+fun note_request(r: *Relay, body: str, len: usize) {
+    var rd: json.Reader;
+    if (!json.reader_init(?rd, r.alloc)) { ret; }
+    var parsed: json.Message = json.read(?rd, body, len);
+    if (parsed.valid) {
+        val id: str = json.id_text(json.member(?parsed.root, "id"), r.alloc);
+        if (id != nil) {
+            atomic.store(?r.last_id, parse_id(id));
+            atomic.store(?r.have_id, 1);
+            json.free_str(id, r.alloc);
+        }
+    }
+    json.release(?rd);
+    json.reader_dnit(?rd);
+}
+
+# a numeric id's value, or 0 for a string or null id
+#
+# A crash report names the id only when it is numeric; quoting a string id back
+# would mean re-escaping it from a thread that is about to exit, and the message
+# is diagnostic rather than protocol.
+fun parse_id(token: str) i64 {
+    var v: i64 = 0;
+    var i: usize = 0;
+    val n: usize = str_len(token);
+    for (i < n) {
+        if (token[i] < '0' || token[i] > '9') { ret 0; }
+        v = v * 10 + (token[i]::i64 - '0'::i64);
+        i = i + 1;
+    }
+    ret v;
+}
+
+# copy the worker's frames to the client, returning whether the stream ended
+# on a frame boundary
+#
+# Every relayed response clears the outstanding id, so a crash is reported
+# against a request that is genuinely unanswered rather than the most recent one.
+fun pump_worker(alloc: *Allocator, fd: i32) bool {
+    for (true) {
+        var msg: transport.Message;
+        val st: transport.ReadStatus = transport.read_message_from(fd, ?msg, alloc);
+        if (st == transport.READ_EOF) { ret true; }
+        if (st != transport.READ_OK)  { ret false; }
+        note_response(?RELAY, msg.body, msg.body_len);
+        transport.send_message(msg.body, alloc);
+        transport.message_free(?msg, alloc);
+    }
+    ret true;
+}
+
+# write one Content-Length frame to `fd`
+fun write_frame(fd: i32, body: str, len: usize) bool {
+    ret transport.write_frame_to(fd, body, len);
+}
+
+# tell the client the analysis worker died, and answer the request it died on
+#
+# Two messages, because they serve different readers: the error response
+# unblocks the client's pending request, and the showMessage is what the person
+# sees. Without the first, an editor waits on that id until it gives up.
+fun report_crash(alloc: *Allocator, sig: i64) {
+    trace.logf("supervisor: analysis worker terminated by signal {}", sig);
+
+    if (atomic.load(?RELAY.have_id) != 0) {
+        val id: i64 = atomic.load(?RELAY.last_id);
+        if (id != 0) {
+            var b: json.Buf = json.buf_init(alloc);
+            json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+            json.buf_push_i64(?b, id);
+            json.buf_push(?b, ",\"error\":{\"code\":-32603,\"message\":");
+            json.buf_push_quoted(?b, "the mach analysis worker crashed while handling this request");
+            json.buf_push(?b, "}}");
+            val msg: str = json.buf_str(?b);
+            if (msg != nil) { transport.send_message(msg, alloc); }
+            json.buf_dnit(?b);
+        }
+    }
+
+    var n: json.Buf = json.buf_init(alloc);
+    json.buf_push(?n, "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":1,\"message\":");
+    var text: json.Buf = json.buf_init(alloc);
+    json.buf_push(?text, "mach-lsp: the analysis worker crashed (signal ");
+    json.buf_push_i64(?text, sig);
+    json.buf_push(?text, "). This is a compiler front-end fault; the language server has stopped.");
+    json.buf_push_quoted(?n, json.buf_str(?text));
+    json.buf_push(?n, "}}");
+    val nmsg: str = json.buf_str(?n);
+    if (nmsg != nil) { transport.send_message(nmsg, alloc); }
+    json.buf_dnit(?text);
+    json.buf_dnit(?n);
+}

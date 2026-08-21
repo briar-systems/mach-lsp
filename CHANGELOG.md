@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-21
+
+### Added
+- supervisor: a compiler front-end fault no longer takes the server down
+  silently. The process the editor talks to owns the client's stdio and runs no
+  compiler code; it spawns a second copy of this executable with `--worker` and
+  relays frames. A fault becomes an ordinary child exit the parent survives and
+  explains - the outstanding request is answered `-32603`, the person is told
+  which signal killed it through `window/showMessage`, and the exit code is 3,
+  distinct from a clean protocol exit (0) and a transport failure (1). The
+  parent tracks which request is genuinely outstanding, clearing it as
+  responses relay back, so a crash after a request was answered adds no second
+  response. Restart with state replay is deliberately absent; that needs the
+  parent to own document text, which is #154/#155's design. (#154, #156)
+- server: every request is guaranteed a response. A handler that produced none -
+  a latched allocation failure in its response buffer, a path that gave up
+  without replying - left the client waiting forever; the dispatcher now detects
+  that and answers `-32603`.
+
+### Fixed
+- deps: **advanced the vendored mach pin to `v4.22.0`**, which carries the
+  retained-analysis leak fix (mach#3010, released in 4.20.1). Session memory is
+  flat: 40 edits of one file on this repository hold at 228 MiB, against ~8 MiB
+  per edit before this work and ~4.2 MiB after 4.20.0. (#159)
+
 ## [0.12.0] - 2026-08-21
 
 Five new language features, cancellation, and the emit layer they all share.

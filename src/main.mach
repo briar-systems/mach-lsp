@@ -8,6 +8,8 @@
 use std.runtime;
 
 use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.string.str;
 use std.types.option.Option;
 use std.types.option.is_some;
@@ -16,7 +18,9 @@ use std.allocator.Allocator;
 use page: std.allocator.page;
 use os:   std.system.os;
 
-use server: mls.server;
+use server:     mls.server;
+use supervisor: mls.supervisor;
+use std.types.string.str_equals;
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
@@ -26,6 +30,14 @@ fun main(argc: i64, argv: **u8) i64 {
     val pe: Option[str] = page.make(?alloc);
     if (is_some[str](pe)) { ret 1; }
 
+    # two roles, one executable. Without `--worker` this process is the
+    # supervisor: it owns the client's stdio and runs no compiler code, so a
+    # front-end fault in the worker is a child exit it survives and can explain
+    # rather than a closed pipe the editor has to guess about.
+    if (!is_worker(argc, argv)) {
+        ret supervisor.run(?alloc, self_path(argc, argv));
+    }
+
     var srv: server.Server;
     if (!server.init(?srv, ?alloc)) { ret 1; }
 
@@ -33,4 +45,20 @@ fun main(argc: i64, argv: **u8) i64 {
 
     server.dnit(?srv);
     ret code;
+}
+
+# whether this process was started as the analysis worker
+fun is_worker(argc: i64, argv: **u8) bool {
+    var i: i64 = 1;
+    for (i < argc) {
+        if (argv[i] != nil && str_equals(argv[i]::str, supervisor.WORKER_FLAG)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# this executable's path, for re-spawning the worker
+fun self_path(argc: i64, argv: **u8) str {
+    if (argc > 0 && argv[0] != nil) { ret argv[0]::str; }
+    ret "mls";
 }

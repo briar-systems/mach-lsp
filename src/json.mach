@@ -756,3 +756,27 @@ test "json: releasing a message reuses the arena instead of growing it" {
     if (fail) { ret 1; }
     ret 0;
 }
+
+# append the bytes of `s` in `[from, to)`
+#
+# Splicing a document for an incremental edit needs a substring append; going
+# through a temporary owned copy would allocate the whole prefix twice.
+pub fun buf_push_range(b: *Buf, s: str, from: usize, to: usize) {
+    if (s == nil || to <= from) { ret; }
+    val n: usize = to - from;
+    if (!buf_reserve(b, n)) { ret; }
+    mem.raw_copy((b.data::usize + b.len)::ptr, (s::usize + from)::ptr, n);
+    b.len = b.len + n;
+}
+
+# an owned copy of `s`
+pub fun dup(s: str, alloc: *Allocator) str {
+    if (s == nil) { ret nil; }
+    val n: usize = str_len(s);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    if (n > 0) { mem.raw_copy(out::ptr, s::ptr, n); }
+    out[n] = 0;
+    ret out::str;
+}

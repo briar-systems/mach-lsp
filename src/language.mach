@@ -565,7 +565,7 @@ fun module_definition(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.S
     json.buf_push_quoted(?b, muri);
     json.buf_push(?b, ",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}}}");
     val msg: str = json.buf_str(?b);
-    if (msg != nil) { transport.send_message(msg, alloc); }
+    if (msg != nil) { transport.send_message(msg, alloc); render.note_response(); }
     json.buf_dnit(?b);
     strutil.str_free(ws.alloc, muri);
     json.free_str(id_raw, alloc);
@@ -1683,7 +1683,7 @@ fun emit_document_symbols(an: analysis.Analyzed, alloc: *Allocator, id_raw: str)
 
     json.buf_push(?b, "]}");
     val msg: str = json.buf_str(?b);
-    if (msg != nil) { transport.send_message(msg, alloc); }
+    if (msg != nil) { transport.send_message(msg, alloc); render.note_response(); }
     or { render.reply_empty_array(alloc, id_raw); json.buf_dnit(?b); ret; }
     json.buf_dnit(?b);
     json.free_str(id_raw, alloc);
@@ -2017,7 +2017,7 @@ fun push_completion_head(b: *json.Buf, id_raw: str) {
 fun push_completion_tail(b: *json.Buf, alloc: *Allocator, id_raw: str) {
     json.buf_push(b, "]}}");
     val msg: str = json.buf_str(b);
-    if (msg != nil) { transport.send_message(msg, alloc); }
+    if (msg != nil) { transport.send_message(msg, alloc); render.note_response(); }
     json.buf_dnit(b);
     json.free_str(id_raw, alloc);
 }

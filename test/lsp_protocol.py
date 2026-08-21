@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import json
 import os
 import queue
@@ -483,7 +484,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             require(isinstance(result, dict), f"invalid initialize result: {result!r}")
             capabilities = result.get("capabilities")
             require(isinstance(capabilities, dict), "initialize capabilities are missing")
-            require(capabilities.get("textDocumentSync") == 1, "full-text sync is not advertised")
+            require(capabilities.get("textDocumentSync") == 2, "incremental sync is not advertised")
             session.notify("initialized", {})
             registration = session.wait_for(
                 lambda item: item.get("method") == "client/registerCapability",
@@ -1438,6 +1439,79 @@ def run_cancellation(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_incremental_sync(server: Path, timeout: float) -> None:
+    """Range edits patch the buffer, and the buffer is what everything reads."""
+    with tempfile.TemporaryDirectory(prefix="mls-incr-") as directory:
+        root = Path(directory).resolve()
+        main, _, _ = write_project(root, "incr", 1)
+        text = "pub fun alpha() i32 { ret 1; }\npub fun beta() i32 { ret 2; }\n"
+        main.write_text(text, encoding="utf-8")
+
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            require(result.get("capabilities", {}).get("textDocumentSync") == 2,
+                    "incremental sync is not advertised")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            version = [1]
+
+            def edit(changes: list[dict[str, Any]]) -> list[str]:
+                version[0] += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                     "contentChanges": changes},
+                )
+                session.diagnostics(main.as_uri(), version[0])
+                response = session.request(
+                    "textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
+                return [s["name"] for s in (response.get("result") or [])]
+
+            def span(l1: int, c1: int, l2: int, c2: int) -> dict[str, Any]:
+                return {"start": {"line": l1, "character": c1},
+                        "end": {"line": l2, "character": c2}}
+
+            # one range
+            names = edit([{"range": span(0, 8, 0, 13), "text": "gamma"}])
+            require(names == ["gamma", "beta"], f"single range edit went wrong: {names!r}")
+
+            # two ranges in one notification: the second is expressed against the
+            # result of the first, which is how the client computed it
+            names = edit([{"range": span(0, 8, 0, 13), "text": "dd"},
+                          {"range": span(1, 8, 1, 12), "text": "ee"}])
+            require(names == ["dd", "ee"], f"ordered ranges went wrong: {names!r}")
+
+            # a range spanning a line boundary
+            names = edit([{"range": span(0, 29, 1, 0), "text": "\n\n"}])
+            require(names == ["dd", "ee"], f"a multi-line range went wrong: {names!r}")
+
+            # a full-document change is still accepted in incremental mode
+            names = edit([{"text": "pub fun solo() i32 { ret 9; }\n"}])
+            require(names == ["solo"], f"a full-text change was mishandled: {names!r}")
+
+            # multi-byte text: the column is UTF-16 code units, not bytes
+            names = edit([{"range": span(0, 0, 0, 0), "text": "# \U0001F600 note\n"}])
+            require(names == ["solo"], f"a multi-byte insert corrupted the buffer: {names!r}")
+            names = edit([{"range": span(0, 5, 0, 9), "text": "x"}])
+            require(names == ["solo"],
+                    f"an edit after an astral codepoint used byte columns: {names!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_active_watcher_fallback(server: Path, timeout: float) -> None:
     """Prove a missed source event is recovered even after watcher ACK."""
     with tempfile.TemporaryDirectory(prefix="mls-watch-") as directory:
@@ -1554,6 +1628,63 @@ def run_bad_frame(server: Path, frame: bytes, timeout: float, label: str) -> Non
             raise ProtocolError(f"{label}: server did not terminate") from error
     require(result.returncode == 1, f"{label}: expected exit 1, got {result.returncode}")
     require(result.stdout == b"", f"{label}: server emitted a partial response")
+
+
+def run_crash_containment(server: Path, timeout: float) -> None:
+    """A worker fault is reported, not a closed pipe.
+
+    The compiler front end runs over buffers the user is actively breaking, and
+    `std` exposes no way to trap an in-process fault, so the process the editor
+    talks to does not run it. Killing the worker stands in for the fault.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-crash-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "crash", 5)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            # the process the client talks to must not be the one analysing
+            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
+                                      capture_output=True, text=True).stdout.split()
+            require(children, "no analysis worker: the compiler runs in the client process")
+
+            pending = session.next_id
+            session._send({"jsonrpc": "2.0", "id": pending,
+                           "method": "textDocument/references",
+                           "params": {"textDocument": {"uri": main.as_uri()},
+                                      "position": {"line": 0, "character": 4},
+                                      "context": {"includeDeclaration": True}}})
+            session.next_id += 1
+            os.kill(int(children[0]), signal.SIGKILL)
+
+            # the outstanding request is answered rather than left hanging
+            answer = session.wait_for(
+                lambda item: item.get("id") == pending,
+                "a response after the worker died")
+            require("error" in answer, f"a crash produced a result: {answer!r}")
+
+            # and the person is told what happened
+            note = session.wait_for(
+                lambda item: item.get("method") == "window/showMessage",
+                "a message explaining the crash")
+            require("crash" in note["params"]["message"].lower(),
+                    f"the message does not explain the crash: {note!r}")
+
+            code = session.proc.wait(timeout=timeout)
+            require(code == 3, f"a worker crash exited {code}, want 3")
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
 
 
 def run_exit_paths(server: Path, timeout: float) -> None:
@@ -1685,9 +1816,11 @@ def main() -> int:
         run_inlay_hints(server, args.timeout)
         run_semantic_tokens(server, args.timeout)
         run_cancellation(server, args.timeout)
+        run_incremental_sync(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
+        run_crash_containment(server, args.timeout)
         run_transport_regressions(server, args.timeout)
         closed_stdout_status = probe_closed_stdout(server, args.timeout, True)
         suppressed_status = probe_closed_stdout(server, args.timeout, False)
@@ -1706,8 +1839,10 @@ def main() -> int:
     print("  inlayHint names literal arguments at multi-parameter calls")
     print("  semanticTokens decode in order, within the legend and the file")
     print("  a withdrawn request is answered RequestCancelled")
+    print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
+    print("  a worker crash is answered, explained, and exits 3")
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")

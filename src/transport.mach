@@ -74,6 +74,20 @@ pub fun write_failed() bool {
 # alloc: allocator for bounded header and body storage
 # ret:   READ_OK, clean READ_EOF, READ_MALFORMED, or READ_ERROR
 pub fun read_message(msg: *Message, alloc: *Allocator) ReadStatus {
+    ret read_message_from(os.STDIN_FD, msg, alloc);
+}
+
+# read one bounded frame from `fd`
+#
+# The supervisor relays frames between the client and a worker child, so the
+# framing is no longer tied to this process's stdio. Bounds, EINTR handling,
+# and the clean-EOF distinction are the same wherever the bytes come from.
+# ---
+# fd:    descriptor to read from
+# msg:   output message, owned on READ_OK and zeroed otherwise
+# alloc: allocator for bounded header and body storage
+# ret:   READ_OK, clean READ_EOF, READ_MALFORMED, or READ_ERROR
+pub fun read_message_from(fd: i32, msg: *Message, alloc: *Allocator) ReadStatus {
     msg.body = nil;
     msg.body_len = 0;
 
@@ -88,7 +102,7 @@ pub fun read_message(msg: *Message, alloc: *Allocator) ReadStatus {
             ret READ_MALFORMED;
         }
         var c: u8;
-        val n: i64 = read_retry(?c, 1);
+        val n: i64 = read_retry_fd(fd, ?c, 1);
         if (n == 0) {
             deallocate[u8](alloc, header, HEADER_MAX);
             if (header_len == 0) { ret READ_EOF; }
@@ -121,7 +135,7 @@ pub fun read_message(msg: *Message, alloc: *Allocator) ReadStatus {
 
     var got: usize = 0;
     for (got < body_len) {
-        val n: i64 = read_retry((body::usize + got)::*u8, body_len - got);
+        val n: i64 = read_retry_fd(fd, (body::usize + got)::*u8, body_len - got);
         if (n == 0) {
             deallocate[u8](alloc, body, body_len + 1);
             ret READ_MALFORMED;
@@ -192,8 +206,12 @@ fun write_all(buf: *u8, len: usize) bool {
 # that guard, retry the operation rather than turning an interruption into an LSP
 # transport failure
 fun read_retry(buf: *u8, len: usize) i64 {
+    ret read_retry_fd(os.STDIN_FD, buf, len);
+}
+
+fun read_retry_fd(fd: i32, buf: *u8, len: usize) i64 {
     for (true) {
-        val n: i64 = os.read(os.STDIN_FD, buf, len);
+        val n: i64 = os.read(fd, buf, len);
         if (n != os.EINTR) { ret n; }
     }
     ret os.EINTR;
@@ -293,4 +311,37 @@ test "mls.transport.parse_content_length:bounded_strict_decimal" {
     val overflow: str = "Content-Length: 999999999999999999999999999999999999\r\n\r\n";
     if (parse_content_length(overflow::*u8, str_len(overflow)) >= 0) { ret 1; }
     ret 0;
+}
+
+# write one Content-Length frame to `fd`
+#
+# The supervisor's counterpart to `send_message`: same framing, but to a child's
+# input rather than this process's stdout, and without the process-wide
+# write-failure latch, which belongs to the client stream alone.
+# ---
+# fd:   descriptor to write to
+# body: message body
+# len:  body length in bytes
+# ret:  true when the whole frame was written
+pub fun write_frame_to(fd: i32, body: str, len: usize) bool {
+    if (body == nil) { ret true; }
+    var digits: [20]u8;
+    val digit_len: usize = usize_to_buf(?digits[0], 20, len);
+    val digit_start: usize = 20 - digit_len;
+
+    if (!write_all_fd(fd, HEADER_PREFIX::*u8, str_len(HEADER_PREFIX))) { ret false; }
+    if (!write_all_fd(fd, ?digits[digit_start], digit_len))            { ret false; }
+    if (!write_all_fd(fd, CRLF_CRLF::*u8, str_len(CRLF_CRLF)))         { ret false; }
+    ret write_all_fd(fd, body::*u8, len);
+}
+
+fun write_all_fd(fd: i32, buf: *u8, len: usize) bool {
+    var off: usize = 0;
+    for (off < len) {
+        var n: i64 = os.write(fd, (buf::usize + off)::*u8, len - off);
+        for (n == os.EINTR) { n = os.write(fd, (buf::usize + off)::*u8, len - off); }
+        if (n <= 0) { ret false; }
+        off = off + n::usize;
+    }
+    ret true;
 }

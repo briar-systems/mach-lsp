@@ -99,11 +99,30 @@ pub fun result_begin(b: *json.Buf, id_raw: str) {
     json.buf_push(b, ",\"result\":");
 }
 
+# responses emitted so far this process
+#
+# The dispatcher compares this across a request to tell whether a handler
+# actually answered. A buffer that latched an allocation failure sends nothing
+# rather than a partial frame, and every feature has paths that give up without
+# replying, so "the caller must remember to answer" is not a property anything
+# enforces. This is what lets the dispatcher enforce it instead.
+var RESPONSES: u64 = 0;
+
+# how many responses have been emitted
+pub fun responses() u64 {
+    ret RESPONSES;
+}
+
+# record that a response was emitted by a path that does not go through `send`
+pub fun note_response() {
+    RESPONSES = RESPONSES + 1;
+}
+
 # close a response, frame and send it, then release the buffer and the id
 #
 # A buffer that latched an allocation failure sends nothing rather than a
-# partial frame; the request then goes unanswered, which the caller must avoid
-# by checking `json.buf_str` itself when it needs a guaranteed reply.
+# partial frame. The request is then unanswered, which the dispatcher detects
+# and backstops rather than leaving the client waiting.
 # ---
 # b:      the buffer holding a complete response
 # alloc:  allocator backing the buffer and the id
@@ -111,7 +130,10 @@ pub fun result_begin(b: *json.Buf, id_raw: str) {
 pub fun send(b: *json.Buf, alloc: *Allocator, id_raw: str) {
     json.buf_push_byte(b, '}');
     val msg: str = json.buf_str(b);
-    if (msg != nil) { transport.send_message(msg, alloc); }
+    if (msg != nil) {
+        transport.send_message(msg, alloc);
+        RESPONSES = RESPONSES + 1;
+    }
     json.buf_dnit(b);
     json.free_str(id_raw, alloc);
 }

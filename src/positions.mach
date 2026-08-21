@@ -16,6 +16,8 @@
 # server advertises no `positionEncoding`, so the client's UTF-16 default holds.
 
 use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
@@ -173,4 +175,80 @@ fun u16_units(b: u8) usize {
 fun dec(n: usize) usize {
     if (n == 0) { ret 0; }
     ret n - 1;
+}
+
+# the byte offset of a 0-based LSP (line, character) within raw text
+#
+# The file-based `offset_at` needs a `SourceFile` and its line index, which an
+# open document does not carry: it owns text. Incremental sync applies edits to
+# that text before any of it reaches the compiler, so the conversion has to work
+# from the bytes alone. Same UTF-16 column rule, same clamping - a character
+# past the end of its line lands at the line's end rather than failing, which is
+# what a client sends when it means "end of line".
+# ---
+# text: the buffer to index
+# line: 0-based LSP line
+# ch:   0-based LSP character (UTF-16 code-unit column)
+# ret:  some(offset), or none when the line is past the end of the text
+pub fun offset_in_text(text: str, line: usize, ch: usize) Option[usize] {
+    if (text == nil) { ret none[usize](); }
+    val n: usize = str_len(text);
+
+    var start: usize = 0;
+    var seen:  usize = 0;
+    for (seen < line && start < n) {
+        if (text[start] == '\n') { seen = seen + 1; }
+        start = start + 1;
+    }
+    # a client may address the position one past the last line, which is where
+    # an append lands; anything beyond that is out of range
+    if (seen < line) {
+        if (seen + 1 == line && start == n) { ret some[usize](n); }
+        ret none[usize]();
+    }
+
+    var end: usize = start;
+    for (end < n && text[end] != '\n') { end = end + 1; }
+
+    var o:     usize = start;
+    var units: usize = 0;
+    for (o < end) {
+        val b: u8 = text[o];
+        val u: usize = u16_units(b);
+        if (units + u > ch) { brk; }
+        units = units + u;
+        o = o + u8_seq_len(b);
+    }
+    ret some[usize](o);
+}
+
+use page: std.allocator.page;
+use std.types.string.str_equals;
+
+test "positions: a text offset resolves line and utf-16 column" {
+    var fail: bool = false;
+    val t: str = "ab\ncdef\n";
+    if (unwrap[usize](offset_in_text(t, 0, 0)) != 0) { fail = true; }
+    if (unwrap[usize](offset_in_text(t, 0, 2)) != 2) { fail = true; }
+    if (unwrap[usize](offset_in_text(t, 1, 0)) != 3) { fail = true; }
+    if (unwrap[usize](offset_in_text(t, 1, 3)) != 6) { fail = true; }
+    # a column past the end of its line clamps to the line's end
+    if (unwrap[usize](offset_in_text(t, 0, 99)) != 2) { fail = true; }
+    # the position one past the final newline is where an append lands
+    if (unwrap[usize](offset_in_text(t, 2, 0)) != 8) { fail = true; }
+    if (is_some[usize](offset_in_text(t, 9, 0)))     { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a 4-byte sequence is one codepoint but TWO utf-16 units, so a column past it
+# must not be read as a byte count
+test "positions: an astral codepoint counts as two utf-16 units" {
+    var fail: bool = false;
+    # "a" + U+1F600 (4 bytes) + "b"
+    val t: str = "a\xF0\x9F\x98\x80b";
+    if (unwrap[usize](offset_in_text(t, 0, 1)) != 1) { fail = true; }
+    if (unwrap[usize](offset_in_text(t, 0, 3)) != 5) { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
 }

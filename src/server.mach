@@ -20,6 +20,10 @@ use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
 use std.types.result.unwrap_err;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.none;
+use std.types.option.unwrap;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -47,6 +51,8 @@ use hints:       mls.hints;
 use tokens:      mls.tokens;
 use project:     mls.project;
 use trace:       mls.trace;
+use render:      mls.render;
+use positions:   mls.positions;
 
 # lifecycle statuses
 pub val STATUS_UNINITIALIZED: u8 = 0;
@@ -68,6 +74,9 @@ val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
+
+# JSON-RPC InternalError
+val INTERNAL_ERROR: i64 = -32603;
 
 val WATCH_FALLBACK: u8 = 0;
 val WATCH_PENDING:  u8 = 1;
@@ -271,6 +280,23 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 # an unknown method gets a JSON-RPC method-not-found error when it carries an
 # id, and is dropped when it does not - a notification owes no response.
 fun dispatch(srv: *Server, root: *sj.Value) {
+    val id: *sj.Value = json.member(root, "id");
+    if (id == nil) { dispatch_inner(srv, root); ret; }
+
+    # every request owes exactly one response. A handler can fail to send one
+    # for reasons it cannot report - a latched allocation failure in the
+    # response buffer, a path that gives up without replying - and a client that
+    # never hears back waits forever. Rather than asking every handler to
+    # remember, the dispatcher checks and backstops.
+    val before: u64 = render.responses();
+    dispatch_inner(srv, root);
+    if (render.responses() == before) {
+        trace.log("server: handler produced no response; answering internal error\n");
+        send_error(srv, id, INTERNAL_ERROR, "the server produced no response for this request");
+    }
+}
+
+fun dispatch_inner(srv: *Server, root: *sj.Value) {
     val a: *Allocator = srv.alloc;
     val method_v: *sj.Value = json.member(root, "method");
     if (method_v == nil) { handle_response(srv, root); ret; }
@@ -330,7 +356,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -435,16 +461,102 @@ fun handle_did_change(srv: *Server, params: *sj.Value) {
     if (uri == nil) { ret; }
     val changes: *sj.Value = json.member(params, "contentChanges");
     val n: usize = json.count(changes);
-    if (n == 0) { json.free_str(uri, srv.alloc); ret; }
-    val text: str = json.text(json.member(json.element(changes, n - 1), "text"), srv.alloc);
-    if (text == nil) { json.free_str(uri, srv.alloc); ret; }
     val version_v: *sj.Value = json.member(doc, "version");
-    if (version_v != nil) { publish_for(srv, uri, text, json.number(version_v, 0), false); }
+    if (n == 0 || version_v == nil) { json.free_str(uri, srv.alloc); ret; }
+
+    val text: str = apply_changes(srv, uri, changes, n);
+    if (text == nil) { json.free_str(uri, srv.alloc); ret; }
+    publish_for(srv, uri, text, json.number(version_v, 0), false);
     json.free_str(text, srv.alloc);
     json.free_str(uri, srv.alloc);
 }
 
-# retire the document, reclaim its cached analysis, and clear its diagnostics
+# build the document's new text from a change list
+#
+# A client may send either form and may mix them. A change carrying a `range`
+# replaces just that span; one without carries the whole document. Ranges are
+# applied in order, each against the result of the previous, because that is how
+# the client computed them - applying them against the original text would place
+# every edit after the first at the wrong offset.
+#
+# Returns owned text, or nil when the document is unknown or a range cannot be
+# resolved. A range that does not resolve is refused rather than skipped: the
+# buffer is the input to every other feature, so a silently mis-patched document
+# would produce confidently wrong answers everywhere downstream.
+# ---
+# srv:     the server
+# uri:     the document being changed
+# changes: the `contentChanges` array
+# n:       its length
+# ret:     owned new text, or nil
+fun apply_changes(srv: *Server, uri: str, changes: *sj.Value, n: usize) str {
+    val d: *documents.Document = documents.find(?srv.docs, uri);
+    if (d == nil) { ret nil; }
+
+    var current: str = nil;
+    var owned: bool = false;
+    var i: usize = 0;
+    for (i < n) {
+        val change: *sj.Value = json.element(changes, i);
+        val whole: *sj.Value = json.member(change, "range");
+        val piece: str = json.text(json.member(change, "text"), srv.alloc);
+        if (piece == nil) {
+            if (owned) { json.free_str(current, srv.alloc); }
+            ret nil;
+        }
+
+        if (whole == nil) {
+            # a full-document change discards everything before it
+            if (owned) { json.free_str(current, srv.alloc); }
+            current = piece;
+            owned = true;
+        }
+        or {
+            var base: str = current;
+            if (!owned) { base = d.text; }
+            val next: str = splice(srv, base, whole, piece);
+            json.free_str(piece, srv.alloc);
+            if (owned) { json.free_str(current, srv.alloc); }
+            if (next == nil) { ret nil; }
+            current = next;
+            owned = true;
+        }
+        i = i + 1;
+    }
+    if (!owned) { ret nil; }
+    ret current;
+}
+
+# `base` with the bytes covered by `range` replaced by `piece`
+fun splice(srv: *Server, base: str, range: *sj.Value, piece: str) str {
+    val so: Option[usize] = offset_of_position(base, json.member(range, "start"));
+    val eo: Option[usize] = offset_of_position(base, json.member(range, "end"));
+    if (!is_some[usize](so) || !is_some[usize](eo)) { ret nil; }
+    var lo: usize = unwrap[usize](so);
+    var hi: usize = unwrap[usize](eo);
+    if (hi < lo) { hi = lo; }
+
+    var b: json.Buf = json.buf_init(srv.alloc);
+    json.buf_push_range(?b, base, 0, lo);
+    json.buf_push(?b, piece);
+    json.buf_push_range(?b, base, hi, str_len(base));
+    val view: str = json.buf_str(?b);
+    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    val out: str = json.dup(view, srv.alloc);
+    json.buf_dnit(?b);
+    ret out;
+}
+
+# the byte offset of an LSP position object within `text`
+fun offset_of_position(text: str, pos: *sj.Value) Option[usize] {
+    if (pos == nil) { ret none[usize](); }
+    val line: i64 = json.number(json.member(pos, "line"), -1);
+    val ch:   i64 = json.number(json.member(pos, "character"), -1);
+    if (line < 0 || ch < 0) { ret none[usize](); }
+    ret positions.offset_in_text(text, line::usize, ch::usize);
+}
+
+# retire the document, reclaim its cached analysis, and clear its diagnostics# retire the document, reclaim its cached analysis, and clear its diagnostics
 fun handle_did_close(srv: *Server, params: *sj.Value) {
     val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
     if (uri == nil) { ret; }
@@ -629,6 +741,9 @@ fun send_error(srv: *Server, id: *sj.Value, code: i64, message: str) {
 # frame and send a buffer's contents, then release it
 fun send_buf(srv: *Server, b: *json.Buf) {
     val msg: str = json.buf_str(b);
-    if (msg != nil) { transport.send_message(msg, srv.alloc); }
+    if (msg != nil) {
+        transport.send_message(msg, srv.alloc);
+        render.note_response();
+    }
     json.buf_dnit(b);
 }
