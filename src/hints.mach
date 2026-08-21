@@ -1,0 +1,295 @@
+# inlay hints: naming the arguments at a call site
+#
+# The usual first use of inlay hints - showing the inferred type of a binding
+# that does not state one - does not apply to Mach: a binding REQUIRES an
+# explicit type annotation, so `val x = f();` is a parse error, not an inference
+# site. There is no inferred binding type to reveal.
+#
+# What is genuinely opaque here is a call's arguments. `take(b, 3, true)` says
+# nothing about what those three values mean, and the parameter names that would
+# say it live in the callee's declaration. So the hints are parameter names,
+# rendered before each argument.
+#
+# A literal argument is the case worth labelling. An argument that is already a
+# plain identifier usually names itself - `send(buf, count)` against parameters
+# `buf, count` is noise - so a hint whose name matches the argument's own
+# spelling is suppressed.
+#
+# Hints are requested on every scroll, so this reads the snapshot and never
+# drives a rebuild.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+
+use sess:     mach.lang.session;
+use src:      mach.lang.source;
+use token:    mach.lang.fe.token;
+use ast:      mach.lang.fe.ast;
+use id:       mach.lang.fe.ast.id;
+use decl:     mach.lang.fe.ast.decl;
+use aexpr:    mach.lang.fe.ast.expr;
+use res:      mach.lang.fe.resolve;
+use stmt:     mach.lang.fe.ast.stmt;
+use type:     mach.lang.type;
+use typename: mach.lang.fe.sema.typename;
+use editor:   mach.lang.editor;
+use sj:       std.data.json;
+
+use json:      mls.json;
+use render:    mls.render;
+use project:   mls.project;
+use positions: mls.positions;
+use documents: mls.documents;
+use analysis:  mls.analysis;
+
+# LSP InlayHintKind.Type
+# LSP InlayHintKind.Parameter
+val HINT_PARAMETER: i64 = 2;
+
+# most hints returned for one range, so a request over a whole large file
+# cannot produce an unbounded payload
+val MAX_HINTS: usize = 512;
+
+# answer textDocument/inlayHint for the requested range
+pub fun inlay_hints(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+                    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(req_id, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an: analysis.Analyzed;
+    if (!analysis.analyze(ws, es, docs, uri, ?an)) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    var lo: usize = 0;
+    var hi: usize = str_len(an.file.text);
+    range_bounds(params, an.file, ?lo, ?hi);
+
+    # a hint needs both the inferred type and a session to render it against;
+    # a standalone buffer has neither in a form this can use
+    val s: *sess.Session = session_of(an);
+    if (an.sr == nil || s == nil) { render.reply_empty_array(alloc, id_raw); ret; }
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+
+    var emitted: usize = 0;
+    var ei: usize = 0;
+    for (ei < an.a.expr_len && emitted < MAX_HINTS) {
+        emitted = push_call_hints(?b, ws, an, uri, ei::id.ExprId, lo, hi, emitted, alloc);
+        ei = ei + 1;
+    }
+
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# the session whose type universe the document's types belong to
+fun session_of(an: analysis.Analyzed) *sess.Session {
+    if (an.root == nil) { ret nil; }
+    ret project.root_session(an.root);
+}
+
+# append a parameter-name hint for each argument of the call at `eid`
+fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed, uri: str,
+                    eid: id.ExprId, lo: usize, hi: usize, count: usize, alloc: *Allocator) usize {
+    val eo: Option[*aexpr.Expr] = ast.get_expr(an.a, eid);
+    if (!is_some[*aexpr.Expr](eo)) { ret count; }
+    val e: *aexpr.Expr = unwrap[*aexpr.Expr](eo);
+    if (e.kind != aexpr.EXPR_KIND_CALL) { ret count; }
+    val nargs: u32 = e.data.call.args_len;
+    if (nargs == 0 || an.a.expr_ids == nil) { ret count; }
+
+    # the callee's parameter names live in its declaration, which is reached
+    # through the same pivot definition uses
+    val d_opt: Option[*decl.Decl] = callee_decl(ws, an, uri, e.data.call.callee);
+    if (!is_some[*decl.Decl](d_opt)) { ret count; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    val site_a: *ast.Ast = callee_ast(ws, an, uri, e.data.call.callee);
+    val site_f: *src.SourceFile = callee_file(ws, an, uri, e.data.call.callee);
+    if (site_a == nil || site_f == nil) { ret count; }
+
+    # a one-parameter call has no ambiguity for a name to resolve: `log("x")`
+    # gains nothing from being told the parameter is called `msg`
+    if (d.data.fun_.params_len < 2) { ret count; }
+
+    var emitted: usize = count;
+    var i: u32 = 0;
+    for (i < nargs && i < d.data.fun_.params_len && emitted < MAX_HINTS) {
+        val arg: id.ExprId = an.a.expr_ids[(e.data.call.args_start + i)::usize];
+        val ao: Option[*aexpr.Expr] = ast.get_expr(an.a, arg);
+        if (is_some[*aexpr.Expr](ao)) {
+            val at: usize = unwrap[*aexpr.Expr](ao).span.offset;
+            if (at >= lo && at <= hi && wants_hint(unwrap[*aexpr.Expr](ao))) {
+                val pname: str = param_name(site_a, site_f, d.data.fun_.params_start + i, alloc);
+                if (pname != nil) {
+                    if (!names_itself(an.file, unwrap[*aexpr.Expr](ao).span, pname)) {
+                        push_hint(b, an.file, at, pname, emitted > 0);
+                        emitted = emitted + 1;
+                    }
+                    json.free_str(pname, alloc);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret emitted;
+}
+
+# the function declaration the callee expression resolves to, or none
+fun callee_decl(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) Option[*decl.Decl] {
+    val so: Option[*res.Symbol] = callee_symbol(an, callee);
+    if (!is_some[*res.Symbol](so)) { ret none[*decl.Decl](); }
+    val sym: *res.Symbol = unwrap[*res.Symbol](so);
+    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
+    if (!is_some[project.Site](site_o)) { ret none[*decl.Decl](); }
+    var site: project.Site = unwrap[project.Site](site_o);
+    val d: Option[*decl.Decl] = ast.get_decl(site.a, sym.decl);
+    project.free_site(ws, ?site);
+    if (!is_some[*decl.Decl](d)) { ret none[*decl.Decl](); }
+    if (unwrap[*decl.Decl](d).kind != decl.DECL_KIND_FUN) { ret none[*decl.Decl](); }
+    ret d;
+}
+
+# the Ast the callee's declaration lives in
+fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) *ast.Ast {
+    val so: Option[*res.Symbol] = callee_symbol(an, callee);
+    if (!is_some[*res.Symbol](so)) { ret nil; }
+    val site_o: Option[project.Site] =
+        project.site_of(ws, an.root, an.own, an.a, an.file, uri, unwrap[*res.Symbol](so));
+    if (!is_some[project.Site](site_o)) { ret nil; }
+    var site: project.Site = unwrap[project.Site](site_o);
+    val a: *ast.Ast = site.a;
+    project.free_site(ws, ?site);
+    ret a;
+}
+
+# the source file backing the callee's declaration
+fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) *src.SourceFile {
+    val so: Option[*res.Symbol] = callee_symbol(an, callee);
+    if (!is_some[*res.Symbol](so)) { ret nil; }
+    val site_o: Option[project.Site] =
+        project.site_of(ws, an.root, an.own, an.a, an.file, uri, unwrap[*res.Symbol](so));
+    if (!is_some[project.Site](site_o)) { ret nil; }
+    var site: project.Site = unwrap[project.Site](site_o);
+    val f: *src.SourceFile = site.file;
+    project.free_site(ws, ?site);
+    ret f;
+}
+
+# the symbol the callee expression binds
+fun callee_symbol(an: analysis.Analyzed, callee: id.ExprId) Option[*res.Symbol] {
+    if (an.rr == nil || an.rr.expr_resolved == nil) { ret none[*res.Symbol](); }
+    if (callee == id.EXPR_NIL || callee::u32 >= an.rr.expr_count) { ret none[*res.Symbol](); }
+    val sid: res.SymbolId = an.rr.expr_resolved[callee];
+    if (sid == res.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none[*res.Symbol](); }
+    ret some[*res.Symbol](?an.rr.symbols[sid]);
+}
+
+# the declared name of the parameter in `typed_names` slot `slot`
+fun param_name(a: *ast.Ast, file: *src.SourceFile, slot: u32, alloc: *Allocator) str {
+    if (a.typed_names == nil) { ret nil; }
+    val tn: *decl.TypedName = ?a.typed_names[slot::usize];
+    if (tn.name.len == 0) { ret nil; }
+    ret positions.span_text(file, tn.name, alloc);
+}
+
+# whether an argument is opaque enough to be worth naming
+#
+# A literal is: `resize(buf, 0, true)` says nothing about which argument is the
+# count and which the flag. Anything the reader can already name - an
+# identifier, a member access, a nested call - is not, and labelling all of them
+# buries the few that matter. Hinting every argument produced 420 hints on one
+# 550-line file, which is not a feature.
+fun wants_hint(e: *aexpr.Expr) bool {
+    if (e.kind == aexpr.EXPR_KIND_LIT_INT)   { ret true; }
+    if (e.kind == aexpr.EXPR_KIND_LIT_FLOAT) { ret true; }
+    if (e.kind == aexpr.EXPR_KIND_LIT_CHAR)  { ret true; }
+    if (e.kind == aexpr.EXPR_KIND_LIT_STR)   { ret true; }
+    if (e.kind == aexpr.EXPR_KIND_LIT_NIL)   { ret true; }
+    ret false;
+}
+
+# whether the argument's own text already spells the parameter name, making the
+# hint pure noise
+fun names_itself(file: *src.SourceFile, span: token.Span, name: str) bool {
+    if (span.len != str_len(name)) { ret false; }
+    var i: usize = 0;
+    for (i < span.len) {
+        if (file.text[span.offset + i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# append one InlayHint just after `offset`
+#
+# `paddingLeft` rather than a leading space in the label, so a client that
+# renders hints inline and one that renders them in a gutter both look right.
+fun push_hint(b: *json.Buf, file: *src.SourceFile, offset: usize, text: str, comma: bool) {
+    if (comma) { json.buf_push_byte(b, ','); }
+    var at: token.Span;
+    at.offset = offset;
+    at.len    = 0;
+    json.buf_push(b, "{\"position\":");
+    push_position(b, file, at);
+    # `name:` reads as the argument label it stands in for
+    json.buf_push(b, ",\"label\":");
+    var label: json.Buf = json.buf_init(b.a);
+    json.buf_push(?label, text);
+    json.buf_push_byte(?label, ':');
+    json.buf_push_quoted(b, json.buf_str(?label));
+    json.buf_dnit(?label);
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, HINT_PARAMETER);
+    json.buf_push(b, ",\"paddingLeft\":false,\"paddingRight\":true}");
+}
+
+# whether the renderer produced a placeholder rather than a spelling
+fun is_placeholder(text: str) bool {
+    if (text == nil) { ret true; }
+    if (str_len(text) == 0) { ret true; }
+    ret text[0] == '<';
+}
+
+# the `start` of a zero-length span, which is the hint's anchor
+fun push_position(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
+    val r: positions.LspRange = positions.range_of(file, span);
+    json.buf_push(b, "{\"line\":");
+    json.buf_push_usize(b, r.start_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, r.start_char);
+    json.buf_push_byte(b, '}');
+}
+
+# read the request's `range` into byte offsets, leaving the defaults when it is
+# absent or malformed
+fun range_bounds(params: *sj.Value, file: *src.SourceFile, lo: *usize, hi: *usize) {
+    val rng: *sj.Value = json.member(params, "range");
+    if (rng == nil) { ret; }
+    val so: Option[usize] = offset_of_member(rng, "start", file);
+    val eo: Option[usize] = offset_of_member(rng, "end", file);
+    if (is_some[usize](so)) { @lo = unwrap[usize](so); }
+    if (is_some[usize](eo)) { @hi = unwrap[usize](eo); }
+}
+
+fun offset_of_member(rng: *sj.Value, key: str, file: *src.SourceFile) Option[usize] {
+    val p: *sj.Value = json.member(rng, key);
+    val line: i64 = json.number(json.member(p, "line"), -1);
+    val ch:   i64 = json.number(json.member(p, "character"), -1);
+    if (line < 0 || ch < 0) { ret positions.offset_at(file, 0, 0); }
+    ret positions.offset_at(file, line::usize, ch::usize);
+}

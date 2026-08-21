@@ -413,3 +413,106 @@ test "jobs: a closed queue refuses further pushes" {
     if (fail) { ret 1; }
     ret 0;
 }
+
+# ids of requests the client has withdrawn
+#
+# The reading thread records a cancellation the moment it arrives; the worker
+# consults this before starting queued work. That ordering is the entire point:
+# a cancellation handled in queue order would be dequeued after the request it
+# withdraws had already run, which is no cancellation at all.
+#
+# Ids are stored as their wire token text, so a string id and the number that
+# spells the same digits stay distinct. The set is small and short-lived - an
+# id is removed when it is answered - so a linear scan is the right structure.
+pub rec Cancels {
+    lock:  mutex.Mutex;
+    ids:   *Job;
+    cap:   usize;
+    count: usize;
+    alloc: *Allocator;
+}
+
+# how many outstanding cancellations are remembered
+#
+# A client that cancels faster than the worker retires requests is dropping
+# cancellations, not accumulating memory; the request is then answered normally,
+# which is permitted.
+pub val CANCEL_CAP: usize = 64;
+
+pub fun cancels_init(c: *Cancels, alloc: *Allocator) bool {
+    c.lock  = mutex.make();
+    c.alloc = alloc;
+    c.count = 0;
+    c.cap   = 0;
+    c.ids   = nil;
+    val r: Result[*Job, str] = allocate[Job](alloc, CANCEL_CAP);
+    if (is_err[*Job, str](r)) { ret false; }
+    c.ids = unwrap_ok[*Job, str](r);
+    c.cap = CANCEL_CAP;
+    var i: usize = 0;
+    for (i < c.cap) { c.ids[i].body = nil; c.ids[i].len = 0; i = i + 1; }
+    ret true;
+}
+
+pub fun cancels_dnit(c: *Cancels) {
+    if (c.ids == nil) { ret; }
+    var i: usize = 0;
+    for (i < c.count) {
+        if (c.ids[i].body != nil) { deallocate[u8](c.alloc, c.ids[i].body::*u8, c.ids[i].len + 1); }
+        i = i + 1;
+    }
+    deallocate[Job](c.alloc, c.ids, c.cap);
+    c.ids = nil;
+    c.cap = 0;
+    c.count = 0;
+}
+
+# remember that `id_token` has been withdrawn
+# ---
+# c:        the registry
+# id_token: the request id as it appeared on the wire
+# ret:      true when recorded; false when full or out of memory
+pub fun cancel_add(c: *Cancels, id_token: str) bool {
+    if (id_token == nil || c.ids == nil) { ret false; }
+    val len: usize = str_len(id_token);
+    val r: Result[*u8, str] = allocate[u8](c.alloc, len + 1);
+    if (is_err[*u8, str](r)) { ret false; }
+    val copy: *u8 = unwrap_ok[*u8, str](r);
+    if (len > 0) { mem.raw_copy(copy::ptr, id_token::ptr, len); }
+    copy[len] = 0;
+
+    mutex.lock(?c.lock);
+    if (c.count == c.cap) {
+        mutex.unlock(?c.lock);
+        deallocate[u8](c.alloc, copy, len + 1);
+        ret false;
+    }
+    c.ids[c.count].body = copy::str;
+    c.ids[c.count].len  = len;
+    c.count = c.count + 1;
+    mutex.unlock(?c.lock);
+    ret true;
+}
+
+# whether `id_token` was cancelled, removing it if so
+#
+# Consuming the entry keeps the set bounded and means a later request that
+# happens to reuse the id is not cancelled by a stale entry.
+pub fun cancel_take(c: *Cancels, id_token: str) bool {
+    if (id_token == nil || c.ids == nil) { ret false; }
+    var found: bool = false;
+    mutex.lock(?c.lock);
+    var i: usize = 0;
+    for (i < c.count && !found) {
+        if (c.ids[i].body != nil && str_equals(c.ids[i].body, id_token)) {
+            deallocate[u8](c.alloc, c.ids[i].body::*u8, c.ids[i].len + 1);
+            c.ids[i] = c.ids[c.count - 1];
+            c.ids[c.count - 1].body = nil;
+            c.count = c.count - 1;
+            found = true;
+        }
+        i = i + 1;
+    }
+    mutex.unlock(?c.lock);
+    ret found;
+}

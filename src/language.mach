@@ -43,6 +43,8 @@ use std.allocator.deallocate;
 use mem: std.memory;
 
 use sess:   mach.lang.session;
+use strutil: std.text.string;
+use trace:   mls.trace;
 use src:    mach.lang.source;
 use intern: mach.lang.intern;
 use editor: mach.lang.editor;
@@ -50,6 +52,7 @@ use type:   mach.lang.type;
 use token:  mach.lang.fe.token;
 use ast:    mach.lang.fe.ast;
 use id:     mach.lang.fe.ast.id;
+use aexpr:  mach.lang.fe.ast.expr;
 use decl:   mach.lang.fe.ast.decl;
 use atype:  mach.lang.fe.ast.type;
 use fedoc:  mach.lang.fe.doc;
@@ -62,7 +65,9 @@ use sj:        std.data.json;
 use documents: mls.documents;
 use features:  mls.features;
 use positions: mls.positions;
+use render:    mls.render;
 use project:   mls.project;
+use analysis:  mls.analysis;
 
 # the resolved analysis of one request's target document
 # ---
@@ -72,16 +77,6 @@ use project:   mls.project;
 # a:        the buffer's parsed Ast
 # rr:       the buffer's ResolveResult side tables
 # own:      this buffer's module id (Symbol.origin equals it for local symbols)
-# root:     the project root the buffer resolved against, or nil for single-file
-rec Analyzed {
-    interner: *intern.Interner;
-    file:     *src.SourceFile;
-    sr:       *sema.SemaResult;
-    a:        *ast.Ast;
-    rr:       *res.ResolveResult;
-    own:      sess.ModuleId;
-    root:     *project.Root;
-}
 
 # answer textDocument/hover with the type / declaration of the symbol at
 # the cursor, or null when the position is not on a resolved symbol
@@ -89,27 +84,27 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
-    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
         # hover before giving up.
         if (field_hover(ws, alloc, ?an, offset, id_raw)) { ret; }
-        reply_null(alloc, id_raw); ret;
+        render.reply_null(alloc, id_raw); ret;
     }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[*res.Symbol](so)) { render.reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
     val md: str = hover_markdown(ws, an, sym, uri, alloc);
-    if (md == nil) { reply_null(alloc, id_raw); ret; }
+    if (md == nil) { render.reply_null(alloc, id_raw); ret; }
 
     reply_hover(alloc, id_raw, an.file, sr.name_span, md);
 }
@@ -117,23 +112,49 @@ pub fun hover(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocat
 # send a `textDocument/hover` reply rendering Markdown `md` over the
 # name span `name_span` in `file`, freeing `md` and `id_raw`. nil-replies when the
 # Markdown cannot be quoted. shared by the symbol and field hover paths
+# an owned copy of a buffer's contents, releasing the buffer
+#
+# The markdown composers build a string rather than a JSON value, so they append
+# into a Buf and take the result instead of summing fragment lengths into an
+# exact allocation and filling it in a second pass.
+fun buf_into_str(b: *json.Buf, alloc: *Allocator) str {
+    val view: str = json.buf_str(b);
+    if (view == nil) { json.buf_dnit(b); ret nil; }
+    val n: usize = str_len(view);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { json.buf_dnit(b); ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
+    out[n] = 0;
+    json.buf_dnit(b);
+    ret out::str;
+}
+
+# reply with one Location
+fun reply_location(alloc: *Allocator, id_raw: str, file: *src.SourceFile, uri: str, span: token.Span) {
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    render.location(?b, file, uri, span);
+    render.send(?b, alloc, id_raw);
+}
+
+# reply with one Range
+fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: token.Span) {
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    render.span_range(?b, file, span);
+    render.send(?b, alloc, id_raw);
+}
+
 fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span: token.Span, md: str) {
-    val qmd: str = json.quote(md, alloc);
-    json.free_str(md, alloc);
-    if (qmd == nil) { reply_null(alloc, id_raw); ret; }
-
-    val range: positions.LspRange = positions.range_of(file, name_span);
-    val rng: str = range_json(range, alloc);
-
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":{\"contents\":{\"kind\":\"markdown\",\"value\":";
-    val p3: str = "},\"range\":";
-    val p4: str = "}}";
-    send6(alloc, p1, id_raw, p2, qmd, p3, rng, p4);
-
-    json.free_str(rng, alloc);
-    json.free_str(qmd, alloc);
-    json.free_str(id_raw, alloc);
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push(?b, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
+    json.buf_push_quoted(?b, md);
+    json.buf_push(?b, "},\"range\":");
+    render.span_range(?b, file, name_span);
+    json.buf_push_byte(?b, '}');
+    render.send(?b, alloc, id_raw);
 }
 
 # the type-driven hover path for a record / union field, consulted
@@ -153,7 +174,7 @@ fun reply_hover(alloc: *Allocator, id_raw: str, file: *src.SourceFile, name_span
 # offset: cursor byte offset into the buffer
 # id_raw: the raw JSON request id (for the reply)
 # ret:    true when a field hover was rendered and replied
-fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, offset: usize, id_raw: str) bool {
+fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, offset: usize, id_raw: str) bool {
     if (an.root == nil) { ret false; }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -253,32 +274,19 @@ fun doc_desc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) s
 # of `name: type` (or just `name` when the type is unavailable), followed by the
 # description prose as a paragraph when present. nil on allocation failure
 fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
-    val pre:   str = "```mach\n";
-    val post:  str = "\n```";
-    val sep:   str = "\n\n";
-    val colon: str = ": ";
-
-    var total: usize = str_len(pre) + str_len(name) + str_len(post);
-    if (ty != nil)  { total = total + str_len(colon) + str_len(ty); }
-    if (doc != nil) { total = total + str_len(sep) + str_len(doc); }
-
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, pre);
-    off = append(buf, off, name);
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "```mach\n");
+    json.buf_push(?b, name);
     if (ty != nil) {
-        off = append(buf, off, colon);
-        off = append(buf, off, ty);
+        json.buf_push(?b, ": ");
+        json.buf_push(?b, ty);
     }
-    off = append(buf, off, post);
+    json.buf_push(?b, "\n```");
     if (doc != nil) {
-        off = append(buf, off, sep);
-        off = append(buf, off, doc);
+        json.buf_push(?b, "\n\n");
+        json.buf_push(?b, doc);
     }
-    buf[off] = 0;
-    ret buf::str;
+    ret buf_into_str(?b, alloc);
 }
 
 # a fenced `mach` code block rendering the symbol at hover. it
@@ -287,14 +295,23 @@ fun compose_field_hover(name: str, ty: str, doc: str, alloc: *Allocator) str {
 # falling back to the symbol kind and name when no decl header is available. the
 # decl's doc comment, if any, follows the block as prose, read from the same
 # Site so a cross-module symbol's docs render too
-fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
+fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symbol, uri: str, alloc: *Allocator) str {
     var sig: str = nil;
     var doc: str = nil;
+
+    # a module alias's decl is the `use` line the cursor is already on, so
+    # rendering it back is no answer. name the module instead.
+    var mid: sess.ModuleId;
+    if (module_alias_target(sym, ?mid) && an.root != nil) {
+        val fqn: str = project.module_fqn(ws, an.root, mid);
+        if (fqn != nil) { ret module_hover_markdown(fqn, alloc); }
+    }
+
     val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
     if (is_some[project.Site](site_o)) {
         var site: project.Site = unwrap[project.Site](site_o);
         if (sym.decl != id.DECL_NIL) {
-            val sso: Option[token.Span] = features.signature_span(site.a, sym);
+            val sso: Option[token.Span] = features.signature_span(site.a, site.file, sym);
             if (is_some[token.Span](sso)) {
                 sig = positions.span_text(site.file, unwrap[token.Span](sso), alloc);
             }
@@ -308,26 +325,17 @@ fun hover_markdown(ws: *project.Workspace, an: Analyzed, sym: *res.Symbol, uri: 
     }
     if (sig == nil) { json.free_str(doc, alloc); ret nil; }
 
-    val pre:  str = "```mach\n";
-    val post: str = "\n```";
-    val sep:  str = "\n\n";
-    var total: usize = str_len(pre) + str_len(sig) + str_len(post);
-    if (doc != nil) { total = total + str_len(sep) + str_len(doc); }
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(sig, alloc); json.free_str(doc, alloc); ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, pre);
-    off = append(buf, off, sig);
-    off = append(buf, off, post);
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "```mach\n");
+    json.buf_push(?b, sig);
+    json.buf_push(?b, "\n```");
     if (doc != nil) {
-        off = append(buf, off, sep);
-        off = append(buf, off, doc);
+        json.buf_push(?b, "\n\n");
+        json.buf_push(?b, doc);
     }
-    buf[off] = 0;
     json.free_str(sig, alloc);
     json.free_str(doc, alloc);
-    ret buf::str;
+    ret buf_into_str(?b, alloc);
 }
 
 # render a declaration's first-class doc block (`Decl.doc`) as
@@ -447,16 +455,11 @@ fun compose_kind_name(sym: *res.Symbol, interner: *intern.Interner, alloc: *Allo
     val name: str = unwrap[str](no);
     val kind: str = features.kind_label(sym.kind);
 
-    val total: usize = str_len(kind) + 1 + str_len(name);
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, kind);
-    buf[off] = ' '; off = off + 1;
-    off = append(buf, off, name);
-    buf[off] = 0;
-    ret buf::str;
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, kind);
+    json.buf_push_byte(?b, ' ');
+    json.buf_push(?b, name);
+    ret buf_into_str(?b, alloc);
 }
 
 # answer textDocument/definition with the Location of the resolved
@@ -467,44 +470,106 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
-    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
         # path before giving up.
         if (field_definition(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
-        reply_null(alloc, id_raw); ret;
+        render.reply_null(alloc, id_raw); ret;
     }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[*res.Symbol](so)) { render.reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
+    # a module alias names a file, not a declaration: `sym.decl` is the `use`
+    # line the cursor is already on, and the module has no name span to point
+    # at. its target ModuleId rides `sym.slot`, so answer with the module's own
+    # file at its start.
+    if (module_definition(ws, an, sym, alloc, id_raw)) { ret; }
+
     val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
-    if (!is_some[project.Site](site_o)) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[project.Site](site_o)) { render.reply_null(alloc, id_raw); ret; }
     var site: project.Site = unwrap[project.Site](site_o);
 
     val spo: Option[token.Span] = features.definition_name_span(site.a, sym);
-    if (!is_some[token.Span](spo)) { project.free_site(ws, ?site); reply_null(alloc, id_raw); ret; }
+    if (!is_some[token.Span](spo)) { project.free_site(ws, ?site); render.reply_null(alloc, id_raw); ret; }
     val span: token.Span = unwrap[token.Span](spo);
 
-    val loc: str = location_json(site.file, site.uri, span, alloc);
+    reply_location(alloc, id_raw, site.file, site.uri, span);
     project.free_site(ws, ?site);
-    if (loc == nil) { reply_null(alloc, id_raw); ret; }
+}
 
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":";
-    val p3: str = "}";
-    send6(alloc, p1, id_raw, p2, loc, p3, nil, nil);
+# `module <fqn>` as a fenced hover body
+fun module_hover_markdown(fqn: str, alloc: *Allocator) str {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "```mach\nmodule ");
+    json.buf_push(?b, fqn);
+    json.buf_push(?b, "\n```");
+    val view: str = json.buf_str(?b);
+    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    val n: usize = str_len(view);
+    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
+    if (is_err[*u8, str](r)) { json.buf_dnit(?b); ret nil; }
+    val out: *u8 = unwrap_ok[*u8, str](r);
+    if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
+    out[n] = 0;
+    json.buf_dnit(?b);
+    ret out::str;
+}
 
-    json.free_str(loc, alloc);
+# whether `sym` is a module alias (`use json: mls.json;`) rather than a symbol
+# import (`use std.types.string.str_equals;`), and the module it names
+#
+# The two forms are distinguished by kind, not by a flag: a module alias binds
+# SYM_USE carrying the target ModuleId in `slot`, while a symbol import binds
+# SYM_IMPORTED carrying the imported declaration. `SYM_FLAG_MODULE` is set on
+# the PublicSymbol snapshot of a re-exported alias, not on the local symbol, so
+# it is not the discriminator here.
+# ---
+# sym: the symbol under the cursor
+# out: receives the aliased module id
+# ret: true when `sym` is a module alias
+fun module_alias_target(sym: *res.Symbol, out: *sess.ModuleId) bool {
+    if (sym.kind != res.SYM_USE) { ret false; }
+    @out = sym.slot::sess.ModuleId;
+    ret true;
+}
+
+# emit the Location of the module `sym` aliases, at the start of its file
+# ---
+# ws:     the workspace
+# an:     the analyzed request document
+# sym:    the symbol under the cursor
+# alloc:  request allocator
+# id_raw: the raw JSON request id, consumed on success
+# ret:    true when a module Location was emitted and replied
+fun module_definition(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symbol, alloc: *Allocator, id_raw: str) bool {
+    var mid: sess.ModuleId;
+    if (!module_alias_target(sym, ?mid)) { ret false; }
+    if (an.root == nil) { ret false; }
+    val muri: str = project.module_uri(ws, an.root, mid);
+    if (muri == nil) { ret false; }
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_raw);
+    json.buf_push(?b, ",\"result\":{\"uri\":");
+    json.buf_push_quoted(?b, muri);
+    json.buf_push(?b, ",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}}}}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(?b);
+    strutil.str_free(ws.alloc, muri);
     json.free_str(id_raw, alloc);
+    ret true;
 }
 
 # the type-driven go-to-definition path for a record / union
@@ -524,7 +589,7 @@ pub fun definition(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
 # offset: cursor byte offset into the buffer
 # id_raw: the raw JSON request id (for the reply)
 # ret:    true when a field declaration was located and emitted
-fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str) bool {
     if (an.root == nil) { ret false; }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -549,10 +614,7 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
     val self_o: Option[FieldSelf] = field_self_at(an, offset);
     if (is_some[FieldSelf](self_o)) {
         val fs: FieldSelf = unwrap[FieldSelf](self_o);
-        val loc: str = location_json(an.file, uri, fs.name, alloc);
-        if (loc == nil) { ret false; }
-        reply_result(alloc, id_raw, loc);
-        json.free_str(loc, alloc);
+        reply_location(alloc, id_raw, an.file, uri, fs.name);
         ret true;
     }
 
@@ -574,7 +636,7 @@ rec FieldSelf {
 # an:     the analyzed request document
 # offset: cursor byte offset into the buffer
 # ret:    some(FieldSelf) on a field declaration name, or none
-fun field_self_at(an: *Analyzed, offset: usize) Option[FieldSelf] {
+fun field_self_at(an: *analysis.Analyzed, offset: usize) Option[FieldSelf] {
     val did: id.DeclId = ast.offset_to_decl(an.a, offset);
     if (did == id.DECL_NIL) { ret none[FieldSelf](); }
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
@@ -604,7 +666,7 @@ fun field_self_at(an: *Analyzed, offset: usize) Option[FieldSelf] {
 # site. builds the site's `file://` URI (the buffer's own URI when the record is
 # declared in this module, else the defining module's on-disk file) and emits the
 # field name span. true on success; false on a URI / allocation failure
-fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, rs: project.RecordSite, name: token.Span, id_raw: str) bool {
+fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, rs: project.RecordSite, name: token.Span, id_raw: str) bool {
     var furi: str = uri;
     var owned: bool = false;
     if (rs.origin != an.own) {
@@ -613,23 +675,11 @@ fun emit_field_location(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed
         owned = true;
     }
 
-    val loc: str = location_json(rs.file, furi, name, alloc);
+    reply_location(alloc, id_raw, rs.file, furi, name);
     if (owned) { json.free_str(furi, ws.alloc); }
-    if (loc == nil) { ret false; }
-    reply_result(alloc, id_raw, loc);
-    json.free_str(loc, alloc);
     ret true;
 }
 
-# send a JSON-RPC success reply carrying `result` for request
-# `id_raw`. shared by the field-definition replies
-fun reply_result(alloc: *Allocator, id_raw: str, result: str) {
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":";
-    val p3: str = "}";
-    send6(alloc, p1, id_raw, p2, result, p3, nil, nil);
-    json.free_str(id_raw, alloc);
-}
 
 # a record / union field resolved from a cursor, the type-driven twin
 # of a SymbolRef for the field references / rename / prepareRename paths. carries
@@ -660,7 +710,7 @@ rec FieldTarget {
 # an:     the analyzed request document
 # offset: cursor byte offset into the buffer
 # ret:    some(FieldTarget) on a field position, or none
-fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option[FieldTarget] {
+fun field_target_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usize) Option[FieldTarget] {
     if (an.root == nil) { ret none[FieldTarget](); }
 
     val fo: Option[features.FieldRef] = features.field_ref_at(an.a, offset);
@@ -694,7 +744,7 @@ fun field_target_at(ws: *project.Workspace, an: *Analyzed, offset: usize) Option
 # field's declared-name span. the field name and its source live in the record's
 # declaring module (`rs.file`), which is the cross-module byte identity every
 # other module's references are matched against
-fun make_field_target(an: *Analyzed, rs: project.RecordSite, field_name: token.Span) FieldTarget {
+fun make_field_target(an: *analysis.Analyzed, rs: project.RecordSite, field_name: token.Span) FieldTarget {
     var t: FieldTarget;
     t.key.origin     = rs.origin;
     t.key.decl       = rs.decl;
@@ -730,7 +780,7 @@ rec FieldXRef {
 # out:   array of at least `cap` FieldXRef slots
 # cap:   capacity of `out` (module_count, or one for a standalone file)
 # ret:   number of populated entries (>= 1), or 0 when the buffer cannot be typed
-fun build_field_refs(ws: *project.Workspace, an: Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
+fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t: FieldTarget, out: *FieldXRef, cap: usize) usize {
     if (an.sr == nil) { ret 0; }
     if (an.root == nil) {
         out[0].a = an.a;
@@ -808,7 +858,7 @@ fun walk_field_sites(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget, want
 # member-access / struct-literal sites plus the field declaration, and emits a
 # Location[]. true when a field was resolved and replied; false (without replying)
 # so the caller falls back to an empty array
-fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str) bool {
+fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str) bool {
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
@@ -835,12 +885,12 @@ fun field_references(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, u
 # module, and emits a WorkspaceEdit replacing every member-access / struct-literal
 # site, the field declaration, and the record's matching doc component. true when
 # the edit was replied
-fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: str, offset: usize, id_raw: str, new_name: str) bool {
+fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str, new_name: str) bool {
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
 
-    if (!field_record_renameable(ws, an.root, t)) { reply_empty_edit(alloc, id_raw); ret true; }
+    if (!field_record_renameable(ws, an.root, t)) { render.reply_empty_edit(alloc, id_raw); ret true; }
 
     var cap: usize = project.module_count(an.root)::usize;
     if (cap == 0) { cap = 1; }
@@ -849,7 +899,7 @@ fun field_rename(ws: *project.Workspace, alloc: *Allocator, an: *Analyzed, uri: 
     val refs: *FieldXRef = unwrap_ok[*FieldXRef, str](ra);
 
     val n: usize = build_field_refs(ws, @an, uri, t, refs, cap);
-    if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); reply_empty_edit(alloc, id_raw); ret true; }
+    if (n == 0) { deallocate[FieldXRef](alloc, refs, cap); render.reply_empty_edit(alloc, id_raw); ret true; }
 
     emit_field_rename(ws, an.root, alloc, id_raw, refs, n, t, new_name);
     free_field_refs(ws, refs, n);
@@ -866,7 +916,7 @@ fun field_record_renameable(ws: *project.Workspace, root: *project.Root, t: Fiel
 # write the field-name span the cursor sits on into `out` and
 # return true when it resolves to a field of a project-owned record, or false. the
 # prepareRename gate for field positions
-fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: usize, out: *token.Span) bool {
+fun field_prepare_span(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, offset: usize, out: *token.Span) bool {
     val to: Option[FieldTarget] = field_target_at(ws, an, offset);
     if (!is_some[FieldTarget](to)) { ret false; }
     val t: FieldTarget = unwrap[FieldTarget](to);
@@ -885,34 +935,16 @@ fun field_prepare_span(ws: *project.Workspace, an: *Analyzed, uri: str, offset: 
 # ownership of `id_raw` and frees it
 fun emit_field_locations(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget) {
     val ti: *type.TypeInterner = project.type_interner(ws, root);
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":[";
-    val suffix: str = "]}";
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
 
-    var k: WalkSink = sink_init(alloc, nil, nil);
-    var si: usize = 0;
-    for (si < nref) { walk_field_sites(?refs[si], ti, t, false, ?k); si = si + 1; }
+    var k: WalkSink = sink_init(?b, alloc, nil, nil);
+    var i: usize = 0;
+    for (i < nref) { walk_field_sites(?refs[i], ti, t, false, ?k); i = i + 1; }
 
-    val total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + k.total + str_len(suffix);
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
-    k.buf   = buf;
-    k.off   = off;
-    k.count = 0;
-    var sj: usize = 0;
-    for (sj < nref) { walk_field_sites(?refs[sj], ti, t, false, ?k); sj = sj + 1; }
-    off = k.off;
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
-    json.free_str(id_raw, alloc);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
 }
 
 # send a WorkspaceEdit renaming the field to `new_name` across
@@ -922,90 +954,45 @@ fun emit_field_locations(ws: *project.Workspace, root: *project.Root, alloc: *Al
 # `id_raw` and frees it
 fun emit_field_rename(ws: *project.Workspace, root: *project.Root, alloc: *Allocator, id_raw: str, refs: *FieldXRef, nref: usize, t: FieldTarget, new_name: str) {
     val ti: *type.TypeInterner = project.type_interner(ws, root);
-    val qname: str = json.quote(new_name, alloc);
-    if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push(?b, "{\"changes\":{");
 
-    val ga: Result[*str, str] = allocate[str](alloc, nref);
-    if (is_err[*str, str](ga)) { json.free_str(qname, alloc); reply_empty_edit(alloc, id_raw); ret; }
-    val groups: *str = unwrap_ok[*str, str](ga);
-
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":{\"changes\":{";
-    val suffix: str = "}}}";
-    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
-    var ng: usize = 0;
-    var si: usize = 0;
-    for (si < nref) {
-        val g: str = field_rename_group_json(?refs[si], ti, t, qname, alloc);
-        if (g != nil) {
-            if (ng > 0) { total = total + 1; }
-            total = total + str_len(g);
-            groups[ng] = g;
-            ng = ng + 1;
+    var emitted: usize = 0;
+    var i: usize = 0;
+    for (i < nref) {
+        if (push_field_rename_group(?b, ?refs[i], ti, t, new_name, emitted > 0, alloc)) {
+            emitted = emitted + 1;
         }
-        si = si + 1;
+        i = i + 1;
     }
 
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) {
-        free_groups(groups, ng, alloc);
-        deallocate[str](alloc, groups, nref);
-        json.free_str(qname, alloc);
-        reply_empty_edit(alloc, id_raw); ret;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
-    var gi: usize = 0;
-    for (gi < ng) {
-        if (gi > 0) { buf[off] = ','; off = off + 1; }
-        off = append(buf, off, groups[gi]);
-        gi = gi + 1;
-    }
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
-
-    free_groups(groups, ng, alloc);
-    deallocate[str](alloc, groups, nref);
-    json.free_str(qname, alloc);
-    json.free_str(id_raw, alloc);
+    json.buf_push(?b, "}}");
+    render.send(?b, alloc, id_raw);
 }
 
-# the `changes`-map entry `"<uri>":[<edits>]` for module
-# `s`, rewriting its field sites (and, for the declaring module, the declaration
-# and doc component) to the quoted `qname`, or nil when `s` contributes no edit
-fun field_rename_group_json(s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget, qname: str, alloc: *Allocator) str {
-    val quri: str = json.quote(s.uri, alloc);
-    if (quri == nil) { ret nil; }
+# append the `changes`-map entry `"<uri>":[<edits>]` for module `s`
+#
+# Rewrites that module's field sites and, for the declaring module, the field
+# declaration and the record's matching doc component. Opened speculatively and
+# rolled back when the module contributes no edit, so one walk decides and
+# writes.
+fun push_field_rename_group(b: *json.Buf, s: *FieldXRef, ti: *type.TypeInterner, t: FieldTarget,
+                            new_name: str, comma: bool, alloc: *Allocator) bool {
+    val mark: usize = json.buf_len(b);
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push_quoted(b, s.uri);
+    json.buf_push(b, ":[");
 
-    var k: WalkSink = sink_init(alloc, qname, nil);
+    var k: WalkSink = sink_init(b, alloc, new_name, nil);
     walk_field_sites(s, ti, t, true, ?k);
-    if (k.count == 0) { json.free_str(quri, alloc); ret nil; }
+    if (k.count == 0) {
+        json.buf_rewind(b, mark);
+        ret false;
+    }
 
-    val open:  str = ":[";
-    val close: str = "]";
-    val total: usize = str_len(quri) + str_len(open) + k.total + str_len(close);
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(quri, alloc); ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-
-    var off: usize = 0;
-    off = append(buf, off, quri);
-    off = append(buf, off, open);
-    k.buf   = buf;
-    k.off   = off;
-    k.count = 0;
-    walk_field_sites(s, ti, t, true, ?k);
-    off = k.off;
-    off = append(buf, off, close);
-    buf[off] = 0;
-    json.free_str(quri, alloc);
-    ret buf::str;
+    json.buf_push_byte(b, ']');
+    ret true;
 }
 
 # answer textDocument/references with every Location resolving to
@@ -1016,23 +1003,23 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
-    if (!is_some[usize](off_o)) { reply_empty_array(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_empty_array(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # name resolution leaves a value-field access unbound, so a cursor on a
         # field name yields no SymbolRef - fall through to the type-driven field
         # references before giving up.
         if (field_references(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
-        reply_empty_array(alloc, id_raw); ret;
+        render.reply_empty_array(alloc, id_raw); ret;
     }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (!is_some[*res.Symbol](so)) { reply_empty_array(alloc, id_raw); ret; }
+    if (!is_some[*res.Symbol](so)) { render.reply_empty_array(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
     var bind: token.Span;
@@ -1040,13 +1027,152 @@ pub fun references(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
 
     val cap: usize = (project.module_count(an.root) + 1)::usize;
     val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
-    if (is_err[*XRef, str](ra)) { reply_empty_array(alloc, id_raw); ret; }
+    if (is_err[*XRef, str](ra)) { render.reply_empty_array(alloc, id_raw); ret; }
     val refs: *XRef = unwrap_ok[*XRef, str](ra);
 
     val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, false, refs, cap);
     emit_locations(alloc, id_raw, refs, n, bind, has_bind);
     free_refs(ws, refs, n);
     deallocate[XRef](alloc, refs, cap);
+}
+
+# answer textDocument/documentHighlight with every occurrence of the symbol at
+# the cursor within this document, classified read or write
+#
+# The same query `references` answers, scoped to one file and with an access
+# kind. Clients fire it on every cursor move, so it never leaves the buffer's
+# own analysis: no other module is walked and no rebuild is triggered.
+pub fun document_highlight(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_empty_array(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
+
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
+    if (!is_some[features.SymbolRef](ro)) {
+        if (field_highlights(ws, alloc, ?an, uri, offset, id_raw)) { ret; }
+        render.reply_empty_array(alloc, id_raw); ret;
+    }
+    val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    push_symbol_highlights(?b, an, sr.sym_id);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# append every occurrence of `target` in the buffer, classified by access
+#
+# Lives apart from the request handler because that handler takes an `id`
+# parameter, which shadows the `mach.lang.fe.ast.id` module alias the walk needs.
+fun push_symbol_highlights(b: *json.Buf, an: analysis.Analyzed, target: res.SymbolId) {
+    var emitted: usize = 0;
+
+    var bind: token.Span;
+    if (binding_span(an, target, ?bind)) {
+        push_highlight(b, an.file, bind, HIGHLIGHT_TEXT, emitted > 0);
+        emitted = emitted + 1;
+    }
+
+    var di: usize = 0;
+    for (di < an.a.decl_len) {
+        val dso: Option[token.Span] = features.decl_ref_span(an.a, an.rr, di::id.DeclId, target);
+        if (is_some[token.Span](dso)) {
+            push_highlight(b, an.file, unwrap[token.Span](dso), HIGHLIGHT_WRITE, emitted > 0);
+            emitted = emitted + 1;
+        }
+        val iso: Option[token.Span] = features.import_ref_span(an.a, an.rr, di::id.DeclId, target, an.file);
+        if (is_some[token.Span](iso)) {
+            push_highlight(b, an.file, unwrap[token.Span](iso), HIGHLIGHT_TEXT, emitted > 0);
+            emitted = emitted + 1;
+        }
+        di = di + 1;
+    }
+
+    var ei: usize = 0;
+    for (ei < an.a.expr_len) {
+        val so: Option[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, target);
+        if (is_some[token.Span](so)) {
+            var kind: i64 = HIGHLIGHT_READ;
+            if (is_assign_target(an.a, ei::id.ExprId)) { kind = HIGHLIGHT_WRITE; }
+            push_highlight(b, an.file, unwrap[token.Span](so), kind, emitted > 0);
+            emitted = emitted + 1;
+        }
+        ei = ei + 1;
+    }
+
+    var ti: usize = 0;
+    for (ti < an.a.type_len) {
+        val so: Option[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, target);
+        if (is_some[token.Span](so)) {
+            push_highlight(b, an.file, unwrap[token.Span](so), HIGHLIGHT_READ, emitted > 0);
+            emitted = emitted + 1;
+        }
+        ti = ti + 1;
+    }
+}
+
+# highlight the field under the cursor across this document, for the positions
+# where name resolution leaves a value-field access unbound
+fun field_highlights(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyzed, uri: str, offset: usize, id_raw: str) bool {
+    if (an.root == nil || an.sr == nil) { ret false; }
+    val to: Option[FieldTarget] = field_target_at(ws, an, offset);
+    if (!is_some[FieldTarget](to)) { ret false; }
+    val t: FieldTarget = unwrap[FieldTarget](to);
+    val ti: *type.TypeInterner = project.type_interner(ws, an.root);
+
+    var s: FieldXRef;
+    s.a         = an.a;
+    s.sr        = an.sr;
+    s.file      = an.file;
+    s.uri       = uri;
+    s.declaring = an.own == t.rs.origin;
+    s.owned     = false;
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    var k: WalkSink = sink_init_mode(?b, alloc, SINK_HIGHLIGHT, nil, nil);
+    walk_field_sites(?s, ti, t, s.declaring, ?k);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+    ret true;
+}
+
+# whether expression `eid` is the left operand of an assignment, which makes a
+# reference through it a write rather than a read
+fun is_assign_target(a: *ast.Ast, eid: id.ExprId) bool {
+    var i: usize = 0;
+    for (i < a.expr_len) {
+        val eo: Option[*aexpr.Expr] = ast.get_expr(a, i::id.ExprId);
+        if (is_some[*aexpr.Expr](eo)) {
+            val e: *aexpr.Expr = unwrap[*aexpr.Expr](eo);
+            if (e.kind == aexpr.EXPR_KIND_BINARY && e.data.binary.op == aexpr.BIN_ASSIGN
+                && e.data.binary.lhs == eid) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# append one DocumentHighlight
+fun push_highlight(b: *json.Buf, file: *src.SourceFile, span: token.Span, kind: i64, comma: bool) {
+    if (comma) { json.buf_push_byte(b, ','); }
+    push_highlight_body(b, file, span, kind);
+}
+
+# one DocumentHighlight object, without the separating comma
+fun push_highlight_body(b: *json.Buf, file: *src.SourceFile, span: token.Span, kind: i64) {
+    json.buf_push(b, "{\"range\":");
+    render.span_range(b, file, span);
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    json.buf_push_byte(b, '}');
 }
 
 # answer textDocument/rename with a WorkspaceEdit replacing every
@@ -1062,31 +1188,31 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     if (id_raw == nil) { ret; }
 
     val new_name: str = json.text(json.member(params, "newName"), alloc);
-    if (new_name == nil) { reply_null(alloc, id_raw); ret; }
+    if (new_name == nil) { render.reply_null(alloc, id_raw); ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
-    if (!is_some[usize](off_o)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # a cursor on a field name yields no SymbolRef - fall through to the
         # type-driven field rename, which gates on the record's ownership.
         if (field_rename(ws, alloc, ?an, uri, offset, id_raw, new_name)) { json.free_str(new_name, alloc); ret; }
-        reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret;
+        render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret;
     }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (!is_some[*res.Symbol](so)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (!is_some[*res.Symbol](so)) { render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
-    if (!renameable(ws, an.root, sym)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (!renameable(ws, an.root, sym)) { render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
 
     # the declared name guards the cross-file walk: only occurrences spelled with
     # it are rewritten, so an aliased import's references are left untouched
     val no: Option[str] = intern.lookup(an.interner, sym.name);
-    if (!is_some[str](no)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (!is_some[str](no)) { render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val name: str = unwrap[str](no);
 
     var bind: token.Span;
@@ -1102,7 +1228,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var cap: usize = project.module_count(an.root)::usize;
     if (cap == 0) { cap = 1; }
     val ra: Result[*XRef, str] = allocate[XRef](alloc, cap);
-    if (is_err[*XRef, str](ra)) { reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
+    if (is_err[*XRef, str](ra)) { render.reply_empty_edit(alloc, id_raw); json.free_str(new_name, alloc); ret; }
     val refs: *XRef = unwrap_ok[*XRef, str](ra);
 
     val n: usize = build_refs(ws, an, uri, sym, sr.sym_id, true, refs, cap);
@@ -1119,7 +1245,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 # (`Decl.doc` resolved through `mach.lang.fe.doc`) is a buffer edit. a generic's
 # component head is the bracket form `# [T]:`, so the returned span is the inner
 # identifier only (the brackets stay)
-fun param_generic_doc_span(an: Analyzed, sym: *res.Symbol, name: str, out: *token.Span) bool {
+fun param_generic_doc_span(an: analysis.Analyzed, sym: *res.Symbol, name: str, out: *token.Span) bool {
     if (sym.kind != res.SYM_PARAM && sym.kind != res.SYM_GENERIC) { ret false; }
     if (sym.decl == id.DECL_NIL) { ret false; }
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, sym.decl);
@@ -1145,12 +1271,12 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val off_o: Option[usize] = locate(ws, es, alloc, docs, params, uri, ?an);
-    if (!is_some[usize](off_o)) { reply_null(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, offset);
+    val ro: Option[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.file, offset);
     if (!is_some[features.SymbolRef](ro)) {
         # a cursor on a field name yields no SymbolRef - accept it when it resolves
         # to a field of a project-owned record (the same gate field rename uses)
@@ -1158,28 +1284,17 @@ pub fun prepare_rename(ws: *project.Workspace, es: *editor.EditorSession, alloc:
         if (field_prepare_span(ws, ?an, uri, offset, ?name_span)) {
             reply_range(alloc, id_raw, an.file, name_span); ret;
         }
-        reply_null(alloc, id_raw); ret;
+        render.reply_null(alloc, id_raw); ret;
     }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
     val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (!is_some[*res.Symbol](so)) { reply_null(alloc, id_raw); ret; }
-    if (!renameable(ws, an.root, unwrap[*res.Symbol](so))) { reply_null(alloc, id_raw); ret; }
+    if (!is_some[*res.Symbol](so)) { render.reply_null(alloc, id_raw); ret; }
+    if (!renameable(ws, an.root, unwrap[*res.Symbol](so))) { render.reply_null(alloc, id_raw); ret; }
 
     reply_range(alloc, id_raw, an.file, sr.name_span);
 }
 
-# send a prepareRename success reply carrying the range of `span` in
-# `file`, freeing `id_raw`. shared by the symbol and field prepare paths
-fun reply_range(alloc: *Allocator, id_raw: str, file: *src.SourceFile, span: token.Span) {
-    val rng: str = range_json(positions.range_of(file, span), alloc);
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":";
-    val p3: str = "}";
-    send6(alloc, p1, id_raw, p2, rng, p3, nil, nil);
-    json.free_str(rng, alloc);
-    json.free_str(id_raw, alloc);
-}
 
 # answer textDocument/documentSymbol with a flat list of the
 # file's top-level declarations as DocumentSymbol nodes (name, kind, range,
@@ -1189,12 +1304,12 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
     if (id_raw == nil) { ret; }
 
     val d: *documents.Document = documents.find(docs, uri);
-    if (d == nil) { reply_empty_array(alloc, id_raw); ret; }
+    if (d == nil) { render.reply_empty_array(alloc, id_raw); ret; }
     val ar: Result[*ast.Ast, str] = editor.parse(es, d.file_id);
-    if (is_err[*ast.Ast, str](ar)) { reply_empty_array(alloc, id_raw); ret; }
+    if (is_err[*ast.Ast, str](ar)) { render.reply_empty_array(alloc, id_raw); ret; }
     val fo: Option[*src.SourceFile] = src.get(?es.s.sources, d.file_id);
-    if (!is_some[*src.SourceFile](fo)) { reply_empty_array(alloc, id_raw); ret; }
-    var an: Analyzed;
+    if (!is_some[*src.SourceFile](fo)) { render.reply_empty_array(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
     an.a = unwrap_ok[*ast.Ast, str](ar);
     an.file = unwrap[*src.SourceFile](fo);
 
@@ -1207,18 +1322,87 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: Analyzed;
-    val okc: bool = analyze(ws, es, docs, uri, ?an);
-    if (!okc) { reply_empty_array(alloc, id_raw); ret; }
+    var an: analysis.Analyzed;
+    if (!analysis.analyze(ws, es, docs, uri, ?an)) { reply_empty_completion(alloc, id_raw); ret; }
 
-    emit_completions(an, alloc, id_raw);
+    # completion is the one feature whose answer depends on where the cursor is
+    # rather than merely what it is on: the identifier being typed narrows the
+    # set, and a preceding `.` replaces it entirely.
+    val pos: *sj.Value = json.member(params, "position");
+    val line: i64 = json.number(json.member(pos, "line"), -1);
+    val ch:   i64 = json.number(json.member(pos, "character"), -1);
+    var offset: usize = 0;
+    var have_offset: bool = false;
+    if (line >= 0 && ch >= 0) {
+        val oo: Option[usize] = positions.offset_at(an.file, line::usize, ch::usize);
+        if (is_some[usize](oo)) { offset = unwrap[usize](oo); have_offset = true; }
+    }
+    if (!have_offset) { emit_completions(an, alloc, id_raw, empty_span(), nil); ret; }
+
+    val prefix: token.Span = ident_prefix_before(an.file, offset);
+    val dot: usize = prefix.offset;
+    if (dot > 0 && an.file.text[dot - 1] == '.') {
+        if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+        # a receiver we cannot resolve offers nothing rather than the whole file,
+        # which would be a list of names that cannot legally follow the dot
+        reply_empty_completion(alloc, id_raw);
+        ret;
+    }
+
+    emit_completions(an, alloc, id_raw, prefix, an.file);
+}
+
+# the identifier being typed immediately before `offset`, as a span
+#
+# Zero-length (anchored at `offset`) when the cursor does not follow an
+# identifier character, which is both the "just typed a dot" case and the "start
+# of a fresh word" case. The span's `offset` is therefore always the position a
+# member receiver's dot would occupy.
+fun ident_prefix_before(file: *src.SourceFile, offset: usize) token.Span {
+    val text: str = file.text;
+    var start: usize = offset;
+    for (start > 0 && is_ident_byte(text[start - 1])) { start = start - 1; }
+    var s: token.Span;
+    s.offset = start;
+    s.len    = offset - start;
+    ret s;
+}
+
+# whether `c` can appear inside a Mach identifier
+fun is_ident_byte(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    if (c >= 'A' && c <= 'Z') { ret true; }
+    if (c >= '0' && c <= '9') { ret true; }
+    ret c == '_';
+}
+
+# whether the bytes of `span` in `file` are a case-sensitive prefix of `name`
+fun span_is_prefix_of(file: *src.SourceFile, span: token.Span, name: str) bool {
+    if (span.len == 0) { ret true; }
+    if (name == nil) { ret false; }
+    if (str_len(name) < span.len) { ret false; }
+    val text: str = file.text;
+    var i: usize = 0;
+    for (i < span.len) {
+        if (text[span.offset + i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# an empty span, for the no-prefix case
+fun empty_span() token.Span {
+    var s: token.Span;
+    s.offset = 0;
+    s.len    = 0;
+    ret s;
 }
 
 # write the binding name span of a param / generic symbol into
 # `out` and return true, or false when the symbol binds at a Decl node (whose
 # site the decl walk already covers). lets references / rename include the one
 # binding site a param / generic has, which no side table records
-fun binding_span(an: Analyzed, sid: res.SymbolId, out: *token.Span) bool {
+fun binding_span(an: analysis.Analyzed, sid: res.SymbolId, out: *token.Span) bool {
     val so: Option[*res.Symbol] = features.symbol(an.rr, sid);
     if (!is_some[*res.Symbol](so)) { ret false; }
     val bo: Option[token.Span] = features.binding_name_span(an.a, unwrap[*res.Symbol](so));
@@ -1250,7 +1434,7 @@ rec XRef {
 # collect each retained module whose resolver maps the target's canonical
 # (origin, declaration) identity. The active document is already that exact
 # ModuleEntry, so it uses the request URI and is neither bridged nor duplicated.
-fun build_refs(ws: *project.Workspace, an: Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
+fun build_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, sym: *res.Symbol, self_target: res.SymbolId, project_only: bool, out: *XRef, cap: usize) usize {
     if (an.root == nil || sym.decl == id.DECL_NIL
         || (sym.origin == an.own && ((sym.flags & res.SYM_FLAG_MODULE) == 0
             || (sym.flags & res.SYM_FLAG_PUB) == 0))) {
@@ -1297,60 +1481,7 @@ fun free_refs(ws: *project.Workspace, refs: *XRef, n: usize) {
         i = i + 1;
     }
 }
-# the project root that governs it and populate `out` with its interner, file,
-# Ast, ResolveResult, governing root, and module id. false when the document is
-# unknown or resolution fails. Project documents use their compiler-owned
-# ModuleId; standalone files use the editor FileId only within that fallback
-# Session.
-fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
-    if (uri == nil) { ret false; }
-    val doc: *documents.Document = documents.find(docs, uri);
-    if (doc == nil) { ret false; }
 
-    val vr: Result[project.DocumentView, str] = project.document_view(ws, doc);
-    if (!is_err[project.DocumentView, str](vr)) {
-        val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
-        out.rr       = v.rr;
-        out.a        = v.a;
-        out.sr       = v.sr;
-        out.interner = v.interner;
-        out.file     = v.file;
-        out.root     = v.root;
-        out.own      = v.module;
-        ret true;
-    }
-    if (project.has_project(ws, uri)) { ret false; }
-
-    val rr: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
-    if (is_err[*res.ResolveResult, str](rr)) { ret false; }
-    out.rr = unwrap_ok[*res.ResolveResult, str](rr);
-    out.a = editor.ast_of(es, doc.file_id);
-    if (out.a == nil) { ret false; }
-    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-    if (!is_some[*src.SourceFile](fo)) { ret false; }
-    out.sr = nil;
-    val sr: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
-    if (!is_err[*sema.SemaResult, str](sr)) { out.sr = unwrap_ok[*sema.SemaResult, str](sr); }
-    out.interner = ?es.s.interner;
-    out.file = unwrap[*src.SourceFile](fo);
-    out.root = nil;
-    out.own = doc.file_id::sess.ModuleId;
-    ret true;
-}
-
-# analyze the target document and resolve the request's cursor position
-# to a byte offset, or none when the document is unknown / unresolvable or the
-# position is invalid (callers fall back to a null / empty reply)
-fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, params: *sj.Value, uri: str, out: *Analyzed) Option[usize] {
-    if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
-
-    val pos: *sj.Value = json.member(params, "position");
-    val line: i64 = json.number(json.member(pos, "line"), -1);
-    val ch:   i64 = json.number(json.member(pos, "character"), -1);
-    if (line < 0 || ch < 0) { ret none[usize](); }
-
-    ret positions.offset_at(out.file, line::usize, ch::usize);
-}
 
 # the size-or-write accumulator behind the shared reference walk.
 # one walk (walk_refs) feeds it: with `buf` nil it totals JSON byte lengths
@@ -1362,41 +1493,60 @@ fun locate(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
 # references while references reports them. `count` sequences the separating
 # commas across everything fed to the sink
 rec WalkSink {
-    alloc: *Allocator;
-    buf:   *u8;
-    off:   usize;
-    total: usize;
-    count: usize;
-    qname: str;
-    guard: str;
+    b:        *json.Buf;
+    alloc:    *Allocator;
+    count:    usize;
+    mode:     u8;
+    new_text: str;
+    guard:    str;
 }
 
-# a sizing WalkSink; point `buf` at the output (and reset `count`)
-# to switch it to the write pass
-fun sink_init(alloc: *Allocator, qname: str, guard: str) WalkSink {
+# what shape one walked span is emitted as
+val SINK_LOCATION:  u8 = 0;
+val SINK_TEXT_EDIT: u8 = 1;
+val SINK_HIGHLIGHT: u8 = 2;
+
+# a sink appending into `b`
+#
+# One walk feeds every consumer of a reference set: references wants Locations,
+# rename wants TextEdits, documentHighlight wants ranges with an access kind.
+# `guard`, when non-nil, drops body spans not spelled exactly `guard`, so rename
+# skips alias-spelled references while references reports them. There is no
+# sizing mode: one walk writes, so size and content cannot disagree.
+# ---
+# b:        buffer to append into
+# alloc:    request allocator
+# mode:     which LSP shape to emit
+# new_text: replacement text for SINK_TEXT_EDIT, else nil
+# guard:    required spelling for body spans, or nil to admit all
+# ret:      an empty sink
+fun sink_init_mode(b: *json.Buf, alloc: *Allocator, mode: u8, new_text: str, guard: str) WalkSink {
     var k: WalkSink;
-    k.alloc = alloc;
-    k.buf   = nil;
-    k.off   = 0;
-    k.total = 0;
-    k.count = 0;
-    k.qname = qname;
-    k.guard = guard;
+    k.b        = b;
+    k.alloc    = alloc;
+    k.count    = 0;
+    k.mode     = mode;
+    k.new_text = new_text;
+    k.guard    = guard;
     ret k;
 }
 
-# size or write one Location / TextEdit for `span` in `file` (located
-# at `uri`), per the sink's mode. taking `file` / `uri` rather than a source
-# record lets the symbol walk (XRef) and the field walk (FieldXRef) share it
+# a sink emitting Locations, or TextEdits when `new_text` is non-nil
+fun sink_init(b: *json.Buf, alloc: *Allocator, new_text: str, guard: str) WalkSink {
+    var mode: u8 = SINK_LOCATION;
+    if (new_text != nil) { mode = SINK_TEXT_EDIT; }
+    ret sink_init_mode(b, alloc, mode, new_text, guard);
+}
+
+# append one Location or TextEdit for `span` in `file` (located at `uri`)
+#
+# Taking `file` / `uri` rather than a source record lets the symbol walk (XRef)
+# and the field walk (FieldXRef) share it.
 fun sink_emit(k: *WalkSink, file: *src.SourceFile, uri: str, span: token.Span) {
-    if (k.qname == nil) {
-        if (k.buf == nil) { k.total = k.total + loc_len(file, uri, span, k.alloc, k.count); }
-        or                { k.off   = put_loc(k.buf, k.off, file, uri, span, k.alloc, k.count); }
-    }
-    or {
-        if (k.buf == nil) { k.total = k.total + edit_len(file, span, k.qname, k.alloc, k.count); }
-        or                { k.off   = put_edit(k.buf, k.off, file, span, k.qname, k.alloc, k.count); }
-    }
+    if (k.count > 0) { json.buf_push_byte(k.b, ','); }
+    if (k.mode == SINK_TEXT_EDIT)      { render.text_edit(k.b, file, span, k.new_text); }
+    or (k.mode == SINK_HIGHLIGHT)      { push_highlight_body(k.b, file, span, HIGHLIGHT_READ); }
+    or                                 { render.location(k.b, file, uri, span); }
     k.count = k.count + 1;
 }
 
@@ -1444,37 +1594,17 @@ fun guard_admits(s: *XRef, k: *WalkSink, span: token.Span) bool {
 # `refs[0]`'s and is included when `has_bind`. takes ownership of `id_raw` and
 # frees it
 fun emit_locations(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, bind: token.Span, has_bind: bool) {
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":[";
-    val suffix: str = "]}";
-
     var empty: token.Span;
-    var k: WalkSink = sink_init(alloc, nil, nil);
-    var si: usize = 0;
-    for (si < nref) { walk_refs(?refs[si], si == 0 && has_bind, bind, false, empty, ?k); si = si + 1; }
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
 
-    val total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + k.total + str_len(suffix);
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
+    var k: WalkSink = sink_init(?b, alloc, nil, nil);
+    var i: usize = 0;
+    for (i < nref) { walk_refs(?refs[i], i == 0 && has_bind, bind, false, empty, ?k); i = i + 1; }
 
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
-
-    k.buf   = buf;
-    k.off   = off;
-    k.count = 0;
-    var sj: usize = 0;
-    for (sj < nref) { walk_refs(?refs[sj], sj == 0 && has_bind, bind, false, empty, ?k); sj = sj + 1; }
-    off = k.off;
-
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
-    json.free_str(id_raw, alloc);
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
 }
 
 # send a WorkspaceEdit renaming the symbol to `new_name` across the
@@ -1485,58 +1615,22 @@ fun emit_locations(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, bin
 # owning decl's matching doc-component name token when `has_doc`. takes ownership
 # of `id_raw` and frees it
 fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_name: str, name: str, bind: token.Span, has_bind: bool, doc: token.Span, has_doc: bool) {
-    val qname: str = json.quote(new_name, alloc);
-    if (qname == nil) { reply_empty_edit(alloc, id_raw); ret; }
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push(?b, "{\"changes\":{");
 
-    val ga: Result[*str, str] = allocate[str](alloc, nref);
-    if (is_err[*str, str](ga)) { json.free_str(qname, alloc); reply_empty_edit(alloc, id_raw); ret; }
-    val groups: *str = unwrap_ok[*str, str](ga);
-
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":{\"changes\":{";
-    val suffix: str = "}}}";
-    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
-    var ng: usize = 0;
-    var si: usize = 0;
-    for (si < nref) {
-        val g: str = rename_group_json(?refs[si], si == 0 && has_bind, bind, si == 0 && has_doc, doc, name, qname, alloc);
-        if (g != nil) {
-            if (ng > 0) { total = total + 1; }
-            total = total + str_len(g);
-            groups[ng] = g;
-            ng = ng + 1;
+    var emitted: usize = 0;
+    var i: usize = 0;
+    for (i < nref) {
+        if (push_rename_group(?b, ?refs[i], i == 0 && has_bind, bind, i == 0 && has_doc, doc,
+                              name, new_name, emitted > 0, alloc)) {
+            emitted = emitted + 1;
         }
-        si = si + 1;
+        i = i + 1;
     }
 
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) {
-        free_groups(groups, ng, alloc);
-        deallocate[str](alloc, groups, nref);
-        json.free_str(qname, alloc);
-        reply_empty_edit(alloc, id_raw); ret;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
-    var gi: usize = 0;
-    for (gi < ng) {
-        if (gi > 0) { buf[off] = ','; off = off + 1; }
-        off = append(buf, off, groups[gi]);
-        gi = gi + 1;
-    }
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
-
-    free_groups(groups, ng, alloc);
-    deallocate[str](alloc, groups, nref);
-    json.free_str(qname, alloc);
-    json.free_str(id_raw, alloc);
+    json.buf_push(?b, "}}");
+    render.send(?b, alloc, id_raw);
 }
 
 # the `changes`-map entry `"<uri>":[<edits>]` for source `s`,
@@ -1545,149 +1639,206 @@ fun emit_rename(alloc: *Allocator, id_raw: str, refs: *XRef, nref: usize, new_na
 # nil when `s` contributes no edit. the active buffer's param / generic binding is
 # included when `include_bind` and its owning decl's doc-component name token when
 # `include_doc`
-fun rename_group_json(s: *XRef, include_bind: bool, bind: token.Span, include_doc: bool, doc: token.Span, name: str, qname: str, alloc: *Allocator) str {
-    if (s.target == res.SYMBOL_NIL) { ret nil; }
-    val quri: str = json.quote(s.uri, alloc);
-    if (quri == nil) { ret nil; }
+fun push_rename_group(b: *json.Buf, s: *XRef, include_bind: bool, bind: token.Span,
+                      include_doc: bool, doc: token.Span, name: str, new_name: str,
+                      comma: bool, alloc: *Allocator) bool {
+    if (s.target == res.SYMBOL_NIL) { ret false; }
 
-    var k: WalkSink = sink_init(alloc, qname, name);
+    # a file's edits are only known to be empty once walked, so open the entry
+    # speculatively and roll the buffer back when the walk contributes nothing
+    val mark: usize = json.buf_len(b);
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push_quoted(b, s.uri);
+    json.buf_push(b, ":[");
+
+    var k: WalkSink = sink_init(b, alloc, new_name, name);
     walk_refs(s, include_bind, bind, include_doc, doc, ?k);
-    if (k.count == 0) { json.free_str(quri, alloc); ret nil; }
+    if (k.count == 0) {
+        json.buf_rewind(b, mark);
+        ret false;
+    }
 
-    val open:  str = ":[";
-    val close: str = "]";
-    val total: usize = str_len(quri) + str_len(open) + k.total + str_len(close);
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(quri, alloc); ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-
-    var off: usize = 0;
-    off = append(buf, off, quri);
-    off = append(buf, off, open);
-    k.buf   = buf;
-    k.off   = off;
-    k.count = 0;
-    walk_refs(s, include_bind, bind, include_doc, doc, ?k);
-    off = k.off;
-    off = append(buf, off, close);
-    buf[off] = 0;
-    json.free_str(quri, alloc);
-    ret buf::str;
+    json.buf_push_byte(b, ']');
+    ret true;
 }
 
-# free the first `n` owned changes-map entry strings in `groups`
-fun free_groups(groups: *str, n: usize, alloc: *Allocator) {
-    var i: usize = 0;
-    for (i < n) { json.free_str(groups[i], alloc); i = i + 1; }
-}
 
 # send a DocumentSymbol[] of the file's top-level decls.
 # takes ownership of `id_raw` and frees it
-fun emit_document_symbols(an: Analyzed, alloc: *Allocator, id_raw: str) {
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":[";
-    val suffix: str = "]}";
+fun emit_document_symbols(an: analysis.Analyzed, alloc: *Allocator, id_raw: str) {
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_raw);
+    json.buf_push(?b, ",\"result\":[");
 
     val n: u32 = features.top_level_count(an.a);
-
-    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
-    var count: usize = 0;
-
-    var d1: u32 = 0;
-    for (d1 < n) {
-        val entry: str = doc_symbol_json(an, features.top_level_decl(an.a, d1), alloc);
-        if (entry != nil) {
-            if (count > 0) { total = total + 1; }
-            total = total + str_len(entry);
-            json.free_str(entry, alloc);
-            count = count + 1;
-        }
-        d1 = d1 + 1;
-    }
-
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
-
-    var emitted: usize = 0;
-    var d2: u32 = 0;
-    for (d2 < n) {
-        val entry: str = doc_symbol_json(an, features.top_level_decl(an.a, d2), alloc);
-        if (entry != nil) {
-            if (emitted > 0) { buf[off] = ','; off = off + 1; }
-            off = append(buf, off, entry);
-            json.free_str(entry, alloc);
+    var emitted: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        if (push_doc_symbol(?b, an, features.top_level_decl(an.a, i), emitted > 0, alloc)) {
             emitted = emitted + 1;
         }
-        d2 = d2 + 1;
+        i = i + 1;
     }
 
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
+    json.buf_push(?b, "]}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    or { render.reply_empty_array(alloc, id_raw); json.buf_dnit(?b); ret; }
+    json.buf_dnit(?b);
     json.free_str(id_raw, alloc);
 }
 
-# render decl `did` as a DocumentSymbol object, or nil when the
-# decl has no nameable symbol (use / fwd / test / comptime / error)
-fun doc_symbol_json(an: Analyzed, did: id.DeclId, alloc: *Allocator) str {
+# append decl `did` as a DocumentSymbol, with its members as `children`
+#
+# A record's fields, a union's variants, and a function's generics and
+# parameters are what the outline is FOR: a flat list of 39 top-level names in a
+# 2000-line module tells a reader nothing they could not get from the file
+# itself. Emitted in one pass through the buffer rather than sized and then
+# filled, so nesting costs one traversal instead of two.
+# ---
+# b:     output buffer
+# an:    the analyzed document
+# did:   decl to render
+# comma: whether to separate from a preceding sibling
+# alloc: request allocator
+# ret:   true when a symbol was appended
+fun push_doc_symbol(b: *json.Buf, an: analysis.Analyzed, did: id.DeclId, comma: bool, alloc: *Allocator) bool {
     val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, did);
-    if (!is_some[*decl.Decl](d_opt)) { ret nil; }
+    if (!is_some[*decl.Decl](d_opt)) { ret false; }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
 
     val nso: Option[token.Span] = features.decl_name_span(d);
-    if (!is_some[token.Span](nso)) { ret nil; }
+    if (!is_some[token.Span](nso)) { ret false; }
     val name_span: token.Span = unwrap[token.Span](nso);
-    if (name_span.len == 0) { ret nil; }
+    if (name_span.len == 0) { ret false; }
 
     val name: str = positions.span_text(an.file, name_span, alloc);
-    if (name == nil) { ret nil; }
-    val qname: str = json.quote(name, alloc);
+    if (name == nil) { ret false; }
+
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"name\":");
+    json.buf_push_quoted(b, name);
     json.free_str(name, alloc);
-    if (qname == nil) { ret nil; }
-
-    val kind: i64 = decl_lsp_kind(d.kind);
-    val kstr: str = json.format_i64(kind, alloc);
-    val full: str = range_json(positions.range_of(an.file, d.span), alloc);
-    val sel:  str = range_json(positions.range_of(an.file, name_span), alloc);
-
-    val p1: str = "{\"name\":";
-    val p2: str = ",\"kind\":";
-    val p3: str = ",\"range\":";
-    val p4: str = ",\"selectionRange\":";
-    val p5: str = "}";
-    val total: usize = str_len(p1) + slen(qname) + str_len(p2) + slen(kstr) + str_len(p3) + slen(full) + str_len(p4) + slen(sel) + str_len(p5);
-
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) {
-        json.free_str(qname, alloc); json.free_str(kstr, alloc); json.free_str(full, alloc); json.free_str(sel, alloc);
-        ret nil;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, qname);
-    off = append(buf, off, p2);
-    off = append(buf, off, kstr);
-    off = append(buf, off, p3);
-    off = append(buf, off, full);
-    off = append(buf, off, p4);
-    off = append(buf, off, sel);
-    off = append(buf, off, p5);
-    buf[off] = 0;
-
-    json.free_str(qname, alloc);
-    json.free_str(kstr, alloc);
-    json.free_str(full, alloc);
-    json.free_str(sel, alloc);
-    ret buf::str;
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, decl_lsp_kind(d.kind));
+    json.buf_push(b, ",\"range\":");
+    render.span_range(b, an.file, d.span);
+    json.buf_push(b, ",\"selectionRange\":");
+    render.span_range(b, an.file, name_span);
+    push_doc_symbol_children(b, an, d, alloc);
+    json.buf_push_byte(b, '}');
+    ret true;
 }
+
+# append the `children` member for a declaration that has members, or nothing
+#
+# A record and a union both hold their members in the shared `typed_names` pool;
+# a function holds its generics in `generic_names` and its parameters in the same
+# typed pool. A declaration with no members omits `children` entirely rather than
+# emitting an empty array, so a client's "has children" test stays meaningful.
+fun push_doc_symbol_children(b: *json.Buf, an: analysis.Analyzed, d: *decl.Decl, alloc: *Allocator) {
+    var fields_start: u32 = 0;
+    var fields_len:   u32 = 0;
+    var gen_start:    u32 = 0;
+    var gen_len:      u32 = 0;
+    var member_kind:  i64 = LSP_SYMBOL_FIELD;
+
+    if (d.kind == decl.DECL_KIND_REC) {
+        fields_start = d.data.rec_.fields_start; fields_len = d.data.rec_.fields_len;
+        gen_start    = d.data.rec_.generics_start; gen_len   = d.data.rec_.generics_len;
+    }
+    or (d.kind == decl.DECL_KIND_UNI) {
+        fields_start = d.data.uni_.fields_start; fields_len = d.data.uni_.fields_len;
+        gen_start    = d.data.uni_.generics_start; gen_len   = d.data.uni_.generics_len;
+        member_kind  = LSP_SYMBOL_ENUM_MEMBER;
+    }
+    or (d.kind == decl.DECL_KIND_FUN) {
+        fields_start = d.data.fun_.params_start; fields_len = d.data.fun_.params_len;
+        gen_start    = d.data.fun_.generics_start; gen_len   = d.data.fun_.generics_len;
+        member_kind  = LSP_SYMBOL_VARIABLE;
+    }
+    or { ret; }
+
+    if (fields_len == 0 && gen_len == 0) { ret; }
+
+    json.buf_push(b, ",\"children\":[");
+    var emitted: u32 = 0;
+    var g: u32 = 0;
+    for (g < gen_len) {
+        if (an.a.generic_names != nil) {
+            val gs: token.Span = an.a.generic_names[(gen_start + g)::usize];
+            if (push_member_symbol(b, an, gs, id.TYPE_NIL, LSP_SYMBOL_TYPE_PARAMETER, emitted > 0, alloc)) {
+                emitted = emitted + 1;
+            }
+        }
+        g = g + 1;
+    }
+    var f: u32 = 0;
+    for (f < fields_len) {
+        if (an.a.typed_names != nil) {
+            val tn: *decl.TypedName = ?an.a.typed_names[(fields_start + f)::usize];
+            if (push_member_symbol(b, an, tn.name, tn.ty, member_kind, emitted > 0, alloc)) {
+                emitted = emitted + 1;
+            }
+        }
+        f = f + 1;
+    }
+    json.buf_push_byte(b, ']');
+}
+
+# append one member (field, variant, parameter, or generic) as a DocumentSymbol
+#
+# A member has no span of its own beyond its name, so `range` and
+# `selectionRange` are both the name; `detail` carries its declared type where
+# it has one.
+fun push_member_symbol(b: *json.Buf, an: analysis.Analyzed, name_span: token.Span, ty: id.TypeId,
+                       kind: i64, comma: bool, alloc: *Allocator) bool {
+    if (name_span.len == 0) { ret false; }
+    val name: str = positions.span_text(an.file, name_span, alloc);
+    if (name == nil) { ret false; }
+
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"name\":");
+    json.buf_push_quoted(b, name);
+    json.free_str(name, alloc);
+
+    if (ty != id.TYPE_NIL) {
+        val to: Option[*atype.Type] = ast.get_type(an.a, ty);
+        if (is_some[*atype.Type](to)) {
+            val tt: str = positions.span_text(an.file, unwrap[*atype.Type](to).span, alloc);
+            if (tt != nil) {
+                json.buf_push(b, ",\"detail\":");
+                json.buf_push_quoted(b, tt);
+                json.free_str(tt, alloc);
+            }
+        }
+    }
+
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    json.buf_push(b, ",\"range\":");
+    render.span_range(b, an.file, name_span);
+    json.buf_push(b, ",\"selectionRange\":");
+    render.span_range(b, an.file, name_span);
+    json.buf_push_byte(b, '}');
+    ret true;
+}
+
+
+# LSP DocumentHighlightKind
+val HIGHLIGHT_TEXT:  i64 = 1;
+val HIGHLIGHT_READ:  i64 = 2;
+val HIGHLIGHT_WRITE: i64 = 3;
+
+# LSP CompletionItemKind for a record or union field
+val LSP_COMPLETION_FIELD: i64 = 5;
+
+# LSP SymbolKind values used for declaration members
+val LSP_SYMBOL_ENUM_MEMBER:    i64 = 22;
+val LSP_SYMBOL_FIELD:          i64 = 8;
+val LSP_SYMBOL_VARIABLE:       i64 = 13;
+val LSP_SYMBOL_TYPE_PARAMETER: i64 = 26;
 
 # the LSP SymbolKind for a decl kind (documentSymbol)
 fun decl_lsp_kind(kind: decl.DeclKind) i64 {
@@ -1703,62 +1854,193 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 # send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of
 # `id_raw` and frees it
-fun emit_completions(an: Analyzed, alloc: *Allocator, id_raw: str) {
-    val prefix: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val mid:    str = ",\"result\":{\"isIncomplete\":false,\"items\":[";
-    val suffix: str = "]}}";
-
-    var total: usize = str_len(prefix) + str_len(id_raw) + str_len(mid) + str_len(suffix);
-    var count: usize = 0;
-
-    var i1: u32 = 0;
-    for (i1 < an.rr.symbol_count) {
-        if (completion_first(an, i1)) {
-            val entry: str = completion_json(an, i1, alloc);
-            if (entry != nil) {
-                if (count > 0) { total = total + 1; }
-                total = total + str_len(entry);
-                json.free_str(entry, alloc);
-                count = count + 1;
-            }
-        }
-        i1 = i1 + 1;
-    }
-
-    val br: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](br)) { reply_empty_array(alloc, id_raw); ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](br);
-
-    var off: usize = 0;
-    off = append(buf, off, prefix);
-    off = append(buf, off, id_raw);
-    off = append(buf, off, mid);
+fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, pfile: *src.SourceFile) {
+    var b: json.Buf = json.buf_init(alloc);
+    push_completion_head(?b, id_raw);
 
     var emitted: usize = 0;
-    var i2: u32 = 0;
-    for (i2 < an.rr.symbol_count) {
-        if (completion_first(an, i2)) {
-            val entry: str = completion_json(an, i2, alloc);
-            if (entry != nil) {
-                if (emitted > 0) { buf[off] = ','; off = off + 1; }
-                off = append(buf, off, entry);
-                json.free_str(entry, alloc);
-                emitted = emitted + 1;
+    var i: u32 = 0;
+    for (i < an.rr.symbol_count) {
+        if (completion_first(an, i)) {
+            val sym: *res.Symbol = ?an.rr.symbols[i];
+            val no: Option[str] = intern.lookup(an.interner, sym.name);
+            if (is_some[str](no)) {
+                val name: str = unwrap[str](no);
+                if (pfile == nil || span_is_prefix_of(pfile, prefix, name)) {
+                    push_completion_item(?b, name, features.lsp_completion_kind(sym.kind),
+                                         features.kind_label(sym.kind), nil, emitted > 0);
+                    emitted = emitted + 1;
+                }
             }
         }
-        i2 = i2 + 1;
+        i = i + 1;
     }
 
-    off = append(buf, off, suffix);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
+    push_completion_tail(?b, alloc, id_raw);
+}
+
+# offer the members reachable through `receiver.`
+#
+# Two receivers are meaningful. A module alias (`json.`) offers that module's
+# public symbols; anything else is typed through the snapshot's sema result and,
+# when it is a record or union, offers its fields. Returns false when the
+# receiver resolves to neither, so the caller can answer with an empty list -
+# the file's flat symbol list is never a correct answer after a dot.
+# ---
+# ws:     the workspace
+# an:     the analyzed document
+# alloc:  request allocator
+# id_raw: the raw JSON request id, consumed on success
+# prefix: the partial member name being typed
+# dot:    byte offset of the `.`
+# ret:    true when a member list was emitted and replied
+fun emit_member_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                            prefix: token.Span, dot: usize) bool {
+    if (dot == 0) { ret false; }
+    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
+    if (eid == id.EXPR_NIL) { ret false; }
+
+    # a module alias resolves through the symbol table; its target rides `slot`
+    if (an.rr.expr_resolved != nil && eid::u32 < an.rr.expr_count) {
+        val sid: res.SymbolId = an.rr.expr_resolved[eid];
+        if (sid != res.SYMBOL_NIL && sid < an.rr.symbol_count) {
+            val sym: *res.Symbol = ?an.rr.symbols[sid];
+            var mid: sess.ModuleId;
+            if (module_alias_target(sym, ?mid)) {
+                ret emit_module_members(ws, an, alloc, id_raw, prefix, mid);
+            }
+        }
+    }
+
+    ret emit_field_completions(ws, an, alloc, id_raw, prefix, eid);
+}
+
+# offer a module's public symbols
+fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                        prefix: token.Span, mid: sess.ModuleId) bool {
+    if (an.root == nil) { ret false; }
+    val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
+    if (!is_some[project.ModuleView](mvo)) { ret false; }
+    val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
+    if (mv.rr == nil) { ret false; }
+
+    var b: json.Buf = json.buf_init(alloc);
+    push_completion_head(?b, id_raw);
+
+    var emitted: usize = 0;
+    var i: u32 = 0;
+    for (i < mv.rr.symbol_count) {
+        val sym: *res.Symbol = ?mv.rr.symbols[i];
+        if ((sym.flags & res.SYM_FLAG_PUB) != 0 && sym.origin == mid) {
+            val no: Option[str] = intern.lookup(?an.root.s.interner, sym.name);
+            if (is_some[str](no)) {
+                val name: str = unwrap[str](no);
+                if (span_is_prefix_of(an.file, prefix, name) && !name_already_emitted(mv.rr, i, mid)) {
+                    push_completion_item(?b, name, features.lsp_completion_kind(sym.kind),
+                                         features.kind_label(sym.kind), nil, emitted > 0);
+                    emitted = emitted + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    push_completion_tail(?b, alloc, id_raw);
+    ret true;
+}
+
+# whether an earlier pub symbol of the same module already carries this name, so
+# a name bound more than once is offered once
+fun name_already_emitted(rr: *res.ResolveResult, sid: res.SymbolId, mid: sess.ModuleId) bool {
+    val target: intern.StrId = (?rr.symbols[sid]).name;
+    var i: u32 = 0;
+    for (i < sid::u32) {
+        val other: *res.Symbol = ?rr.symbols[i];
+        if (other.name == target && (other.flags & res.SYM_FLAG_PUB) != 0 && other.origin == mid) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# offer the fields of the record or union the receiver expression types to
+fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                           prefix: token.Span, eid: id.ExprId) bool {
+    if (an.root == nil || an.sr == nil) { ret false; }
+    val tid: type.TypeId = project.type_of(an.sr, eid);
+    val rso: Option[project.RecordSite] =
+        project.record_decl_in(ws, an.root, an.own, an.a, an.file, tid);
+    if (!is_some[project.RecordSite](rso)) { ret false; }
+    val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+
+    var b: json.Buf = json.buf_init(alloc);
+    push_completion_head(?b, id_raw);
+
+    var emitted: usize = 0;
+    var i: u32 = 0;
+    for (i < rs.fields_len) {
+        val tn: *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i];
+        val fname: str = positions.span_text(rs.file, tn.name, alloc);
+        if (fname != nil) {
+            if (span_is_prefix_of(an.file, prefix, fname)) {
+                val ftype: str = field_type_text(rs, tn, alloc);
+                push_completion_item(?b, fname, LSP_COMPLETION_FIELD, "field", ftype, emitted > 0);
+                if (ftype != nil) { json.free_str(ftype, alloc); }
+                emitted = emitted + 1;
+            }
+            json.free_str(fname, alloc);
+        }
+        i = i + 1;
+    }
+
+    push_completion_tail(?b, alloc, id_raw);
+    ret true;
+}
+
+# an empty CompletionList
+#
+# The same shape as a populated reply rather than a bare `[]`, so a client sees
+# one response type from this method whatever the cursor is on.
+fun reply_empty_completion(alloc: *Allocator, id_raw: str) {
+    var b: json.Buf = json.buf_init(alloc);
+    push_completion_head(?b, id_raw);
+    push_completion_tail(?b, alloc, id_raw);
+}
+
+# the response envelope every completion list shares
+fun push_completion_head(b: *json.Buf, id_raw: str) {
+    json.buf_push(b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(b, id_raw);
+    json.buf_push(b, ",\"result\":{\"isIncomplete\":false,\"items\":[");
+}
+
+# close the envelope, send it, and release the request id
+fun push_completion_tail(b: *json.Buf, alloc: *Allocator, id_raw: str) {
+    json.buf_push(b, "]}}");
+    val msg: str = json.buf_str(b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(b);
     json.free_str(id_raw, alloc);
+}
+
+# append one CompletionItem
+#
+# `detail` is what the client shows beside the label: a field's declared type
+# where there is one, otherwise the symbol's kind.
+fun push_completion_item(b: *json.Buf, label: str, kind: i64, kind_label: str, detail: str, comma: bool) {
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"label\":");
+    json.buf_push_quoted(b, label);
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    json.buf_push(b, ",\"detail\":");
+    if (detail != nil) { json.buf_push_quoted(b, detail); }
+    or                 { json.buf_push_quoted(b, kind_label); }
+    json.buf_push_byte(b, '}');
 }
 
 # whether symbol `sid` is a completion candidate AND the first
 # symbol with its name, so a name bound more than once is offered only once
-fun completion_first(an: Analyzed, sid: res.SymbolId) bool {
+fun completion_first(an: analysis.Analyzed, sid: res.SymbolId) bool {
     if (!features.completion_candidate(an.rr, sid)) { ret false; }
     val name: intern.StrId = an.rr.symbols[sid].name;
     var j: u32 = 0;
@@ -1769,238 +2051,17 @@ fun completion_first(an: Analyzed, sid: res.SymbolId) bool {
     ret true;
 }
 
-# render symbol `sid` as a CompletionItem, or nil
-fun completion_json(an: Analyzed, sid: res.SymbolId, alloc: *Allocator) str {
-    val sym: *res.Symbol = ?an.rr.symbols[sid];
-    val no: Option[str] = intern.lookup(an.interner, sym.name);
-    if (!is_some[str](no)) { ret nil; }
-    val qname: str = json.quote(unwrap[str](no), alloc);
-    if (qname == nil) { ret nil; }
 
-    val kind: i64 = features.lsp_completion_kind(sym.kind);
-    val kstr: str = json.format_i64(kind, alloc);
-    val qdetail: str = json.quote(features.kind_label(sym.kind), alloc);
 
-    val p1: str = "{\"label\":";
-    val p2: str = ",\"kind\":";
-    val p3: str = ",\"detail\":";
-    val p4: str = "}";
-    val total: usize = str_len(p1) + slen(qname) + str_len(p2) + slen(kstr) + str_len(p3) + slen(qdetail) + str_len(p4);
 
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) {
-        json.free_str(qname, alloc); json.free_str(kstr, alloc); json.free_str(qdetail, alloc);
-        ret nil;
-    }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, qname);
-    off = append(buf, off, p2);
-    off = append(buf, off, kstr);
-    off = append(buf, off, p3);
-    off = append(buf, off, qdetail);
-    off = append(buf, off, p4);
-    buf[off] = 0;
 
-    json.free_str(qname, alloc);
-    json.free_str(kstr, alloc);
-    json.free_str(qdetail, alloc);
-    ret buf::str;
-}
 
-# a Location object `{ uri, range }` for a span, or nil
-fun location_json(file: *src.SourceFile, uri: str, span: token.Span, alloc: *Allocator) str {
-    val quri: str = json.quote(uri, alloc);
-    if (quri == nil) { ret nil; }
-    val rng: str = range_json(positions.range_of(file, span), alloc);
 
-    val p1: str = "{\"uri\":";
-    val p2: str = ",\"range\":";
-    val p3: str = "}";
-    val total: usize = str_len(p1) + slen(quri) + str_len(p2) + slen(rng) + str_len(p3);
 
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(quri, alloc); json.free_str(rng, alloc); ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, quri);
-    off = append(buf, off, p2);
-    off = append(buf, off, rng);
-    off = append(buf, off, p3);
-    buf[off] = 0;
 
-    json.free_str(quri, alloc);
-    json.free_str(rng, alloc);
-    ret buf::str;
-}
 
-# a `{ start: {...}, end: {...} }` range object, or nil
-fun range_json(range: positions.LspRange, alloc: *Allocator) str {
-    val sl: str = json.format_usize(range.start_line, alloc);
-    val sc: str = json.format_usize(range.start_char, alloc);
-    val el: str = json.format_usize(range.end_line, alloc);
-    val ec: str = json.format_usize(range.end_char, alloc);
 
-    val p1: str = "{\"start\":{\"line\":";
-    val p2: str = ",\"character\":";
-    val p3: str = "},\"end\":{\"line\":";
-    val p4: str = ",\"character\":";
-    val p5: str = "}}";
-    val total: usize = str_len(p1) + slen(sl) + str_len(p2) + slen(sc) + str_len(p3) + slen(el) + str_len(p4) + slen(ec) + str_len(p5);
 
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { free4(sl, sc, el, ec, alloc); ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, sl);
-    off = append(buf, off, p2);
-    off = append(buf, off, sc);
-    off = append(buf, off, p3);
-    off = append(buf, off, el);
-    off = append(buf, off, p4);
-    off = append(buf, off, ec);
-    off = append(buf, off, p5);
-    buf[off] = 0;
 
-    free4(sl, sc, el, ec, alloc);
-    ret buf::str;
-}
 
-# the JSON length one Location entry adds (plus a separating comma when
-# it is not the first), without retaining the rendering
-fun loc_len(file: *src.SourceFile, uri: str, span: token.Span, alloc: *Allocator, index: usize) usize {
-    val loc: str = location_json(file, uri, span, alloc);
-    if (loc == nil) { ret 0; }
-    var n: usize = str_len(loc);
-    if (index > 0) { n = n + 1; }
-    json.free_str(loc, alloc);
-    ret n;
-}
 
-# write one Location entry (comma-separated) into `buf`, returning the
-# new offset
-fun put_loc(buf: *u8, off: usize, file: *src.SourceFile, uri: str, span: token.Span, alloc: *Allocator, index: usize) usize {
-    val loc: str = location_json(file, uri, span, alloc);
-    if (loc == nil) { ret off; }
-    var o: usize = off;
-    if (index > 0) { buf[o] = ','; o = o + 1; }
-    o = append(buf, o, loc);
-    json.free_str(loc, alloc);
-    ret o;
-}
-
-# the JSON length one TextEdit adds (plus a separating comma when not
-# first), without retaining the rendering
-fun edit_len(file: *src.SourceFile, span: token.Span, qname: str, alloc: *Allocator, index: usize) usize {
-    val ed: str = text_edit_json(file, span, qname, alloc);
-    if (ed == nil) { ret 0; }
-    var n: usize = str_len(ed);
-    if (index > 0) { n = n + 1; }
-    json.free_str(ed, alloc);
-    ret n;
-}
-
-# write one TextEdit entry (comma-separated) into `buf`
-fun put_edit(buf: *u8, off: usize, file: *src.SourceFile, span: token.Span, qname: str, alloc: *Allocator, index: usize) usize {
-    val ed: str = text_edit_json(file, span, qname, alloc);
-    if (ed == nil) { ret off; }
-    var o: usize = off;
-    if (index > 0) { buf[o] = ','; o = o + 1; }
-    o = append(buf, o, ed);
-    json.free_str(ed, alloc);
-    ret o;
-}
-
-# a `{ range, newText }` TextEdit replacing a span's range with
-# the already-quoted `qname`, or nil
-fun text_edit_json(file: *src.SourceFile, span: token.Span, qname: str, alloc: *Allocator) str {
-    val rng: str = range_json(positions.range_of(file, span), alloc);
-    if (rng == nil) { ret nil; }
-
-    val p1: str = "{\"range\":";
-    val p2: str = ",\"newText\":";
-    val p3: str = "}";
-    val total: usize = str_len(p1) + slen(rng) + str_len(p2) + slen(qname) + str_len(p3);
-
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { json.free_str(rng, alloc); ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, p1);
-    off = append(buf, off, rng);
-    off = append(buf, off, p2);
-    off = append(buf, off, qname);
-    off = append(buf, off, p3);
-    buf[off] = 0;
-
-    json.free_str(rng, alloc);
-    ret buf::str;
-}
-
-# send a `result: null` response for the request id
-fun reply_null(alloc: *Allocator, id_raw: str) {
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":null}";
-    send6(alloc, p1, id_raw, p2, nil, nil, nil, nil);
-    json.free_str(id_raw, alloc);
-}
-
-# send a `result: []` response for the request id
-fun reply_empty_array(alloc: *Allocator, id_raw: str) {
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":[]}";
-    send6(alloc, p1, id_raw, p2, nil, nil, nil, nil);
-    json.free_str(id_raw, alloc);
-}
-
-# send an empty WorkspaceEdit (`changes: {}`) for the id
-fun reply_empty_edit(alloc: *Allocator, id_raw: str) {
-    val p1: str = "{\"jsonrpc\":\"2.0\",\"id\":";
-    val p2: str = ",\"result\":{\"changes\":{}}}";
-    send6(alloc, p1, id_raw, p2, nil, nil, nil, nil);
-    json.free_str(id_raw, alloc);
-}
-
-# frame and send the concatenation of up to six fragments (nil skipped)
-fun send6(alloc: *Allocator, a: str, b: str, c: str, d: str, e: str, f: str, g: str) {
-    val total: usize = slen(a) + slen(b) + slen(c) + slen(d) + slen(e) + slen(f) + slen(g);
-    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
-    if (is_err[*u8, str](r)) { ret; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
-    var off: usize = 0;
-    off = append(buf, off, a);
-    off = append(buf, off, b);
-    off = append(buf, off, c);
-    off = append(buf, off, d);
-    off = append(buf, off, e);
-    off = append(buf, off, f);
-    off = append(buf, off, g);
-    buf[off] = 0;
-    transport.send_message(buf::str, alloc);
-    deallocate[u8](alloc, buf, total + 1);
-}
-
-# length of `s`, treating nil as 0
-fun slen(s: str) usize {
-    if (s == nil) { ret 0; }
-    ret str_len(s);
-}
-
-# copy `s` into `buf` at `offset`, returning the new offset
-fun append(buf: *u8, offset: usize, s: str) usize {
-    if (s == nil) { ret offset; }
-    val n: usize = str_len(s);
-    if (n > 0) { mem.raw_copy((buf::usize + offset)::ptr, s::ptr, n); }
-    ret offset + n;
-}
-
-# free four owned strings
-fun free4(a: str, b: str, c: str, d: str, alloc: *Allocator) {
-    json.free_str(a, alloc);
-    json.free_str(b, alloc);
-    json.free_str(c, alloc);
-    json.free_str(d, alloc);
-}

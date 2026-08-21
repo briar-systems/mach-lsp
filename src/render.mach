@@ -1,0 +1,243 @@
+# the LSP value emit layer: one spelling per protocol value
+#
+# Every feature answers with the same handful of LSP shapes - a Range, a
+# Location, a TextEdit, a response envelope - and each one used to be spelled
+# wherever it was needed. That produced two problems worth naming.
+#
+# The first is duplication: a Location was rendered by `location_json` for
+# definition, again inside `loc_len` to measure a references entry, and a third
+# time inside `put_loc` to write it. The second is the pattern that duplication
+# forced. A payload whose shape is data-dependent cannot be sized by summing
+# constants, so the emitters ran the whole traversal twice - once with the
+# output pointer nil to total lengths, once pointed at an exact allocation to
+# fill it - and the two passes had to agree exactly. When they did not, the
+# buffer was under-filled, `str_len` truncated the frame at the resulting NUL,
+# and the client saw a valid Content-Length over a body that stopped mid-token.
+# Silent, and shaped like a transport fault rather than a rendering one.
+#
+# `json.Buf` removes the sizing pass, so these are all single-traversal
+# appenders. A failed allocation latches on the buffer and `json.buf_str`
+# answers nil, so a response is either complete or absent - never truncated.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.Allocator;
+
+use src:   mach.lang.source;
+use token: mach.lang.fe.token;
+
+use json:      mls.json;
+use positions: mls.positions;
+use transport: mls.transport;
+
+# append an LSP Range
+# ---
+# b: output buffer
+# r: the range to emit
+pub fun range(b: *json.Buf, r: positions.LspRange) {
+    json.buf_push(b, "{\"start\":{\"line\":");
+    json.buf_push_usize(b, r.start_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, r.start_char);
+    json.buf_push(b, "},\"end\":{\"line\":");
+    json.buf_push_usize(b, r.end_line);
+    json.buf_push(b, ",\"character\":");
+    json.buf_push_usize(b, r.end_char);
+    json.buf_push(b, "}}");
+}
+
+# append an LSP Range for a byte span in `file`
+# ---
+# b:    output buffer
+# file: source file the span indexes
+# span: byte span to convert
+pub fun span_range(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
+    range(b, positions.range_of(file, span));
+}
+
+# append an LSP Location: a document URI and a range within it
+# ---
+# b:    output buffer
+# file: source file backing the span
+# uri:  document URI of `file`
+# span: byte span to report
+pub fun location(b: *json.Buf, file: *src.SourceFile, uri: str, span: token.Span) {
+    json.buf_push(b, "{\"uri\":");
+    json.buf_push_quoted(b, uri);
+    json.buf_push(b, ",\"range\":");
+    span_range(b, file, span);
+    json.buf_push_byte(b, '}');
+}
+
+# append an LSP TextEdit replacing `span` with `new_text`
+# ---
+# b:        output buffer
+# file:     source file backing the span
+# span:     byte span to replace
+# new_text: replacement text, quoted and escaped here
+pub fun text_edit(b: *json.Buf, file: *src.SourceFile, span: token.Span, new_text: str) {
+    json.buf_push(b, "{\"range\":");
+    span_range(b, file, span);
+    json.buf_push(b, ",\"newText\":");
+    json.buf_push_quoted(b, new_text);
+    json.buf_push_byte(b, '}');
+}
+
+# begin a successful JSON-RPC response, leaving `result` open for the caller
+#
+# `id_raw` is the request's id token, already spelled with its wire type.
+# ---
+# b:      output buffer
+# id_raw: the request id token
+pub fun result_begin(b: *json.Buf, id_raw: str) {
+    json.buf_push(b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(b, id_raw);
+    json.buf_push(b, ",\"result\":");
+}
+
+# close a response, frame and send it, then release the buffer and the id
+#
+# A buffer that latched an allocation failure sends nothing rather than a
+# partial frame; the request then goes unanswered, which the caller must avoid
+# by checking `json.buf_str` itself when it needs a guaranteed reply.
+# ---
+# b:      the buffer holding a complete response
+# alloc:  allocator backing the buffer and the id
+# id_raw: the request id token, released here
+pub fun send(b: *json.Buf, alloc: *Allocator, id_raw: str) {
+    json.buf_push_byte(b, '}');
+    val msg: str = json.buf_str(b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(b);
+    json.free_str(id_raw, alloc);
+}
+
+# reply with a bare `result` value already spelled as JSON text
+# ---
+# alloc:  request allocator
+# id_raw: the request id token, consumed
+# value:  the literal result text, e.g. `null` or `[]`
+pub fun reply_literal(alloc: *Allocator, id_raw: str, value: str) {
+    var b: json.Buf = json.buf_init(alloc);
+    result_begin(?b, id_raw);
+    json.buf_push(?b, value);
+    send(?b, alloc, id_raw);
+}
+
+# reply `null`, the LSP "nothing here" answer for a positional request
+pub fun reply_null(alloc: *Allocator, id_raw: str) {
+    reply_literal(alloc, id_raw, "null");
+}
+
+# reply with an empty array
+pub fun reply_empty_array(alloc: *Allocator, id_raw: str) {
+    reply_literal(alloc, id_raw, "[]");
+}
+
+# reply with a WorkspaceEdit that changes nothing
+#
+# An empty `changes` map rather than null: a rename that finds nothing to
+# rewrite has succeeded at renaming nothing, and null would read as an error.
+pub fun reply_empty_edit(alloc: *Allocator, id_raw: str) {
+    reply_literal(alloc, id_raw, "{\"changes\":{}}");
+}
+
+use page: std.allocator.page;
+use std.types.string.str_equals;
+
+# a SourceFile over `text` with a real line index
+#
+# `src.position` binary-searches `line_starts` and reads `line_starts[lo - 1]`,
+# so a stub without one is a nil dereference rather than a degenerate result.
+# `starts` must hold the byte offset of every line, `0` first.
+fun stub_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
+    var f: src.SourceFile;
+    f.path        = "stub.mach";
+    f.text        = text;
+    f.line_starts = starts;
+    f.line_len    = nlines;
+    ret f;
+}
+
+fun span_at(offset: usize, len: usize) token.Span {
+    var s: token.Span;
+    s.offset = offset;
+    s.len    = len;
+    ret s;
+}
+
+test "render: a range spells both endpoints" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: json.Buf = json.buf_init(?pa);
+    var r: positions.LspRange;
+    r.start_line = 2; r.start_char = 4; r.end_line = 2; r.end_char = 9;
+    range(?b, r);
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b),
+        "{\"start\":{\"line\":2,\"character\":4},\"end\":{\"line\":2,\"character\":9}}")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "render: a location carries an escaped uri" {
+    var pa: Allocator;
+    page.make(?pa);
+    var starts: [3]usize;
+    starts[0] = 0; starts[1] = 3; starts[2] = 6;
+    var f: src.SourceFile = stub_file("ab\ncd\n", ?starts[0], 3);
+    var b: json.Buf = json.buf_init(?pa);
+    location(?b, ?f, "file:///a b.mach", span_at(3, 2));
+    var fail: bool = false;
+    val got: str = json.buf_str(?b);
+    if (got == nil) { fail = true; }
+    or {
+        if (!str_equals(got,
+            "{\"uri\":\"file:///a b.mach\",\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":2}}}")) { fail = true; }
+    }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# newText is user-supplied and must survive the trip; the old hand-rolled
+# escaper replaced control bytes with `?`
+test "render: a text edit escapes its replacement" {
+    var pa: Allocator;
+    page.make(?pa);
+    var starts: [1]usize;
+    starts[0] = 0;
+    var f: src.SourceFile = stub_file("abcd", ?starts[0], 1);
+    var b: json.Buf = json.buf_init(?pa);
+    text_edit(?b, ?f, span_at(0, 2), "x\"y\nz");
+    var fail: bool = false;
+    val got: str = json.buf_str(?b);
+    if (got == nil) { fail = true; }
+    or {
+        if (!str_equals(got,
+            "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":2}},\"newText\":\"x\\\"y\\nz\"}")) { fail = true; }
+    }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+test "render: a response envelope preserves the id's wire type" {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: json.Buf = json.buf_init(?pa);
+    result_begin(?b, "\"abc\"");
+    json.buf_push(?b, "null");
+    json.buf_push_byte(?b, '}');
+    var fail: bool = false;
+    if (!str_equals(json.buf_str(?b),
+        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":null}")) { fail = true; }
+    json.buf_dnit(?b);
+    if (fail) { ret 1; }
+    ret 0;
+}

@@ -1,0 +1,139 @@
+# resolving a positional request to the document view that answers it
+#
+# Every feature that pivots on a cursor needs the same two things first: the
+# compiler-owned analysis of the document the request names, and the byte offset
+# its (line, character) position denotes. Both are shared here so a new feature
+# binds to one contract rather than reaching into another feature's internals.
+#
+# A document inside a project resolves through its root's retained snapshot; one
+# outside any project falls back to the single-buffer editor API, where cross
+# module references are unresolved by construction. Callers that need project
+# scope test `root` for nil rather than assuming it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+
+use sess:   mach.lang.session;
+use src:    mach.lang.source;
+use intern: mach.lang.intern;
+use ast:    mach.lang.fe.ast;
+use res:    mach.lang.fe.resolve;
+use sema:   mach.lang.fe.sema;
+use editor: mach.lang.editor;
+use sj:     std.data.json;
+
+use json:      mls.json;
+use positions: mls.positions;
+use project:   mls.project;
+use documents: mls.documents;
+
+# one document's analysis, as a request sees it
+# ---
+# interner: interner the symbol names resolve against
+# file:     source file backing every span
+# sr:       semantic result, or nil when the document has none
+# a:        parsed Ast
+# rr:       resolve side tables
+# own:      the document's own module id
+# root:     the project root that governs it, or nil for a standalone buffer
+pub rec Analyzed {
+    interner: *intern.Interner;
+    file:     *src.SourceFile;
+    sr:       *sema.SemaResult;
+    a:        *ast.Ast;
+    rr:       *res.ResolveResult;
+    own:      sess.ModuleId;
+    root:     *project.Root;
+}
+
+# resolve `uri` to its current analysis
+#
+# Prefers the project snapshot, which is what makes cross-module references
+# resolvable; falls back to the isolated editor analysis only for a document
+# that belongs to no project, never as a way to paper over a failed load.
+# ---
+# ws:   the workspace
+# es:   the standalone editor session
+# docs: the open-document registry
+# uri:  the requested document
+# out:  receives the analysis on success
+# ret:  true when the document could be analyzed
+pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store, uri: str, out: *Analyzed) bool {
+    if (uri == nil) { ret false; }
+    val doc: *documents.Document = documents.find(docs, uri);
+    if (doc == nil) { ret false; }
+
+    val vr: Result[project.DocumentView, str] = project.document_view(ws, doc);
+    if (!is_err[project.DocumentView, str](vr)) {
+        val v: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        out.rr       = v.rr;
+        out.a        = v.a;
+        out.sr       = v.sr;
+        out.interner = v.interner;
+        out.file     = v.file;
+        out.root     = v.root;
+        out.own      = v.module;
+        ret true;
+    }
+    if (project.has_project(ws, uri)) { ret false; }
+
+    val rr: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
+    if (is_err[*res.ResolveResult, str](rr)) { ret false; }
+    out.rr = unwrap_ok[*res.ResolveResult, str](rr);
+    out.a = editor.ast_of(es, doc.file_id);
+    if (out.a == nil) { ret false; }
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (!is_some[*src.SourceFile](fo)) { ret false; }
+    out.sr = nil;
+    val sr: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
+    if (!is_err[*sema.SemaResult, str](sr)) { out.sr = unwrap_ok[*sema.SemaResult, str](sr); }
+    out.interner = ?es.s.interner;
+    out.file = unwrap[*src.SourceFile](fo);
+    out.root = nil;
+    out.own = doc.file_id::sess.ModuleId;
+    ret true;
+}
+
+# analyze the requested document and convert its cursor position to a byte
+# offset, or none when the document is unknown, unanalyzable, or the position
+# falls outside it
+# ---
+# ws:     the workspace
+# es:     the standalone editor session
+# docs:   the open-document registry
+# params: the request's params object, holding `position`
+# uri:    the requested document
+# out:    receives the analysis on success
+# ret:    the cursor's byte offset, or none
+pub fun locate(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store,
+               params: *sj.Value, uri: str, out: *Analyzed) Option[usize] {
+    if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
+    ret offset_of(params, out.file);
+}
+
+# the byte offset denoted by a request's `position`, or none when it is absent
+# or outside the file
+# ---
+# params: the request's params object
+# file:   the file the position indexes
+# ret:    the byte offset, or none
+pub fun offset_of(params: *sj.Value, file: *src.SourceFile) Option[usize] {
+    val pos: *sj.Value = json.member(params, "position");
+    val line: i64 = json.number(json.member(pos, "line"), -1);
+    val ch:   i64 = json.number(json.member(pos, "character"), -1);
+    if (line < 0 || ch < 0) { ret none[usize](); }
+    ret positions.offset_at(file, line::usize, ch::usize);
+}

@@ -189,6 +189,28 @@ pub fun buf_push_i64(b: *Buf, value: i64) {
     buf_push_usize(b, value::usize);
 }
 
+# bytes written so far, as a mark for `buf_rewind`
+# ---
+# b:   the buffer
+# ret: the current length
+pub fun buf_len(b: *Buf) usize {
+    ret b.len;
+}
+
+# discard everything written after `mark`
+#
+# What lets a single-pass emitter speculate. A payload whose entries are only
+# known to be empty once walked - a rename group for a file that turns out to
+# contribute no edit - can open the entry, walk, and roll back, instead of
+# walking once to decide and again to write. A failed buffer stays failed.
+# ---
+# b:    the buffer
+# mark: a length previously returned by `buf_len`
+pub fun buf_rewind(b: *Buf, mark: usize) {
+    if (mark > b.len) { ret; }
+    b.len = mark;
+}
+
 # the buffer's contents as a nul-terminated string BORROWED from the buffer -
 # invalidated by any later push and freed by `buf_dnit`. nil when a push failed
 # to allocate, so one check here covers every push

@@ -1,0 +1,320 @@
+# semantic tokens: classifying from meaning rather than spelling
+#
+# Mach is a language whose meaning is not visible in its syntax. An identifier
+# may be a type, a function, a module alias, a parameter, a field, or a comptime
+# value, and nothing about how it is written says which. A regex highlighter
+# cannot tell them apart; the resolved side tables can, and that is the whole
+# reason this feature is worth more here than in a language where `Foo` is
+# obviously a type because it is capitalised.
+#
+# The wire format is a flat array of five-integer groups, each relative to the
+# previous token, which makes two properties load-bearing: the tokens must be
+# sorted by position, and they must not overlap. Both are enforced here after
+# collection rather than assumed of the walks, because the walks visit decls,
+# expressions, types, and import paths independently and in no particular order.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.unwrap;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use sort: std.collections.sort;
+
+use src:   mach.lang.source;
+use token: mach.lang.fe.token;
+use ast:   mach.lang.fe.ast;
+use id:    mach.lang.fe.ast.id;
+use decl:  mach.lang.fe.ast.decl;
+use res:   mach.lang.fe.resolve;
+use editor: mach.lang.editor;
+use sj:    std.data.json;
+
+use json:      mls.json;
+use render:    mls.render;
+use project:   mls.project;
+use features:  mls.features;
+use positions: mls.positions;
+use documents: mls.documents;
+use analysis:  mls.analysis;
+
+# the legend, in the order the client is told about it at initialize. an index
+# into this list is what a token's `tokenType` field carries
+pub val TOKEN_TYPES: str = "\"namespace\",\"type\",\"function\",\"variable\",\"parameter\",\"property\",\"typeParameter\"";
+pub val TOKEN_MODIFIERS: str = "\"declaration\",\"readonly\"";
+
+val T_NAMESPACE:      i64 = 0;
+val T_TYPE:           i64 = 1;
+val T_FUNCTION:       i64 = 2;
+val T_VARIABLE:       i64 = 3;
+val T_PARAMETER:      i64 = 4;
+val T_PROPERTY:       i64 = 5;
+val T_TYPE_PARAMETER: i64 = 6;
+
+val M_NONE:        i64 = 0;
+val M_DECLARATION: i64 = 1;
+val M_READONLY:    i64 = 2;
+
+# most tokens returned for one document
+val MAX_TOKENS: usize = 65536;
+
+# one classified span, before delta encoding
+rec Tok {
+    offset: usize;
+    len:    usize;
+    kind:   i64;
+    mods:   i64;
+}
+
+# answer textDocument/semanticTokens/full
+pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+                        docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(req_id, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an: analysis.Analyzed;
+    if (!analysis.analyze(ws, es, docs, uri, ?an)) { reply_empty(alloc, id_raw); ret; }
+
+    val ta: Result[*Tok, str] = allocate[Tok](alloc, MAX_TOKENS);
+    if (is_err[*Tok, str](ta)) { reply_empty(alloc, id_raw); ret; }
+    val toks: *Tok = unwrap_ok[*Tok, str](ta);
+
+    var n: usize = collect(an, toks, MAX_TOKENS);
+    if (n > 1) {
+        sort.sort[Tok](toks, n, by_offset);
+        n = drop_overlaps(toks, n);
+    }
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push(?b, "{\"data\":[");
+    encode(?b, an.file, toks, n);
+    json.buf_push(?b, "]}");
+    render.send(?b, alloc, id_raw);
+
+    deallocate[Tok](alloc, toks, MAX_TOKENS);
+}
+
+# gather every classifiable span in the buffer
+#
+# The four walks are independent: a declaration's own name comes from the decl
+# table, a reference from the expression or type side tables, and an import leaf
+# from the declaration's path. Nothing orders them, which is why the caller
+# sorts.
+fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
+    var n: usize = 0;
+
+    var di: usize = 0;
+    for (di < an.a.decl_len && n < cap) {
+        val d_opt: Option[*decl.Decl] = ast.get_decl(an.a, di::id.DeclId);
+        if (is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+            val nso: Option[token.Span] = features.decl_name_span(d);
+            if (is_some[token.Span](nso)) {
+                n = push(out, n, cap, unwrap[token.Span](nso),
+                         decl_token_type(d.kind), M_DECLARATION);
+            }
+            n = collect_members(an, d, out, n, cap);
+        }
+        di = di + 1;
+    }
+
+    var ei: usize = 0;
+    for (ei < an.a.expr_len && n < cap) {
+        val so: Option[res.SymbolId] = expr_symbol(an, ei::id.ExprId);
+        if (is_some[res.SymbolId](so)) {
+            val sid: res.SymbolId = unwrap[res.SymbolId](so);
+            val spo: Option[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
+            if (is_some[token.Span](spo)) {
+                n = push(out, n, cap, unwrap[token.Span](spo), symbol_token_type(an, sid), M_NONE);
+            }
+        }
+        ei = ei + 1;
+    }
+
+    var ti: usize = 0;
+    for (ti < an.a.type_len && n < cap) {
+        val so: Option[res.SymbolId] = type_symbol(an, ti::id.TypeId);
+        if (is_some[res.SymbolId](so)) {
+            val sid: res.SymbolId = unwrap[res.SymbolId](so);
+            val spo: Option[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
+            if (is_some[token.Span](spo)) {
+                n = push(out, n, cap, unwrap[token.Span](spo), symbol_token_type(an, sid), M_NONE);
+            }
+        }
+        ti = ti + 1;
+    }
+
+    ret n;
+}
+
+# a declaration's own members: record fields, union variants, parameters, and
+# generic parameters, which no side table records as references
+fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usize, cap: usize) usize {
+    var n: usize = count;
+    var fields_start: u32 = 0;
+    var fields_len:   u32 = 0;
+    var gen_start:    u32 = 0;
+    var gen_len:      u32 = 0;
+    var member_type:  i64 = T_PROPERTY;
+
+    if (d.kind == decl.DECL_KIND_REC) {
+        fields_start = d.data.rec_.fields_start; fields_len = d.data.rec_.fields_len;
+        gen_start = d.data.rec_.generics_start;  gen_len   = d.data.rec_.generics_len;
+    }
+    or (d.kind == decl.DECL_KIND_UNI) {
+        fields_start = d.data.uni_.fields_start; fields_len = d.data.uni_.fields_len;
+        gen_start = d.data.uni_.generics_start;  gen_len   = d.data.uni_.generics_len;
+    }
+    or (d.kind == decl.DECL_KIND_FUN) {
+        fields_start = d.data.fun_.params_start; fields_len = d.data.fun_.params_len;
+        gen_start = d.data.fun_.generics_start;  gen_len   = d.data.fun_.generics_len;
+        member_type  = T_PARAMETER;
+    }
+    or { ret n; }
+
+    var g: u32 = 0;
+    for (g < gen_len && n < cap) {
+        if (an.a.generic_names != nil) {
+            n = push(out, n, cap, an.a.generic_names[(gen_start + g)::usize],
+                     T_TYPE_PARAMETER, M_DECLARATION);
+        }
+        g = g + 1;
+    }
+    var f: u32 = 0;
+    for (f < fields_len && n < cap) {
+        if (an.a.typed_names != nil) {
+            val tn: *decl.TypedName = ?an.a.typed_names[(fields_start + f)::usize];
+            n = push(out, n, cap, tn.name, member_type, M_DECLARATION);
+        }
+        f = f + 1;
+    }
+    ret n;
+}
+
+fun expr_symbol(an: analysis.Analyzed, eid: id.ExprId) Option[res.SymbolId] {
+    if (an.rr.expr_resolved == nil || eid::u32 >= an.rr.expr_count) { ret none_sym(); }
+    val sid: res.SymbolId = an.rr.expr_resolved[eid];
+    if (sid == res.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
+    ret some_sym(sid);
+}
+
+fun type_symbol(an: analysis.Analyzed, tid: id.TypeId) Option[res.SymbolId] {
+    if (an.rr.type_resolved == nil || tid::u32 >= an.rr.type_count) { ret none_sym(); }
+    val sid: res.SymbolId = an.rr.type_resolved[tid];
+    if (sid == res.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
+    ret some_sym(sid);
+}
+
+fun some_sym(s: res.SymbolId) Option[res.SymbolId] { ret some[res.SymbolId](s); }
+fun none_sym() Option[res.SymbolId] { ret none[res.SymbolId](); }
+
+# the legend index for a resolved symbol
+fun symbol_token_type(an: analysis.Analyzed, sid: res.SymbolId) i64 {
+    val sym: *res.Symbol = ?an.rr.symbols[sid];
+    if (sym.kind == res.SYM_FUN)     { ret T_FUNCTION; }
+    if (sym.kind == res.SYM_REC)     { ret T_TYPE; }
+    if (sym.kind == res.SYM_UNI)     { ret T_TYPE; }
+    if (sym.kind == res.SYM_DEF)     { ret T_TYPE; }
+    if (sym.kind == res.SYM_PRIM)    { ret T_TYPE; }
+    if (sym.kind == res.SYM_VECTOR)  { ret T_TYPE; }
+    if (sym.kind == res.SYM_PARAM)   { ret T_PARAMETER; }
+    if (sym.kind == res.SYM_GENERIC) { ret T_TYPE_PARAMETER; }
+    if (sym.kind == res.SYM_USE)     { ret T_NAMESPACE; }
+    ret T_VARIABLE;
+}
+
+# the legend index for a declaration kind
+fun decl_token_type(kind: decl.DeclKind) i64 {
+    if (kind == decl.DECL_KIND_FUN) { ret T_FUNCTION; }
+    if (kind == decl.DECL_KIND_REC) { ret T_TYPE; }
+    if (kind == decl.DECL_KIND_UNI) { ret T_TYPE; }
+    if (kind == decl.DECL_KIND_DEF) { ret T_TYPE; }
+    ret T_VARIABLE;
+}
+
+fun push(out: *Tok, count: usize, cap: usize, span: token.Span, kind: i64, mods: i64) usize {
+    if (count >= cap || span.len == 0) { ret count; }
+    out[count].offset = span.offset;
+    out[count].len    = span.len;
+    out[count].kind   = kind;
+    out[count].mods   = mods;
+    ret count + 1;
+}
+
+fun by_offset(a: *Tok, b: *Tok) i64 {
+    if (a.offset < b.offset) { ret -1; }
+    if (a.offset > b.offset) { ret 1; }
+    ret 0;
+}
+
+# discard tokens that start inside the previous one
+#
+# The walks can classify the same span twice - a declaration's name is both a
+# decl entry and, for some kinds, a reference - and the wire format has no way
+# to express an overlap. The first classification wins, which after sorting is
+# the earlier-starting and therefore outer one.
+fun drop_overlaps(toks: *Tok, n: usize) usize {
+    var w: usize = 1;
+    var i: usize = 1;
+    for (i < n) {
+        val prev_end: usize = toks[w - 1].offset + toks[w - 1].len;
+        if (toks[i].offset >= prev_end) {
+            toks[w] = toks[i];
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    ret w;
+}
+
+# emit the delta-encoded five-integer groups
+#
+# Each token is relative to the previous: line delta, then character delta
+# within a line or absolute character when the line changed.
+fun encode(b: *json.Buf, file: *src.SourceFile, toks: *Tok, n: usize) {
+    var prev_line: usize = 0;
+    var prev_char: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        var span: token.Span;
+        span.offset = toks[i].offset;
+        span.len    = toks[i].len;
+        val r: positions.LspRange = positions.range_of(file, span);
+
+        # a token the conversion split across lines cannot be expressed as a
+        # single length, so it is dropped rather than encoded wrong
+        if (r.end_line == r.start_line) {
+            if (i > 0) { json.buf_push_byte(b, ','); }
+            json.buf_push_usize(b, r.start_line - prev_line);
+            json.buf_push_byte(b, ',');
+            if (r.start_line == prev_line) { json.buf_push_usize(b, r.start_char - prev_char); }
+            or                             { json.buf_push_usize(b, r.start_char); }
+            json.buf_push_byte(b, ',');
+            json.buf_push_usize(b, r.end_char - r.start_char);
+            json.buf_push_byte(b, ',');
+            json.buf_push_i64(b, toks[i].kind);
+            json.buf_push_byte(b, ',');
+            json.buf_push_i64(b, toks[i].mods);
+            prev_line = r.start_line;
+            prev_char = r.start_char;
+        }
+        i = i + 1;
+    }
+}
+
+fun reply_empty(alloc: *Allocator, id_raw: str) {
+    render.reply_literal(alloc, id_raw, "{\"data\":[]}");
+}

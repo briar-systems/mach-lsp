@@ -1,0 +1,209 @@
+# workspace-wide symbol search
+#
+# Every other navigation feature starts from a cursor: you must already be
+# looking at the name to ask about it. `workspace/symbol` is the one that does
+# not, which makes it the only way to reach a declaration you have not opened.
+#
+# The search is over what is already loaded. Every root's retained snapshot
+# holds each module's parsed Ast and resolve tables, so a query is a walk over
+# memory rather than a build; a root that has never been analysed is skipped
+# rather than loaded, because indexing a workspace on the first keystroke is the
+# cost #95 was about. That makes the result set depend on what has been opened,
+# which is a real limitation and the reason a syntax-only background index is
+# worth considering later.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use std.allocator.Allocator;
+
+use sess:   mach.lang.session;
+use src:    mach.lang.source;
+use intern: mach.lang.intern;
+use res:    mach.lang.fe.resolve;
+use token:  mach.lang.fe.token;
+
+use json:      mls.json;
+use render:    mls.render;
+use project:   mls.project;
+use features:  mls.features;
+use strutil:   std.text.string;
+
+# most matches returned for one query
+#
+# A bound, not a truncation policy: a query matching more than this is nearly
+# always too short to be useful, and the client re-queries as the user types.
+val MAX_RESULTS: usize = 256;
+
+# answer workspace/symbol over every loaded root
+# ---
+# ws:     the workspace
+# alloc:  request allocator
+# id_raw: the raw JSON request id, consumed here
+# query:  the client's query string; empty matches nothing
+pub fun symbols(ws: *project.Workspace, alloc: *Allocator, id_raw: str, query: str) {
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+
+    # emit best matches first: a name that STARTS with the query, then one whose
+    # word starts with it (`push` in `buf_push`), then an interior hit. clients
+    # re-rank, but they cannot recover an ordering from a list that was
+    # truncated at MAX_RESULTS before the good matches were reached
+    var emitted: usize = 0;
+    if (query != nil && str_len(query) > 0) {
+        var tier: u8 = MATCH_PREFIX;
+        for (tier <= MATCH_INTERIOR && emitted < MAX_RESULTS) {
+            var ri: u32 = 0;
+            for (ri < project.root_count(ws) && emitted < MAX_RESULTS) {
+                val root: *project.Root = project.root_at(ws, ri);
+                if (project.root_is_loaded(root)) {
+                    emitted = push_root_symbols(?b, ws, root, query, tier, emitted);
+                }
+                ri = ri + 1;
+            }
+            tier = tier + 1;
+        }
+    }
+
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# append every matching symbol declared in `root`, returning the new count
+fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
+                      query: str, tier: u8, start_count: usize) usize {
+    var emitted: usize = start_count;
+    val n: u32 = project.module_count(root);
+    var mi: u32 = 0;
+    for (mi < n && emitted < MAX_RESULTS) {
+        val mid: sess.ModuleId = mi::sess.ModuleId;
+        val mvo: Option[project.ModuleView] = project.module_view(ws, root, mid);
+        if (is_some[project.ModuleView](mvo)) {
+            val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
+            if (mv.rr != nil && mv.a != nil) {
+                val uri: str = project.module_uri(ws, root, mid);
+                if (uri != nil) {
+                    val fqn: str = project.module_fqn(ws, root, mid);
+                    emitted = push_module_symbols(b, ws, root, mid, mv, uri, fqn, query, tier, emitted);
+                    strutil.str_free(ws.alloc, uri);
+                }
+            }
+        }
+        mi = mi + 1;
+    }
+    ret emitted;
+}
+
+# append every matching symbol `mid` declares, returning the new count
+fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
+                        mid: sess.ModuleId, mv: project.ModuleView, uri: str, fqn: str,
+                        query: str, tier: u8, start_count: usize) usize {
+    var emitted: usize = start_count;
+    var i: u32 = 0;
+    for (i < mv.rr.symbol_count && emitted < MAX_RESULTS) {
+        val sym: *res.Symbol = ?mv.rr.symbols[i];
+        # only declarations this module owns: an imported symbol is reported by
+        # the module that declares it, so a name appears once per declaration
+        # rather than once per importer
+        if (sym.origin == mid && features.completion_candidate(mv.rr, i)) {
+            val no: Option[str] = intern.lookup(?root.s.interner, sym.name);
+            if (is_some[str](no)) {
+                val name: str = unwrap[str](no);
+                if (match_tier(query, name) == tier) {
+                    val spo: Option[token.Span] = features.decl_name_span_of(mv.a, sym);
+                    if (is_some[token.Span](spo)) {
+                        push_symbol(b, mv.file, uri, unwrap[token.Span](spo), name,
+                                    features.lsp_symbol_kind(sym.kind), fqn, emitted > 0);
+                        emitted = emitted + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret emitted;
+}
+
+# append one SymbolInformation
+#
+# `containerName` carries the declaring module's FQN, which is what makes two
+# identically-named symbols distinguishable - and roots with colliding FQNs are
+# explicitly supported, so this is not cosmetic.
+fun push_symbol(b: *json.Buf, file: *src.SourceFile, uri: str, span: token.Span,
+                name: str, kind: i64, container: str, comma: bool) {
+    if (comma) { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"name\":");
+    json.buf_push_quoted(b, name);
+    json.buf_push(b, ",\"kind\":");
+    json.buf_push_i64(b, kind);
+    if (container != nil) {
+        json.buf_push(b, ",\"containerName\":");
+        json.buf_push_quoted(b, container);
+    }
+    json.buf_push(b, ",\"location\":");
+    render.location(b, file, uri, span);
+    json.buf_push_byte(b, '}');
+}
+
+# how well `name` matches `query`, case-insensitively
+#
+# Substring rather than prefix-only, because a Mach name is commonly reached by
+# its tail (`push` for `buf_push_quoted`). But an interior hit is much weaker
+# than a leading one - `read_` occurs inside `thread_spawn` - so the position of
+# the hit becomes its rank rather than being discarded.
+val MATCH_PREFIX:   u8 = 0;
+val MATCH_WORD:     u8 = 1;
+val MATCH_INTERIOR: u8 = 2;
+val MATCH_NONE:     u8 = 3;
+
+fun match_tier(query: str, name: str) u8 {
+    val qn: usize = str_len(query);
+    val nn: usize = str_len(name);
+    if (qn == 0 || qn > nn) { ret MATCH_NONE; }
+    var start: usize = 0;
+    for (start + qn <= nn) {
+        var i: usize = 0;
+        var same: bool = true;
+        for (i < qn && same) {
+            if (lower(name[start + i]) != lower(query[i])) { same = false; }
+            i = i + 1;
+        }
+        if (same) {
+            if (start == 0) { ret MATCH_PREFIX; }
+            if (name[start - 1] == '_') { ret MATCH_WORD; }
+            ret MATCH_INTERIOR;
+        }
+        start = start + 1;
+    }
+    ret MATCH_NONE;
+}
+
+# ASCII lowercase; identifiers are ASCII in Mach
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+test "workspace: match rank prefers leading over interior hits" {
+    var fail: bool = false;
+    if (match_tier("json", "json_buf_push") != MATCH_PREFIX)   { fail = true; }
+    if (match_tier("JSON", "json_buf_push") != MATCH_PREFIX)   { fail = true; }
+    if (match_tier("buf",  "json_buf_push") != MATCH_WORD)     { fail = true; }
+    if (match_tier("push", "json_buf_push") != MATCH_WORD)     { fail = true; }
+    if (match_tier("uf",   "json_buf_push") != MATCH_INTERIOR) { fail = true; }
+    # the case that made raw substring matching noisy
+    if (match_tier("read_", "thread_spawn") != MATCH_INTERIOR) { fail = true; }
+    if (match_tier("zzz", "json_buf_push")  != MATCH_NONE)     { fail = true; }
+    if (match_tier("", "anything")          != MATCH_NONE)     { fail = true; }
+    if (match_tier("toolong", "short")      != MATCH_NONE)     { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}

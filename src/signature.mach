@@ -1,0 +1,314 @@
+# parameter hints for the call being written
+#
+# This is the one feature that runs almost exclusively over source that does not
+# parse. It fires the moment `(` is typed and again after every comma, when the
+# argument list is by definition incomplete, so the enclosing call cannot be
+# located by walking the Ast for a call node - there may not be one yet.
+#
+# The call is found by scanning the text backwards from the cursor for the
+# innermost unclosed `(`, tracking nesting and skipping string and character
+# literals so a paren inside `"f("` does not open a call. The identifier before
+# that paren is the callee, and it resolves through the ordinary symbol pivot;
+# commas at that same nesting depth give the active parameter.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.some;
+use std.types.option.none;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use std.allocator.Allocator;
+
+use src:   mach.lang.source;
+use token: mach.lang.fe.token;
+use ast:   mach.lang.fe.ast;
+use id:    mach.lang.fe.ast.id;
+use decl:  mach.lang.fe.ast.decl;
+use atype: mach.lang.fe.ast.type;
+use res:   mach.lang.fe.resolve;
+use editor: mach.lang.editor;
+use sj:    std.data.json;
+
+use json:      mls.json;
+use render:    mls.render;
+use project:   mls.project;
+use features:  mls.features;
+use positions: mls.positions;
+use documents: mls.documents;
+use analysis:  mls.analysis;
+
+# the call the cursor sits inside
+# ---
+# callee_offset: byte offset of a character within the callee identifier
+# active:        zero-based index of the argument being written
+rec CallSite {
+    callee_offset: usize;
+    active:        usize;
+}
+
+# answer textDocument/signatureHelp for the call surrounding the cursor
+pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+                       docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(req_id, alloc);
+    if (id_raw == nil) { ret; }
+
+    var an: analysis.Analyzed;
+    val off_o: Option[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
+    val offset: usize = unwrap[usize](off_o);
+
+    val co: Option[CallSite] = enclosing_call(an.file, offset);
+    if (!is_some[CallSite](co)) { render.reply_null(alloc, id_raw); ret; }
+    val call: CallSite = unwrap[CallSite](co);
+
+    val ro: Option[features.SymbolRef] =
+        features.ref_at(an.a, an.rr, an.own, an.file, call.callee_offset);
+    if (!is_some[features.SymbolRef](ro)) { render.reply_null(alloc, id_raw); ret; }
+    val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
+
+    val so: Option[*res.Symbol] = features.symbol(an.rr, sr.sym_id);
+    if (!is_some[*res.Symbol](so)) { render.reply_null(alloc, id_raw); ret; }
+    val sym: *res.Symbol = unwrap[*res.Symbol](so);
+
+    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
+    if (!is_some[project.Site](site_o)) { render.reply_null(alloc, id_raw); ret; }
+    var site: project.Site = unwrap[project.Site](site_o);
+
+    val d_opt: Option[*decl.Decl] = ast.get_decl(site.a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) {
+        project.free_site(ws, ?site);
+        render.reply_null(alloc, id_raw); ret;
+    }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN) {
+        project.free_site(ws, ?site);
+        render.reply_null(alloc, id_raw); ret;
+    }
+
+    emit(alloc, id_raw, site.a, site.file, d, call.active);
+    project.free_site(ws, ?site);
+}
+
+# send the SignatureHelp for function declaration `d`
+fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: *src.SourceFile,
+         d: *decl.Decl, active: usize) {
+    val n: u32 = d.data.fun_.params_len;
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push(?b, "{\"signatures\":[{\"label\":");
+
+    # the label must be one string, and each parameter's label is a byte range
+    # into it, so the offsets are recorded while it is built rather than
+    # recomputed against a finished string
+    var starts: [64]usize;
+    var ends:   [64]usize;
+    var label: json.Buf = json.buf_init(alloc);
+    val name: str = decl_name_text(file, d, alloc);
+    if (name != nil) { json.buf_push(?label, name); }
+    json.buf_push_byte(?label, '(');
+    var i: u32 = 0;
+    for (i < n) {
+        if (i > 0) { json.buf_push(?label, ", "); }
+        if (i::usize < 64) { starts[i::usize] = json.buf_len(?label); }
+        push_param_text(?label, a, file, d.data.fun_.params_start + i, alloc);
+        if (i::usize < 64) { ends[i::usize] = json.buf_len(?label); }
+        i = i + 1;
+    }
+    json.buf_push_byte(?label, ')');
+    val ret_text: str = return_type_text(a, file, d, alloc);
+    if (ret_text != nil) {
+        json.buf_push_byte(?label, ' ');
+        json.buf_push(?label, ret_text);
+        json.free_str(ret_text, alloc);
+    }
+    if (name != nil) { json.free_str(name, alloc); }
+
+    val label_text: str = json.buf_str(?label);
+    json.buf_push_quoted(?b, label_text);
+
+    json.buf_push(?b, ",\"parameters\":[");
+    var p: u32 = 0;
+    for (p < n) {
+        if (p > 0) { json.buf_push_byte(?b, ','); }
+        json.buf_push(?b, "{\"label\":[");
+        if (p::usize < 64) {
+            json.buf_push_usize(?b, starts[p::usize]);
+            json.buf_push_byte(?b, ',');
+            json.buf_push_usize(?b, ends[p::usize]);
+        }
+        or { json.buf_push(?b, "0,0"); }
+        json.buf_push(?b, "]}");
+        p = p + 1;
+    }
+    json.buf_push(?b, "]}],\"activeSignature\":0,\"activeParameter\":");
+
+    # a cursor past the last parameter clamps rather than pointing at nothing,
+    # which is what a variadic or an over-long argument list produces
+    var act: usize = active;
+    if (n == 0) { act = 0; }
+    or (act >= n::usize) { act = (n - 1)::usize; }
+    json.buf_push_usize(?b, act);
+    json.buf_push_byte(?b, '}');
+
+    json.buf_dnit(?label);
+    render.send(?b, alloc, id_raw);
+}
+
+# `name: Type` for the parameter in `typed_names` slot `slot`
+fun push_param_text(b: *json.Buf, a: *ast.Ast, file: *src.SourceFile, slot: u32, alloc: *Allocator) {
+    if (a.typed_names == nil) { ret; }
+    val tn: *decl.TypedName = ?a.typed_names[slot::usize];
+    val pname: str = positions.span_text(file, tn.name, alloc);
+    if (pname != nil) {
+        json.buf_push(b, pname);
+        json.free_str(pname, alloc);
+    }
+    if (tn.ty != id.TYPE_NIL) {
+        val to: Option[*atype.Type] = ast.get_type(a, tn.ty);
+        if (is_some[*atype.Type](to)) {
+            val tt: str = positions.span_text(file, unwrap[*atype.Type](to).span, alloc);
+            if (tt != nil) {
+                json.buf_push(b, ": ");
+                json.buf_push(b, tt);
+                json.free_str(tt, alloc);
+            }
+        }
+    }
+}
+
+# the declared return type as written, or nil when there is none
+fun return_type_text(a: *ast.Ast, file: *src.SourceFile, d: *decl.Decl, alloc: *Allocator) str {
+    if (d.data.fun_.return_type == id.TYPE_NIL) { ret nil; }
+    val to: Option[*atype.Type] = ast.get_type(a, d.data.fun_.return_type);
+    if (!is_some[*atype.Type](to)) { ret nil; }
+    ret positions.span_text(file, unwrap[*atype.Type](to).span, alloc);
+}
+
+# the function's own name as written
+fun decl_name_text(file: *src.SourceFile, d: *decl.Decl, alloc: *Allocator) str {
+    val nso: Option[token.Span] = features.decl_name_span(d);
+    if (!is_some[token.Span](nso)) { ret nil; }
+    ret positions.span_text(file, unwrap[token.Span](nso), alloc);
+}
+
+# find the call the cursor is inside by scanning back for an unclosed `(`
+#
+# Text rather than Ast because this request exists while the source does not
+# parse. String and character literals are skipped so their contents cannot open
+# or close a call, and nesting is tracked so an inner call's parens do not end
+# the search early.
+# ---
+# file:   the buffer
+# offset: cursor byte offset
+# ret:    the enclosing call, or none when the cursor is not inside one
+fun enclosing_call(file: *src.SourceFile, offset: usize) Option[CallSite] {
+    val text: str = file.text;
+    if (offset == 0 || offset > str_len(text)) { ret none[CallSite](); }
+
+    var depth:  i64   = 0;
+    var commas: usize = 0;
+    var i:      usize = offset;
+    for (i > 0) {
+        i = i - 1;
+        val c: u8 = text[i];
+
+        if (c == '"' || c == '\'') {
+            # skip the literal this quote closes, honouring escapes
+            val quote: u8 = c;
+            var j: usize = i;
+            var closed: bool = false;
+            for (j > 0 && !closed) {
+                j = j - 1;
+                if (text[j] == quote && !escaped_at(text, j)) { closed = true; }
+            }
+            if (!closed) { ret none[CallSite](); }
+            i = j;
+        }
+        or (c == ')') { depth = depth + 1; }
+        or (c == '(') {
+            if (depth == 0) {
+                val co: Option[usize] = ident_end_before(text, i);
+                if (!is_some[usize](co)) { ret none[CallSite](); }
+                var call: CallSite;
+                call.callee_offset = unwrap[usize](co);
+                call.active        = commas;
+                ret some[CallSite](call);
+            }
+            depth = depth - 1;
+        }
+        or (c == ',') { if (depth == 0) { commas = commas + 1; } }
+        or (c == ';' || c == '{' || c == '}') {
+            # a statement boundary at depth zero means the cursor is not inside
+            # a call at all; without this the scan runs to the top of the file
+            if (depth == 0) { ret none[CallSite](); }
+        }
+        i = i;
+    }
+    ret none[CallSite]();
+}
+
+# whether the byte at `i` is backslash-escaped
+fun escaped_at(text: str, i: usize) bool {
+    var n: usize = 0;
+    var j: usize = i;
+    for (j > 0) {
+        j = j - 1;
+        if (text[j] != '\\') { brk; }
+        n = n + 1;
+    }
+    ret (n % 2) == 1;
+}
+
+# the offset of the last identifier byte before `paren`, skipping whitespace and
+# a generic argument list
+#
+# A generic call spells the type arguments between the name and the paren -
+# `take[i32](b)` - so the identifier is not necessarily adjacent to the paren.
+fun ident_end_before(text: str, paren: usize) Option[usize] {
+    var i: usize = paren;
+    var skipped_generics: bool = false;
+    for (i > 0) {
+        i = i - 1;
+        val c: u8 = text[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { i = i; }
+        or (c == ']' && !skipped_generics) {
+            val bo: Option[usize] = matching_bracket_before(text, i);
+            if (!is_some[usize](bo)) { ret none[usize](); }
+            i = unwrap[usize](bo);
+            skipped_generics = true;
+        }
+        or (is_ident_byte(c)) { ret some[usize](i); }
+        or { ret none[usize](); }
+    }
+    ret none[usize]();
+}
+
+# the offset of the `[` matching the `]` at `close`, or none
+fun matching_bracket_before(text: str, close: usize) Option[usize] {
+    var depth: i64   = 0;
+    var i:     usize = close + 1;
+    for (i > 0) {
+        i = i - 1;
+        val c: u8 = text[i];
+        if (c == ']') { depth = depth + 1; }
+        or (c == '[') {
+            depth = depth - 1;
+            if (depth == 0) { ret some[usize](i); }
+        }
+    }
+    ret none[usize]();
+}
+
+fun is_ident_byte(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    if (c >= 'A' && c <= 'Z') { ret true; }
+    if (c >= '0' && c <= '9') { ret true; }
+    ret c == '_';
+}

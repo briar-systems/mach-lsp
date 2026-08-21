@@ -1495,6 +1495,55 @@ pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
     ret norm_uri(w.alloc, root.mod_paths[mid::u32]);
 }
 
+# the session a root's types and interners belong to
+#
+# Rendering a type needs the session that interned it; a type id is meaningless
+# against any other.
+pub fun root_session(r: *Root) *sess.Session {
+    if (r == nil) { ret nil; }
+    ret r.s;
+}
+
+# how many root slots the workspace holds
+#
+# Slots are stable addresses, so an index is a durable handle across a walk;
+# some slots are empty and some hold roots that failed to load.
+pub fun root_count(w: *Workspace) u32 {
+    ret w.root_cap;
+}
+
+# the root in slot `i`, or nil when the slot is empty
+pub fun root_at(w: *Workspace, i: u32) *Root {
+    if (w.roots == nil || i >= w.root_cap) { ret nil; }
+    val r: *Root = ?w.roots[i];
+    if (r.path == nil || r.s == nil) { ret nil; }
+    ret r;
+}
+
+# whether `r` holds a live snapshot that can be queried without rebuilding
+pub fun root_is_loaded(r: *Root) bool {
+    if (r == nil) { ret false; }
+    ret r.loaded;
+}
+
+# the interned FQN of a loaded module, or nil
+#
+# The name a module alias stands for. `module_uri` gives where it lives; this
+# gives what it is called, so hover can say `module std.data.json` rather than
+# echoing the `use` line the cursor is already on.
+# ---
+# w:    the workspace
+# root: the root owning the module
+# mid:  module id within that root
+# ret:  borrowed FQN text, or nil when the module is not loaded
+pub fun module_fqn(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
+    val e: *driver.ModuleEntry = module_entry(root, mid);
+    if (e == nil) { ret nil; }
+    val o: Option[str] = intern.lookup(?root.s.interner, e.fqn);
+    if (!is_some[str](o)) { ret nil; }
+    ret unwrap[str](o);
+}
+
 # the loaded module in `root` whose source file is the document
 # at `uri` (matched on the normalized filesystem path), or none. This is the
 # canonical document-to-ModuleEntry identity used for routing and views.

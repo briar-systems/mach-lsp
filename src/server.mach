@@ -15,6 +15,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
 use std.types.string.str_equals;
+use std.types.string.str_contains;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -25,6 +26,7 @@ use std.allocator.allocate;
 use std.allocator.deallocate;
 
 use mem: std.memory;
+use strutil: std.text.string;
 
 use sess:   mach.lang.session;
 use src:    mach.lang.source;
@@ -39,6 +41,10 @@ use exec:        std.process.exec;
 use documents:   mls.documents;
 use diagnostics: mls.diagnostics;
 use language:    mls.language;
+use workspace:   mls.workspace;
+use signature:   mls.signature;
+use hints:       mls.hints;
+use tokens:      mls.tokens;
 use project:     mls.project;
 use trace:       mls.trace;
 
@@ -55,6 +61,13 @@ val FEATURE_RENAME:          u8 = 3;
 val FEATURE_PREPARE_RENAME:  u8 = 4;
 val FEATURE_DOCUMENT_SYMBOL: u8 = 5;
 val FEATURE_COMPLETION:      u8 = 6;
+val FEATURE_DOCUMENT_HIGHLIGHT: u8 = 7;
+val FEATURE_SIGNATURE_HELP:     u8 = 8;
+val FEATURE_INLAY_HINT:         u8 = 9;
+val FEATURE_SEMANTIC_TOKENS:    u8 = 10;
+
+# LSP RequestCancelled
+val REQUEST_CANCELLED: i64 = -32800;
 
 val WATCH_FALLBACK: u8 = 0;
 val WATCH_PENDING:  u8 = 1;
@@ -71,6 +84,8 @@ val WATCH_ACTIVE:   u8 = 2;
 # ws:            per-root project graphs backing cross-module analysis
 # rd:            per-message JSON parse arena, owned by the analysis thread
 # q:             message queue feeding the analysis thread
+# cancels:       ids the client has withdrawn, written by the reading thread
+# rd_client:     the READING thread's parse arena, private to it
 # stop:          set once the reading thread should stop; read atomically
 # deferred:      a document changed but its analysis was postponed behind newer
 #                input, and must run once the queue drains
@@ -86,6 +101,8 @@ pub rec Server {
     ws:            project.Workspace;
     rd:            json.Reader;
     q:             jobs.Queue;
+    cancels:       jobs.Cancels;
+    rd_client:     json.Reader;
     stop:          i64;
     deferred:      bool;
     watch_dynamic: bool;
@@ -116,6 +133,8 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.stop = 0;
     srv.deferred = false;
     if (!jobs.init(?srv.q, alloc)) { ret false; }
+    if (!jobs.cancels_init(?srv.cancels, alloc)) { ret false; }
+    if (!json.reader_init(?srv.rd_client, alloc)) { ret false; }
     ret true;
 }
 
@@ -124,6 +143,8 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
 # srv: server to tear down
 pub fun dnit(srv: *Server) {
     jobs.dnit(?srv.q);
+    jobs.cancels_dnit(?srv.cancels);
+    json.reader_dnit(?srv.rd_client);
     json.reader_dnit(?srv.rd);
     documents.dnit(?srv.docs);
     project.dnit(?srv.ws);
@@ -164,9 +185,13 @@ pub fun run(srv: *Server) i64 {
             brk;
         }
 
-        if (!jobs.push(?srv.q, msg.body, msg.body_len)) {
-            trace.logf("server: analysis queue full at {} messages, dropping input",
-                       jobs.depth(?srv.q)::i64);
+        # a cancellation is handled HERE rather than queued: queued, it would be
+        # dequeued after the request it withdraws had already run
+        if (!intercept_cancel(srv, msg.body, msg.body_len)) {
+            if (!jobs.push(?srv.q, msg.body, msg.body_len)) {
+                trace.logf("server: analysis queue full at {} messages, dropping input",
+                           jobs.depth(?srv.q)::i64);
+            }
         }
         transport.message_free(?msg, srv.alloc);
         if (atomic.load(?srv.stop) != 0) { brk; }
@@ -180,6 +205,34 @@ pub fun run(srv: *Server) i64 {
     if (srv.status == STATUS_EXITED)       { ret srv.exit_code; }
     if (last_read == transport.READ_EOF && srv.status == STATUS_SHUTTING_DOWN) { ret 0; }
     ret 1;
+}
+
+# record a `$/cancelRequest` and report whether the message was one
+#
+# Runs on the READING thread, with its own parse arena, so it never touches the
+# worker's. The substring test is a cheap negative filter, not the decision: a
+# body that contains the text is still parsed and checked structurally, so a
+# document whose own source mentions the method cannot be mistaken for one.
+fun intercept_cancel(srv: *Server, body: str, len: usize) bool {
+    if (body == nil) { ret false; }
+    if (!str_contains(body, "$/cancelRequest")) { ret false; }
+
+    var parsed: json.Message = json.read(?srv.rd_client, body, len);
+    var handled: bool = false;
+    if (parsed.valid) {
+        if (json.text_equals(json.member(?parsed.root, "method"), "$/cancelRequest", srv.alloc)) {
+            val id_token: str = json.id_text(
+                json.member(json.member(?parsed.root, "params"), "id"), srv.alloc);
+            if (id_token != nil) {
+                jobs.cancel_add(?srv.cancels, id_token);
+                trace.logf("server: cancel requested for id {}", id_token);
+                json.free_str(id_token, srv.alloc);
+            }
+            handled = true;
+        }
+    }
+    json.release(?srv.rd_client);
+    ret handled;
 }
 
 # handle one queued message on the analysis thread
@@ -250,6 +303,11 @@ fun dispatch(srv: *Server, root: *sj.Value) {
     if (str_equals(method, "textDocument/prepareRename"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_PREPARE_RENAME); ret; }
     if (str_equals(method, "textDocument/documentSymbol")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_SYMBOL); ret; }
     if (str_equals(method, "textDocument/completion"))     { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_COMPLETION); ret; }
+    if (str_equals(method, "textDocument/documentHighlight")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT); ret; }
+    if (str_equals(method, "textDocument/signatureHelp"))  { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_SIGNATURE_HELP); ret; }
+    if (str_equals(method, "textDocument/inlayHint"))      { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_INLAY_HINT); ret; }
+    if (str_equals(method, "textDocument/semanticTokens/full")) { json.free_str(method, a); handle_feature(srv, root, params, FEATURE_SEMANTIC_TOKENS); ret; }
+    if (str_equals(method, "workspace/symbol"))            { json.free_str(method, a); handle_workspace_symbol(srv, root, params); ret; }
 
     trace.logf("server: unhandled method {}", method);
     json.free_str(method, a);
@@ -268,7 +326,11 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push_id(?b, json.member(root, "id"));
-    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
+    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[");
+    json.buf_push(?b, tokens.TOKEN_TYPES);
+    json.buf_push(?b, "],\"tokenModifiers\":[");
+    json.buf_push(?b, tokens.TOKEN_MODIFIERS);
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\"}}}");
     send_buf(srv, ?b);
 
     srv.status = STATUS_RUNNING;
@@ -400,8 +462,9 @@ fun handle_did_close(srv: *Server, params: *sj.Value) {
 # resolves the buffer, pivots the cursor, and replies. an unknown or unopened
 # uri still gets a null / empty reply, so the client is never left waiting
 fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) {
-    val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
     val id: *sj.Value = json.member(root, "id");
+    if (withdrawn(srv, id)) { ret; }
+    val uri: str = json.text(json.member2(params, "textDocument", "uri"), srv.alloc);
 
     # snapshot compiler epochs so a feature-triggered rebuild republishes the
     # now-current diagnostics for every affected open document
@@ -415,10 +478,39 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_PREPARE_RENAME)  { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_SYMBOL) { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_COMPLETION)      { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_DOCUMENT_HIGHLIGHT) { language.document_highlight(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SIGNATURE_HELP)  { signature.signature_help(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_INLAY_HINT)      { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SEMANTIC_TOKENS) { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
     if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
+}
+
+# whether the client withdrew this request before the worker reached it
+#
+# A cancelled request still owes exactly one response, so it is answered with
+# RequestCancelled rather than dropped.
+fun withdrawn(srv: *Server, id: *sj.Value) bool {
+    if (id == nil) { ret false; }
+    val id_token: str = json.id_text(id, srv.alloc);
+    if (id_token == nil) { ret false; }
+    val cancelled: bool = jobs.cancel_take(?srv.cancels, id_token);
+    if (cancelled) { send_error(srv, id, REQUEST_CANCELLED, "request cancelled"); }
+    json.free_str(id_token, srv.alloc);
+    ret cancelled;
+}
+
+# answer workspace/symbol from every loaded root
+fun handle_workspace_symbol(srv: *Server, root: *sj.Value, params: *sj.Value) {
+    val id: *sj.Value = json.member(root, "id");
+    if (withdrawn(srv, id)) { ret; }
+    val id_raw: str = json.id_text(id, srv.alloc);
+    if (id_raw == nil) { ret; }
+    val query: str = json.text(json.member(params, "query"), srv.alloc);
+    workspace.symbols(?srv.ws, srv.alloc, id_raw, query);
+    if (query != nil) { json.free_str(query, srv.alloc); }
 }
 
 # re-publish diagnostics for every open document the given root governs

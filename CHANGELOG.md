@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-21
+
+Five new language features, cancellation, and the emit layer they all share.
+Advertised capabilities go from 6 to 11.
+
+### Added
+- protocol: `$/cancelRequest` is honoured. A withdrawn request is answered
+  RequestCancelled (-32800) rather than dropped, because a request still owes
+  exactly one response. The cancellation is handled on the reading thread rather
+  than queued - queued, it would be dequeued after the request it withdraws had
+  already run. Cancelling work already in progress remains out of scope. (#153)
+- documentHighlight, workspace/symbol, signatureHelp, inlayHint, and
+  semanticTokens. Advertised capabilities go from 6 to 11. (#170, #167, #168,
+  #169, #166)
+- semanticTokens classifies from the resolved side tables rather than from
+  spelling, which is the point in a language where an identifier may be a type,
+  a function, a module alias, a parameter, a field, or a comptime value with
+  nothing in how it is written to say which. 1389 tokens on `src/server.mach`.
+- signatureHelp locates the enclosing call by scanning text rather than the Ast,
+  because the request exists precisely while the argument list does not parse;
+  it handles nesting, string literals, statement boundaries, and the type
+  arguments of a generic call.
+- inlayHint names literal arguments at multi-parameter calls. Mach requires an
+  explicit type annotation on every binding, so the usual inferred-binding-type
+  hint has nothing to show; suppression is the feature, taking 420 candidate
+  hints on one file down to 76.
+- workspace/symbol searches every loaded root, ranked so leading matches precede
+  interior ones - `read_` should find `read_dir`, not `thread_spawn`.
+
+### Changed
+- analysis: request-to-document-view resolution moves to `mls.analysis`, so a
+  feature binds to one contract instead of reaching into `language.mach`.
+- render: `language.mach`'s remaining two-pass emitters are gone; `mls.render`
+  is the only place that knows how an LSP value is spelled. (#171)
+
+### Fixed
+- hover: a record or union renders its declaration header rather than its whole
+  body. `Server` hovered as fifteen lines of fields with its doc comment buried
+  underneath; a binding with a multi-line initialiser did the same. (#145,
+  first half)
+
+### Known issues
+- codeAction is blocked on briar-systems/mach#3023. A mach diagnostic's `help`
+  is a sentence, not an edit - there is no span or replacement on the record - so
+  building quick fixes today means pattern-matching the compiler's English,
+  which breaks silently whenever upstream rephrases. (#165)
+- a function-local `val` / `var` resolves in some buffers and not others, so
+  hover, definition, references, and highlight silently decline on them in
+  those files. (#181)
+
+### Fixed
+- completion: answers for the cursor rather than for the file. The server
+  advertised `.` as a trigger character and then ignored the request position
+  entirely, returning every top-level symbol whatever the cursor was on: `srv.`
+  gave 178 items with **zero** `Server` fields among them, and a cursor mid-word
+  at `STATUS_RUNNING` gave the same 178. A record or union receiver now offers
+  its fields with their declared types, a module alias offers the target's public
+  symbols, and anything else is filtered by the partial identifier. An
+  unresolvable receiver offers nothing rather than the file's names. (#81, #82)
+- definition / hover: `use` and `fwd` import paths navigate. Both answered null
+  at every position on an import line — an import path is neither an expression
+  nor a type and an import declaration has no name span, so the offset pivot
+  missed it, while `decl_symbol` held the bound symbol the whole time. A module
+  alias resolves to the module's file and hovers as `module <fqn>`; a symbol
+  import resolves to its declaration. (#163)
+- documentSymbol: reports record fields, union variants, function parameters, and
+  generics as `children`, each with its declared type in `detail`. The outline was
+  a flat list — 39 top-level symbols on `src/server.mach`, none with children. Now
+  25 of 39 have them. (#164)
+
+### Changed
+- render: a new `mls.render` is the only place that knows how an LSP value is
+  spelled - Range, Location, TextEdit, the response envelope, the standard empty
+  replies. Responses were previously assembled by summing fragment lengths into
+  an exact allocation and filling it in a second pass, which meant every
+  data-dependent payload was traversed twice and each entry rendered twice, and a
+  disagreement between the two passes under-filled the buffer so `str_len`
+  truncated the frame at the resulting NUL - a valid `Content-Length` over a body
+  stopping mid-token. `json.buf_len` / `buf_rewind` cover the one case that
+  needed the sizing pass, a rename group only known to be empty once walked.
+  `language.mach` 2364 → 1968 lines, two-pass emitters 4 → 0, manual
+  `allocate[u8]` assembly 22 → 4. Incidentally faster: `documentSymbol`
+  13 ms → 5 ms, `completion` 14 ms → 0.2 ms. (#171)
+- completion: an empty result is the same `CompletionList` shape as a populated
+  one rather than a bare array, so the method has one response type.
+
 ## [0.11.0] - 2026-08-20
 
 The server was unusably slow on any project that vendors the compiler, reported

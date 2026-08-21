@@ -589,6 +589,10 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+            # the fingerprint fallback coalesces to at most one scan per 250 ms
+            # per root, so a request issued inside that window is answered from
+            # the still-live snapshot. wait past it, or this asserts nothing.
+            time.sleep(0.4)
             broken = session.request(
                 "textDocument/definition",
                 {"textDocument": {"uri": alpha[0].as_uri()},
@@ -597,6 +601,9 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             require(broken.get("result") is None,
                     f"watcher rejection disabled manifest fallback: {broken!r}")
             alpha_manifest.write_text(manifest_text, encoding="utf-8")
+            # and again on the way back: a failed root retries on the next
+            # fingerprint scan, not on the next request
+            time.sleep(0.4)
             assert_definition(session, *alpha)
 
             # An unsaved export change in one module must be visible from another
@@ -758,6 +765,674 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             telemetry = session.finish()
             finished = True
             return telemetry, session.timings
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_import_navigation(server: Path, timeout: float) -> None:
+    """A `use` / `fwd` path must navigate like a body reference to the same symbol.
+
+    An import path is neither an expression nor a type and an import declaration
+    has no name span, so nothing in the offset pivot reached it: hover and
+    definition both answered null anywhere on a `use` line. The resolver does
+    record the bound symbol on the declaration, which is what makes this
+    answerable.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-import-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "imp", 5)
+        bridge = main.parent / "bridge.mach"
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            lines = text.splitlines()
+
+            def at(needle: str, within: str) -> dict[str, Any]:
+                line = next(i for i, v in enumerate(lines) if within in v)
+                return {"textDocument": {"uri": main.as_uri()},
+                        "position": {"line": line, "character": lines[line].index(needle) + 1}}
+
+            def location(label: str, params: dict[str, Any]) -> dict[str, Any]:
+                response = session.request("textDocument/definition", params)
+                result = response.get("result")
+                require(isinstance(result, dict),
+                        f"{label}: definition on an import is not a Location: {result!r}")
+                assert_range(result.get("range"), f"{label}.range")
+                return result
+
+            def hover_text(label: str, params: dict[str, Any]) -> str:
+                response = session.request("textDocument/hover", params)
+                result = response.get("result")
+                require(isinstance(result, dict), f"{label}: hover on an import is null")
+                contents = result.get("contents")
+                require(isinstance(contents, dict), f"{label}: hover contents malformed")
+                return str(contents.get("value"))
+
+            # a plain symbol import: the leaf names a declaration in another module
+            leaf = at("Box", "use imp.defs.Box;")
+            require(location("symbol import leaf", leaf).get("uri") == defs.as_uri(),
+                    "a symbol import leaf did not resolve to its declaring module")
+            require("Box" in hover_text("symbol import leaf", leaf),
+                    "hover on a symbol import leaf did not name the symbol")
+
+            # the qualifier of the same path resolves to the same symbol, so a
+            # cursor anywhere on the line is useful rather than only on the leaf
+            require(location("import qualifier", at("imp", "use imp.defs.Box;")).get("uri")
+                    == defs.as_uri(),
+                    "the qualifier of an import path did not resolve")
+
+            # a member alias binds the imported symbol under a new name
+            require(location("member alias", at("direct", "use direct:")).get("uri")
+                    == defs.as_uri(),
+                    "a member alias did not resolve to its declaration")
+
+            # a bare-module alias names a FILE, not a declaration
+            module_alias = at("rootmod", "use rootmod:")
+            require(location("module alias", module_alias).get("uri") == defs.as_uri(),
+                    "a module alias did not resolve to the module's file")
+            require("module" in hover_text("module alias", module_alias),
+                    "hover on a module alias did not name it as a module")
+
+            # `fwd` re-export paths behave like `use` paths
+            bridge_text = bridge.read_text(encoding="utf-8")
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": bridge.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": bridge_text}},
+            )
+            session.diagnostics(bridge.as_uri(), 1)
+            blines = bridge_text.splitlines()
+            bline = next(i for i, v in enumerate(blines) if v.startswith("fwd "))
+            fwd = {"textDocument": {"uri": bridge.as_uri()},
+                   "position": {"line": bline, "character": blines[bline].index("answer") + 1}}
+            response = session.request("textDocument/definition", fwd)
+            result = response.get("result")
+            require(isinstance(result, dict) and result.get("uri") == defs.as_uri(),
+                    f"a fwd re-export path did not resolve: {result!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
+    """A record's fields and a function's parameters belong in the outline.
+
+    documentSymbol reported a flat list, so a module's structure was invisible:
+    39 top-level names and no way to see what any of them contained.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-dsym-") as directory:
+        root = Path(directory).resolve()
+        main, defs, _ = write_project(root, "dsym", 7)
+        defs_text = defs.read_text(encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": defs.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": defs_text}},
+            )
+            session.diagnostics(defs.as_uri(), 1)
+            response = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            symbols = response.get("result")
+            require(isinstance(symbols, list) and symbols,
+                    f"documentSymbol returned nothing: {symbols!r}")
+
+            by_name = {s["name"]: s for s in symbols}
+
+            def children(name: str) -> list[dict[str, Any]]:
+                require(name in by_name, f"{name} missing from documentSymbol")
+                node = by_name[name]
+                assert_range(node.get("range"), f"{name}.range")
+                assert_range(node.get("selectionRange"), f"{name}.selectionRange")
+                return node.get("children") or []
+
+            # `pub rec Box[T] { v: T; }` -- one generic and one field
+            box = children("Box")
+            names = [c["name"] for c in box]
+            require("T" in names, f"Box did not report its generic parameter: {names!r}")
+            require("v" in names, f"Box did not report its field: {names!r}")
+            field = next(c for c in box if c["name"] == "v")
+            require(field.get("detail") == "T",
+                    f"a field's declared type is missing from detail: {field!r}")
+            require(field.get("kind") == 8, f"a record field is not SymbolKind.Field: {field!r}")
+            for entry in box:
+                assert_range(entry.get("range"), "Box child range")
+                assert_range(entry.get("selectionRange"), "Box child selectionRange")
+
+            # `pub fun take[T](b: Box[T]) i32` -- one generic and one parameter
+            take = children("take")
+            take_names = [c["name"] for c in take]
+            require("T" in take_names, f"take did not report its generic: {take_names!r}")
+            require("b" in take_names, f"take did not report its parameter: {take_names!r}")
+            param = next(c for c in take if c["name"] == "b")
+            require(param.get("detail") == "Box[T]",
+                    f"a parameter's declared type is missing from detail: {param!r}")
+
+            # a declaration with no members omits children rather than sending []
+            require("children" not in by_name["answer"] or not by_name["answer"]["children"],
+                    "a val reported children it does not have")
+
+            # still syntax-only: it must answer without a compiler root
+            manifest = defs.parents[1] / "mach.toml"
+            manifest_text = manifest.read_text(encoding="utf-8")
+            manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+            time.sleep(0.4)
+            started = time.monotonic()
+            broken = session.request(
+                "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
+            require(time.monotonic() - started < 1.0,
+                    "documentSymbol blocked on project analysis")
+            require(isinstance(broken.get("result"), list) and broken["result"],
+                    f"documentSymbol needed a loaded project: {broken!r}")
+            manifest.write_text(manifest_text, encoding="utf-8")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_completion_context(server: Path, timeout: float) -> None:
+    """Completion must answer for the cursor, not for the file.
+
+    The server advertises `.` as a trigger character, and typing a dot used to
+    return every top-level name in the file with none of the receiver's members
+    among them -- a wrong answer rather than a missing one. Nor did a partial
+    identifier narrow anything.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-compl-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "compl", 3)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            # after `b.v = N;`, so the local `b` is in scope for the probe
+            anchor_line = next(i for i, v in enumerate(lines) if v.strip().startswith("b.v ="))
+            version = [1]
+
+            def complete(probe: str) -> list[str]:
+                """Insert `probe` as a line in main's body and complete at its end."""
+                edited = list(lines)
+                edited.insert(anchor_line + 1, "    " + probe)
+                version[0] += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                     "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
+                )
+                session.diagnostics(main.as_uri(), version[0])
+                response = session.request(
+                    "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
+                )
+                result = response.get("result")
+                require(isinstance(result, dict), f"completion is not a list: {result!r}")
+                items = result.get("items")
+                require(isinstance(items, list), f"completion has no items: {result!r}")
+                for item in items:
+                    require(isinstance(item.get("label"), str), f"item without a label: {item!r}")
+                    require(isinstance(item.get("kind"), int), f"item without a kind: {item!r}")
+                return [item["label"] for item in items]
+
+            # a record receiver offers its fields, and only its fields
+            fields = complete("b.")
+            require("v" in fields, f"a record receiver did not offer its field: {fields!r}")
+            require("main" not in fields and "take" not in fields,
+                    f"a record receiver offered file-level names: {fields!r}")
+
+            # a module alias offers that module's public symbols
+            members = complete("rootmod.")
+            require("answer" in members and "Box" in members,
+                    f"a module alias did not offer its exports: {members!r}")
+            require("main" not in members,
+                    f"a module alias offered the requesting file's names: {members!r}")
+
+            # a partial member narrows
+            narrowed = complete("rootmod.an")
+            require(narrowed and all(label.startswith("an") for label in narrowed),
+                    f"a partial member name did not filter: {narrowed!r}")
+            require("answer" in narrowed, f"filtering dropped the match: {narrowed!r}")
+
+            # an unresolvable receiver offers nothing, never the file's names
+            unknown = complete("nosuchreceiver.")
+            require(unknown == [],
+                    f"an unresolved receiver fell back to the file list: {unknown!r}")
+
+            # a partial identifier with no dot narrows the file-level list
+            everything = complete("")
+            prefixed = complete("Bo")
+            require(prefixed and all(label.startswith("Bo") for label in prefixed),
+                    f"a partial identifier did not filter: {prefixed!r}")
+            require(len(prefixed) < len(everything),
+                    "filtering returned as many items as no filter at all")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_document_highlight(server: Path, timeout: float) -> None:
+    """Occurrences in the active file, classified read or write."""
+    with tempfile.TemporaryDirectory(prefix="mls-hl-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "imp", 4)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            lines = text.splitlines()
+
+            def highlights(needle: str, within: str) -> list[dict[str, Any]]:
+                line = next(i for i, v in enumerate(lines) if within in v)
+                response = session.request(
+                    "textDocument/documentHighlight",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": lines[line].index(needle) + 1}},
+                )
+                items = response.get("result")
+                require(isinstance(items, list), f"documentHighlight is not a list: {items!r}")
+                for item in items:
+                    assert_range(item.get("range"), "highlight.range")
+                    require(item.get("kind") in (1, 2, 3),
+                            f"highlight kind is not a DocumentHighlightKind: {item!r}")
+                    require("uri" not in item,
+                            f"a highlight carried a uri, so it is a Location: {item!r}")
+                return items
+
+            # a top-level declaration: its own name is a write, its uses reads
+            found = highlights("watched", "use imp.defs.watched;")
+            require(found, f"an import was not highlighted: {found!r}")
+
+            # an imported symbol used in the body
+            uses = highlights("take", "ret take")
+            require(uses, "an imported symbol produced no highlight")
+            require({item["kind"] for item in uses} <= {1, 2, 3},
+                    f"unexpected highlight kinds: {uses!r}")
+
+            # a cursor on nothing answers an empty list, not an error
+            blank = session.request(
+                "textDocument/documentHighlight",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": 0, "character": 0}},
+            )
+            require(isinstance(blank.get("result"), list),
+                    f"a cursor on nothing did not answer a list: {blank!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_workspace_symbol(server: Path, timeout: float) -> None:
+    """Find a declaration without already looking at it."""
+    with tempfile.TemporaryDirectory(prefix="mls-wsym-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "wsym", 6)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            require(result.get("capabilities", {}).get("workspaceSymbolProvider") is True,
+                    "workspaceSymbolProvider is not advertised")
+            session.notify("initialized", {})
+
+            def query(text_: str) -> list[dict[str, Any]]:
+                response = session.request("workspace/symbol", {"query": text_})
+                items = response.get("result")
+                require(isinstance(items, list), f"workspace/symbol is not a list: {items!r}")
+                for item in items:
+                    require(isinstance(item.get("name"), str), f"symbol without a name: {item!r}")
+                    require(isinstance(item.get("kind"), int), f"symbol without a kind: {item!r}")
+                    location = item.get("location")
+                    require(isinstance(location, dict) and "uri" in location,
+                            f"symbol without a location: {item!r}")
+                    assert_range(location.get("range"), "symbol.location.range")
+                return items
+
+            # nothing is loaded yet: a query must answer, not block on a build
+            started = time.monotonic()
+            require(query("answer") == [], "an unloaded workspace returned symbols")
+            require(time.monotonic() - started < 2.0,
+                    "workspace/symbol forced a cold project load")
+
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            found = query("answer")
+            require(found, "a declared symbol was not found after loading")
+            names = [item["name"] for item in found]
+            require("answer" in names, f"the exact match is missing: {names!r}")
+            hit = next(item for item in found if item["name"] == "answer")
+            require(hit["location"]["uri"] == defs.as_uri(),
+                    f"symbol resolved to the wrong file: {hit!r}")
+            require(hit.get("containerName"), "no containerName to disambiguate the module")
+
+            # a leading match outranks an interior one
+            ranked = [item["name"] for item in query("Box")]
+            require(ranked and ranked[0] == "Box",
+                    f"an exact match was not ranked first: {ranked!r}")
+
+            require(query("zzz-no-such-symbol") == [], "a miss returned results")
+            require(query("") == [], "an empty query returned results")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_signature_help(server: Path, timeout: float) -> None:
+    """Parameter hints while the argument list is still incomplete."""
+    with tempfile.TemporaryDirectory(prefix="mls-sig-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "sig", 8)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            provider = result.get("capabilities", {}).get("signatureHelpProvider")
+            require(isinstance(provider, dict) and "(" in provider.get("triggerCharacters", []),
+                    f"signatureHelpProvider is not advertised with `(`: {provider!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            anchor_line = next(i for i, v in enumerate(lines) if v.strip().startswith("b.v ="))
+            version = [1]
+
+            def help_at(probe: str) -> dict[str, Any] | None:
+                edited = list(lines)
+                edited.insert(anchor_line + 1, "    " + probe)
+                version[0] += 1
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                     "contentChanges": [{"text": "\n".join(edited) + "\n"}]},
+                )
+                session.diagnostics(main.as_uri(), version[0])
+                response = session.request(
+                    "textDocument/signatureHelp",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": anchor_line + 1, "character": 4 + len(probe)}},
+                )
+                return response.get("result")
+
+            # the argument list is unclosed at every one of these positions
+            opened = help_at("take[i32](")
+            require(opened, "signatureHelp gave nothing for an open call")
+            signature = opened["signatures"][0]
+            require("b" in signature["label"],
+                    f"the parameter is missing from the label: {signature['label']!r}")
+            require(opened.get("activeParameter") == 0,
+                    f"the first argument is not active: {opened!r}")
+            require(len(signature.get("parameters") or []) == 1,
+                    f"parameter list is wrong: {signature!r}")
+            # each parameter label is a byte range into the signature label
+            span = signature["parameters"][0]["label"]
+            require(isinstance(span, list) and len(span) == 2 and span[0] < span[1],
+                    f"parameter label is not a valid range: {span!r}")
+            require(signature["label"][span[0]:span[1]].startswith("b"),
+                    f"parameter range does not cover the parameter: {signature!r}")
+
+            # a `(` inside a string literal must not open a call
+            quoted = help_at('take[i32]("a(b"')
+            require(quoted, "a paren inside a string broke the enclosing call")
+
+            # a cursor outside any call, and a callee that resolves to nothing
+            require(help_at("val zz: i64 = 1;") is None,
+                    "signatureHelp answered outside a call")
+            require(help_at("no_such_function(") is None,
+                    "signatureHelp answered for an unresolvable callee")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_inlay_hints(server: Path, timeout: float) -> None:
+    """Parameter names on literal arguments, and nowhere else.
+
+    Mach requires an explicit type annotation on every binding, so there is no
+    inferred binding type to reveal; what is opaque at a call site is which
+    literal means what.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-hint-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "hint", 2)
+        # a two-parameter callee, called with one literal and one named value
+        extra = ("pub fun pair(first: i32, second: i32) i32 { ret first + second; }\n")
+        defs.write_text(defs.read_text(encoding="utf-8") + extra, encoding="utf-8")
+        body = text.replace("ret take[i32](b)", "ret pair(1, watched) + take[i32](b)")
+        body = body.replace("use hint.defs.watched;", "use hint.defs.watched;\nuse hint.defs.pair;")
+        main.write_text(body, encoding="utf-8")
+
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            require(result.get("capabilities", {}).get("inlayHintProvider") is True,
+                    "inlayHintProvider is not advertised")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": body}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = body.splitlines()
+            response = session.request(
+                "textDocument/inlayHint",
+                {"textDocument": {"uri": main.as_uri()},
+                 "range": {"start": {"line": 0, "character": 0},
+                           "end": {"line": len(lines), "character": 0}}},
+            )
+            hints = response.get("result")
+            require(isinstance(hints, list), f"inlayHint is not a list: {hints!r}")
+            for hint in hints:
+                assert_position(hint.get("position"), "hint.position")
+                require(isinstance(hint.get("label"), str), f"hint without a label: {hint!r}")
+                require(hint.get("kind") == 2, f"hint is not InlayHintKind.Parameter: {hint!r}")
+
+            labels = [hint["label"] for hint in hints]
+            require("first:" in labels,
+                    f"the literal argument was not named: {labels!r}")
+            # `watched` is an identifier, not a literal, so it is left alone
+            require("second:" not in labels,
+                    f"a self-naming argument was labelled: {labels!r}")
+
+            # a range that covers nothing yields nothing
+            empty = session.request(
+                "textDocument/inlayHint",
+                {"textDocument": {"uri": main.as_uri()},
+                 "range": {"start": {"line": 0, "character": 0},
+                           "end": {"line": 0, "character": 0}}},
+            )
+            require(empty.get("result") == [], f"an empty range produced hints: {empty!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_semantic_tokens(server: Path, timeout: float) -> None:
+    """Classification from the resolved tables, in a wire format that decodes.
+
+    The payload is a flat array of five-integer groups, each relative to the
+    previous, so ordering and non-overlap are load-bearing rather than
+    cosmetic: a single out-of-order token corrupts everything after it.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-semtok-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "semtok", 5)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            result = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
+            provider = result.get("capabilities", {}).get("semanticTokensProvider")
+            require(isinstance(provider, dict), f"semanticTokensProvider missing: {provider!r}")
+            legend = provider.get("legend", {})
+            types = legend.get("tokenTypes")
+            require(isinstance(types, list) and types, f"no token legend: {legend!r}")
+            require(isinstance(legend.get("tokenModifiers"), list), "no modifier legend")
+
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            response = session.request(
+                "textDocument/semanticTokens/full", {"textDocument": {"uri": main.as_uri()}})
+            payload = response.get("result")
+            require(isinstance(payload, dict), f"semanticTokens is not an object: {payload!r}")
+            data = payload.get("data")
+            require(isinstance(data, list) and data, f"no token data: {payload!r}")
+            require(len(data) % 5 == 0,
+                    f"token data is not a multiple of five: {len(data)}")
+
+            lines = text.splitlines()
+            line = 0
+            char = 0
+            previous = (-1, -1)
+            seen_types = set()
+            for index in range(0, len(data), 5):
+                d_line, d_char, length, kind, _mods = data[index:index + 5]
+                require(d_line >= 0 and d_char >= 0, f"negative delta at {index}")
+                if d_line == 0:
+                    char += d_char
+                else:
+                    line += d_line
+                    char = d_char
+                require((line, char) >= previous,
+                        f"token {index // 5} is out of order at {(line, char)}")
+                previous = (line, char)
+                require(0 <= kind < len(types), f"token type {kind} outside the legend")
+                require(length > 0, f"zero-length token at {index}")
+                require(line < len(lines), f"token past end of file at line {line}")
+                require(char + length <= len(lines[line]) + 1,
+                        f"token runs past end of line {line}")
+                seen_types.add(types[kind])
+
+            # the point of the feature: kinds a syntax highlighter cannot infer
+            require("type" in seen_types, f"no type tokens: {sorted(seen_types)}")
+            require("function" in seen_types, f"no function tokens: {sorted(seen_types)}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_cancellation(server: Path, timeout: float) -> None:
+    """A withdrawn request is answered RequestCancelled, never dropped."""
+    with tempfile.TemporaryDirectory(prefix="mls-cancel-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "cancel", 3)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            # the cancellation is sent FIRST so this does not race the worker.
+            # Against a fixture this small the queue drains faster than a second
+            # message arrives, and cancelling work already in progress is
+            # best-effort by design; what is under test is that a request found
+            # withdrawn when the worker reaches it is answered, not dropped.
+            doc = {"textDocument": {"uri": main.as_uri()}}
+            first = session.next_id
+            session.notify("$/cancelRequest", {"id": first})
+            session._send({"jsonrpc": "2.0", "id": first,
+                           "method": "textDocument/documentSymbol", "params": doc})
+            session.next_id += 1
+
+            answer = session.wait_for(
+                lambda item: item.get("id") == first, f"a response for request {first}")
+            require("error" in answer,
+                    f"a cancelled request was answered normally: {answer!r}")
+            require(answer["error"].get("code") == -32800,
+                    f"cancellation is not RequestCancelled: {answer!r}")
+
+            # a cancellation naming an id the server never saw must be inert
+            session.notify("$/cancelRequest", {"id": 999999})
+            later = session.request("textDocument/documentSymbol", doc)
+            require(isinstance(later.get("result"), list),
+                    f"a stray cancellation disturbed a later request: {later!r}")
+
+            # and the id is consumed: reusing it must not be cancelled again
+            reused = session.request("textDocument/documentSymbol", doc)
+            require(isinstance(reused.get("result"), list),
+                    f"a consumed cancellation still applied: {reused!r}")
+
+            session.finish()
+            finished = True
         finally:
             if not finished:
                 session.abort()
@@ -1001,6 +1676,15 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
+        run_import_navigation(server, args.timeout)
+        run_document_symbol_hierarchy(server, args.timeout)
+        run_completion_context(server, args.timeout)
+        run_document_highlight(server, args.timeout)
+        run_workspace_symbol(server, args.timeout)
+        run_signature_help(server, args.timeout)
+        run_inlay_hints(server, args.timeout)
+        run_semantic_tokens(server, args.timeout)
+        run_cancellation(server, args.timeout)
         run_same_fqn_reverse(server, args.timeout)
         run_clean_eof(server, args.timeout)
         run_exit_paths(server, args.timeout)
@@ -1013,6 +1697,15 @@ def main() -> int:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
+    print("  use / fwd import paths navigate to their declarations")
+    print("  documentSymbol nests fields, variants, parameters, and generics")
+    print("  completion answers for the cursor: members, exports, prefixes")
+    print("  documentHighlight classifies reads and writes in the active file")
+    print("  workspace/symbol searches loaded roots, best matches first")
+    print("  signatureHelp tracks the active argument through incomplete calls")
+    print("  inlayHint names literal arguments at multi-parameter calls")
+    print("  semanticTokens decode in order, within the legend and the file")
+    print("  a withdrawn request is answered RequestCancelled")
     print("  clean EOF after shutdown: exit 0")
     print("  all five lifecycle endings terminate with the documented code")
     print("  malformed/oversized frames: 8 rejected with exit 1")

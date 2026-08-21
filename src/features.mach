@@ -78,7 +78,7 @@ pub rec SymbolRef {
 # own:    this buffer's module id (Symbol.origin equals it for local symbols)
 # offset: byte offset into the buffer
 # ret:    some(SymbolRef) for a resolved position, or none
-pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, offset: usize) Option[SymbolRef] {
+pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, file: *src.SourceFile, offset: usize) Option[SymbolRef] {
     val eid: id.ExprId = ast.offset_to_expr(a, offset);
     if (eid != id.EXPR_NIL && rr.expr_resolved != nil && eid::u32 < rr.expr_count) {
         val sid: res.SymbolId = rr.expr_resolved[eid];
@@ -127,9 +127,54 @@ pub fun ref_at(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, offset: 
         # cursor on one of those binding names through the symbol table
         val bo: Option[SymbolRef] = binding_ref_in_decl(a, rr, own, did, offset);
         if (is_some[SymbolRef](bo)) { ret bo; }
+
+        # a `use` / `fwd` path is neither an expr nor a type, and an import decl
+        # has no name span, so nothing above reaches it - yet decl_symbol holds
+        # exactly the symbol the import binds
+        val io: Option[SymbolRef] = import_ref_in_decl(a, rr, own, did, file, offset);
+        if (is_some[SymbolRef](io)) { ret io; }
     }
 
     ret none[SymbolRef]();
+}
+
+# a SymbolRef when `offset` falls on an import declaration's alias or anywhere in
+# its dotted path, or none
+#
+# The resolver binds a single-symbol import under the path's leaf and records the
+# imported symbol in `decl_symbol`, so the whole import line resolves to one
+# symbol. The reported name span is the leaf rather than the cursor's own token:
+# a rename must rewrite the leaf, and hover wants the symbol's own name, not the
+# package qualifier the cursor happened to land on.
+# ---
+# a:      the Ast holding the decl
+# rr:     the ResolveResult side tables
+# own:    the buffer's module id
+# did:    decl id under the cursor
+# file:   source file backing the import path, to locate the leaf
+# offset: cursor byte offset
+# ret:    some(ref) when the cursor is on an import path or alias, else none
+fun import_ref_in_decl(a: *ast.Ast, rr: *res.ResolveResult, own: sess.ModuleId, did: id.DeclId, file: *src.SourceFile, offset: usize) Option[SymbolRef] {
+    if (file == nil) { ret none[SymbolRef](); }
+    if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret none[SymbolRef](); }
+    val sid: res.SymbolId = rr.decl_symbol[did];
+    if (sid == res.SYMBOL_NIL || sid >= rr.symbol_count) { ret none[SymbolRef](); }
+
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
+    if (!is_some[*decl.Decl](d_opt)) { ret none[SymbolRef](); }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+
+    var path:  token.Span;
+    var alias: token.Span;
+    if (d.kind == decl.DECL_KIND_USE) { path = d.data.use_.path; alias = d.data.use_.alias; }
+    or (d.kind == decl.DECL_KIND_FWD) { path = d.data.fwd_.path; alias = d.data.fwd_.alias; }
+    or { ret none[SymbolRef](); }
+
+    val on_path:  bool = ast.span_contains(path, offset);
+    val on_alias: bool = alias.len > 0 && ast.span_contains(alias, offset);
+    if (!on_path && !on_alias) { ret none[SymbolRef](); }
+
+    ret some[SymbolRef](make_ref(rr, own, sid, import_leaf_span(file, path)));
 }
 
 # a SymbolRef when `offset` falls on a function
@@ -367,7 +412,7 @@ pub fun decl_name_span(d: *decl.Decl) Option[token.Span] {
 # a:   the Ast owning the decl
 # sym: the symbol whose signature span is wanted
 # ret: some(span) of the header text, or none
-pub fun signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
+pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *res.Symbol) Option[token.Span] {
     if (sym.kind == res.SYM_GENERIC) { ret binding_name_span(a, sym); }
     if (sym.kind == res.SYM_PARAM)   { ret param_signature_span(a, sym); }
 
@@ -388,7 +433,63 @@ pub fun signature_span(a: *ast.Ast, sym: *res.Symbol) Option[token.Span] {
             }
         }
     }
+    # a record or union's declaration span covers every field. hover is a
+    # summary, not a source viewer: a 13-field record renders as a wall that
+    # buries the one line the reader asked about. trim to the header.
+    if (d.kind == decl.DECL_KIND_REC || d.kind == decl.DECL_KIND_UNI) {
+        val ho: Option[token.Span] = header_span(file, d.span, '{');
+        if (is_some[token.Span](ho)) { ret ho; }
+    }
+
+    # a binding whose initialiser runs over several lines has the same problem;
+    # its type is what hover is for, and that ends at the `=`
+    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
+        if (spans_multiple_lines(file, d.span)) {
+            val ho: Option[token.Span] = header_span(file, d.span, '=');
+            if (is_some[token.Span](ho)) { ret ho; }
+        }
+    }
+
     ret some[token.Span](d.span);
+}
+
+# the leading part of `span` up to the first `stop` byte, trailing whitespace
+# removed, or none when `stop` does not occur
+fun header_span(file: *src.SourceFile, span: token.Span, stop: u8) Option[token.Span] {
+    if (file == nil || file.text == nil) { ret none[token.Span](); }
+    val text: str = file.text;
+    var i: usize = span.offset;
+    val end: usize = span.offset + span.len;
+    for (i < end) {
+        if (text[i] == stop) {
+            var n: usize = i - span.offset;
+            for (n > 0 && is_space(text[span.offset + n - 1])) { n = n - 1; }
+            if (n == 0) { ret none[token.Span](); }
+            var out: token.Span;
+            out.offset = span.offset;
+            out.len    = n;
+            ret some[token.Span](out);
+        }
+        i = i + 1;
+    }
+    ret none[token.Span]();
+}
+
+# whether `span` covers a line break
+fun spans_multiple_lines(file: *src.SourceFile, span: token.Span) bool {
+    if (file == nil || file.text == nil) { ret false; }
+    val text: str = file.text;
+    var i: usize = span.offset;
+    val end: usize = span.offset + span.len;
+    for (i < end) {
+        if (text[i] == '\n') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun is_space(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
 
 # the `name: type` span of a parameter symbol - from its
