@@ -1,4 +1,4 @@
-# crash containment: the client-facing half of the server
+# crash containment and recovery: the client-facing half of the server
 #
 # The analysis worker runs the compiler front end over buffers the user is
 # actively breaking. A front-end defect there is an in-process fault - a bad
@@ -9,14 +9,34 @@
 # So the process the editor talks to does not run the compiler. It owns the
 # client's stdin and stdout, spawns a second copy of this executable with
 # `--worker`, and relays frames between them. A fault in the worker is then an
-# ordinary child exit, which the parent survives and can explain: the in-flight
-# request is answered, the user is told, and the exit code says what happened.
+# ordinary child exit, which the parent survives and can explain.
 #
-# Restart with state replay is deliberately NOT here. Replaying a session means
-# the parent owning document text - reconstructing it through incremental edits
-# it would otherwise never parse - which is the design in #154/#155 and a much
-# larger change than containment. Reporting a crash honestly and exiting is
-# worth having on its own, and an editor restarts a server that exits.
+# Surviving is not the same as recovering. The state the worker held - open
+# documents, their current text, what the client negotiated at `initialize` -
+# died with it, and the client will not send any of it again. `mirror` keeps the
+# supervisor's own copy of exactly that, built from the frames the client sent,
+# so a replacement worker can be brought to the state the dead one was in.
+#
+# Two threads and one lock:
+#
+#   - the client pump reads the client, folds each frame into the mirror, and
+#     writes it to the current worker;
+#   - the main thread relays worker output, and on the worker's death reaps it,
+#     spawns a replacement, and arms a replay.
+#
+# The replay is performed by the client pump rather than by the thread that
+# spawned the worker, and that is not an arbitrary split. Replaying a session
+# means writing every open document's full text into the worker's input, which
+# is far more than a pipe holds; the worker answers with diagnostics for each,
+# which is far more than the other pipe holds. Whoever writes the replay must
+# not also be the one draining the answers, or the two block against each other
+# and the session hangs instead of recovering. The main thread is already
+# draining, so the pump writes.
+#
+# The cost of that split is that a replay waits for the client's next frame. An
+# idle client sees a recovered session on its next keystroke rather than
+# immediately, which is invisible in practice: the request the worker died on is
+# answered with an error straight away, and that is what the client reacts to.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -24,6 +44,7 @@ use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.result.Result;
 use std.types.result.is_err;
 use std.types.result.unwrap_ok;
@@ -34,30 +55,84 @@ use os:     std.system.os;
 use exec:   std.process.exec;
 use env:    std.process.env;
 use thread: std.sync.thread;
+use mutex:  std.sync.mutex;
 use atomic: std.sync.atomic;
 
 use sj:        std.data.json;
 use json:      mls.json;
+use mirror:    mls.mirror;
 use transport: mls.transport;
 use trace:     mls.trace;
 
 # the argument that selects the worker role
 pub val WORKER_FLAG: str = "--worker";
 
-# exit code when the worker died on a signal, distinct from a clean protocol
-# exit (0) and a transport failure (1) so a wrapper can tell them apart
+# exit code when the worker died on a signal and could not be recovered,
+# distinct from a clean protocol exit (0) and a transport failure (1) so a
+# wrapper can tell them apart
 pub val EXIT_WORKER_CRASHED: i64 = 3;
+
+# how many times a session will replace a crashed worker
+#
+# A cap rather than a timed backoff, because there is no sleep to back off with
+# and because the thing worth bounding is not the rate but the pointlessness: a
+# session that has crashed this many times is not going to stop.
+val MAX_RESTARTS: i64 = 5;
+
+# how many replacements may die without ever answering anything
+#
+# A worker that dies having emitted no frame at all died on the session itself -
+# on replay, or on the first thing it was asked - so replacing it again reruns
+# exactly what killed it. Two of those in a row is a crash loop, and the useful
+# response is to stop and say so rather than to keep spawning.
+val MAX_BARREN: i64 = 2;
+
+# how long a request may go unanswered before the worker is declared hung
+#
+# A compiler stuck in non-cooperative code cannot read a cancellation, so the
+# only way out is to end the process. The number is deliberately far above any
+# real analysis - a cold load of a large project is seconds, and a warm request
+# is under a millisecond - because the failure mode of a deadline that is too
+# short is to kill work that was about to succeed, which is worse than the hang
+# it is guarding against. A hang is indefinite; two minutes of silence is not
+# ambiguous.
+val DEFAULT_DEADLINE_NS: i64 = 120000000000;
+
+# the same bound, overridable for a workspace where two minutes is genuinely
+# too short - and for the test, which cannot wait that long to prove the
+# watchdog fires
+val DEADLINE_VAR: str = "MLS_REQUEST_DEADLINE_MS";
+
+# how long the worker gets to exit on its own after the client says `exit`
+#
+# Shutdown must terminate even when analysis is wedged, because a language
+# server that will not exit is a process the user has to hunt down.
+val SHUTDOWN_GRACE_NS: i64 = 2000000000;
+
+# how often the watchdog looks at the clock
+val WATCH_TICK_NS: i64 = 200000000;
 
 # the relay's shared state
 #
-# `to_worker` is written by the pump thread and read by nobody else; the fields
-# here are what the two halves genuinely share.
+# `to_worker` and `mir` are written by whichever thread holds `mu`; the atomics
+# are read across threads without it.
 rec Relay {
     alloc:      *Allocator;
+    mu:         mutex.Mutex;
     to_worker:  i32;
+    mir:        mirror.Mirror;
     stop:       i64;
     last_id:    i64;
     have_id:    i64;
+    need_replay: i64;
+    swallow:    i64;
+    pid:        i64;
+    req_at:     i64;
+    exit_at:    i64;
+    down_seen:  i64;
+    deadline:   i64;
+    timed_out:  i64;
+    open_token: str;
 }
 
 # one relay per process; the pump thread is handed its address
@@ -67,10 +142,162 @@ var RELAY: Relay;
 #
 # `self` is this executable's path, re-spawned with `--worker`.
 pub fun run(alloc: *Allocator, self: str) i64 {
+    # the worker records the protocol; this process would only record it a
+    # second time, and two processes appending to one log overwrite each other
+    trace.mute_frames();
+
     var to_worker:   [2]i32;
     var from_worker: [2]i32;
-    if (os.pipe(?to_worker[0]) < 0)   { trace.log("supervisor: pipe failed\n"); ret 1; }
-    if (os.pipe(?from_worker[0]) < 0) { trace.log("supervisor: pipe failed\n"); ret 1; }
+
+    RELAY.alloc       = alloc;
+    RELAY.mu          = mutex.make();
+    RELAY.stop        = 0;
+    RELAY.last_id     = 0;
+    RELAY.have_id     = 0;
+    RELAY.need_replay = 0;
+    RELAY.swallow     = 0;
+    RELAY.pid         = -1;
+    RELAY.req_at      = 0;
+    RELAY.exit_at     = 0;
+    RELAY.down_seen   = 0;
+    RELAY.timed_out   = 0;
+    RELAY.open_token  = nil;
+    RELAY.deadline    = configured_deadline();
+    mirror.init(?RELAY.mir, alloc);
+
+    var pid: i64 = start_worker(self, ?to_worker[0], ?from_worker[0]);
+    if (pid < 0) {
+        trace.log("supervisor: could not start the analysis worker\n");
+        mirror.dnit(?RELAY.mir);
+        ret 1;
+    }
+    RELAY.to_worker = to_worker[1];
+    atomic.store(?RELAY.pid, pid);
+
+    var pump: thread.Thread;
+    thread.spawn_with(pump_client, (?RELAY)::*u8, ?pump);
+    if (pump.tid < 0) {
+        os.close(to_worker[1]);
+        os.close(from_worker[0]);
+        trace.log("supervisor: could not start the client pump\n");
+        mirror.dnit(?RELAY.mir);
+        ret 1;
+    }
+
+    # the watchdog is the only thing holding a clock. Both pumps are parked in
+    # read(2) for as long as the worker is silent, which is exactly the state a
+    # hang produces, so neither of them can notice one.
+    var watch: thread.Thread;
+    thread.spawn_with(watchdog, (?RELAY)::*u8, ?watch);
+
+    var code:     i64 = 0;
+    var restarts: i64 = 0;
+    var barren:   i64 = 0;
+    var reading:  i32 = from_worker[0];
+
+    for (true) {
+        var frames: i64 = 0;
+        val clean: bool = pump_worker(alloc, reading, ?frames);
+
+        # the watchdog must not be able to signal this pid once it is being
+        # reaped: the kernel is free to reuse the number the moment wait
+        # returns, and terminating a reused pid kills an unrelated process
+        atomic.store(?RELAY.pid, -1);
+
+        var child: exec.Child;
+        child.pid = pid;
+        val wr: Result[exec.ExitStatus, str] = exec.wait(child);
+        if (is_err[exec.ExitStatus, str](wr)) { code = 1; brk; }
+        var status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](wr);
+
+        if (!exec.signaled(status)) {
+            # a clean or self-reported exit is the worker's own decision - a
+            # shutdown, or a transport failure it already described. Replacing
+            # it would restart a session the client is finished with.
+            if (!clean) { trace.log("supervisor: worker output ended mid-frame\n"); }
+            code = exec.code(status)::i64;
+            brk;
+        }
+
+        val sig: i64 = exec.signal(status)::i64;
+
+        # a worker ended during shutdown is not a crash to recover from - the
+        # client is leaving, and the kill was ours. The protocol's own rule
+        # decides the code, because the worker no longer can.
+        if (atomic.load(?RELAY.exit_at) != 0) {
+            trace.logf("supervisor: worker ended during shutdown by signal {}", sig);
+            code = 1;
+            if (atomic.load(?RELAY.down_seen) != 0) { code = 0; }
+            brk;
+        }
+
+        if (frames == 0) { barren = barren + 1; }
+        or { barren = 0; }
+
+        val may_retry: bool = restarts < MAX_RESTARTS
+                           && barren < MAX_BARREN
+                           && mirror.has_session(?RELAY.mir)
+                           && atomic.load(?RELAY.stop) == 0;
+        if (!may_retry) {
+            report_crash(alloc, sig, false);
+            code = EXIT_WORKER_CRASHED;
+            brk;
+        }
+
+        # The replacement is in place and armed BEFORE the client is told
+        # anything. Telling it first would invite it to send into the gap where
+        # there is no worker to send to: a client that has just been handed an
+        # error for its pending request reissues immediately, and that reissue
+        # would be dropped with nothing left to answer it. Ordering it this way
+        # means every frame the client sends in reaction to the crash arrives at
+        # a worker that exists, behind a replay that is already pending.
+        os.close(reading);
+        mutex.lock(?RELAY.mu);
+        os.close(RELAY.to_worker);
+        RELAY.to_worker = -1;
+        atomic.store(?RELAY.need_replay, 1);
+        pid = start_worker(self, ?to_worker[0], ?from_worker[0]);
+        if (pid >= 0) {
+            RELAY.to_worker = to_worker[1];
+            reading         = from_worker[0];
+            atomic.store(?RELAY.swallow, 1);
+            atomic.store(?RELAY.pid, pid);
+        }
+        mutex.unlock(?RELAY.mu);
+
+        if (pid < 0) {
+            trace.log("supervisor: could not restart the analysis worker\n");
+            report_crash(alloc, sig, false);
+            code = EXIT_WORKER_CRASHED;
+            brk;
+        }
+        restarts = restarts + 1;
+
+        # now the request the worker died holding is answered: the replacement
+        # will never have heard of it, so nothing else is going to unblock the
+        # client
+        report_crash(alloc, sig, true);
+        trace.logf("supervisor: analysis worker replaced after signal {}", sig);
+    }
+
+    atomic.store(?RELAY.stop, 1);
+    os.close(reading);
+    mutex.lock(?RELAY.mu);
+    os.close(RELAY.to_worker);
+    RELAY.to_worker = -1;
+    mutex.unlock(?RELAY.mu);
+    mirror.dnit(?RELAY.mir);
+    ret code;
+}
+
+# spawn a worker over fresh pipes, returning its pid or a negative value
+#
+# `to` and `from` receive the pipe pairs; the caller keeps `to[1]` and `from[0]`
+# and the child's ends are closed here, because holding them past the child's
+# exit would keep the pipes open and turn a crash into a hang.
+fun start_worker(self: str, to: *i32, from: *i32) i64 {
+    if (os.pipe(to) < 0)   { ret -1; }
+    if (os.pipe(from) < 0) { os.close(to[0]); os.close(to[1]); ret -1; }
 
     var argv: [3]*u8;
     argv[0] = self::*u8;
@@ -82,74 +309,136 @@ pub fun run(alloc: *Allocator, self: str) i64 {
     # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
     # until something that depends on one of them stops working.
     val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
-                                       to_worker[0], from_worker[1], 2);
-    # the child owns its ends now; holding them here would keep the pipes open
-    # past the child's exit and turn a crash into a hang
-    os.close(to_worker[0]);
-    os.close(from_worker[1]);
+                                       to[0], from[1], 2);
+    os.close(to[0]);
+    os.close(from[1]);
     if (pid < 0) {
-        os.close(to_worker[1]);
-        os.close(from_worker[0]);
-        trace.log("supervisor: could not start the analysis worker\n");
-        ret 1;
+        os.close(to[1]);
+        os.close(from[0]);
+        ret -1;
     }
-
-    RELAY.alloc     = alloc;
-    RELAY.to_worker = to_worker[1];
-    RELAY.stop      = 0;
-    RELAY.last_id   = 0;
-    RELAY.have_id   = 0;
-
-    var pump: thread.Thread;
-    thread.spawn_with(pump_client, (?RELAY)::*u8, ?pump);
-    if (pump.tid < 0) {
-        os.close(to_worker[1]);
-        os.close(from_worker[0]);
-        trace.log("supervisor: could not start the client pump\n");
-        ret 1;
-    }
-
-    # relay the worker's output to the client until the worker's end closes
-    val clean: bool = pump_worker(alloc, from_worker[0]);
-    atomic.store(?RELAY.stop, 1);
-
-    var child: exec.Child;
-    child.pid = pid;
-    val wr: Result[exec.ExitStatus, str] = exec.wait(child);
-    os.close(to_worker[1]);
-    os.close(from_worker[0]);
-
-    if (is_err[exec.ExitStatus, str](wr)) { ret 1; }
-    var status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](wr);
-
-    if (exec.signaled(status)) {
-        report_crash(alloc, exec.signal(status)::i64);
-        ret EXIT_WORKER_CRASHED;
-    }
-    if (!clean) { trace.log("supervisor: worker output ended mid-frame\n"); }
-    ret exec.code(status)::i64;
+    ret pid;
 }
 
-# forward client frames to the worker, recording the newest request id
+# end a worker that has stopped answering, and bound shutdown
 #
-# The id is what lets a crash be attributed to a request rather than reported
-# as an anonymous failure. Only the newest is kept: with one worker executing in
-# order, the newest request is the one that was running.
+# A compiler stuck in non-cooperative code cannot read a cancellation frame, so
+# there is nothing to ask: the only way to get the session back is to end the
+# process. Killing it turns the hang into the crash the rest of this file
+# already knows how to handle - the request is answered, a replacement is
+# spawned, and the session is replayed into it.
+#
+# This has to be its own thread because both pumps are parked in read(2) for as
+# long as the worker is silent, and silence is precisely what a hang looks like.
+fun watchdog(arg: *u8) {
+    val r: *Relay = arg::*Relay;
+    for (atomic.load(?r.stop) == 0) {
+        os.sleep(WATCH_TICK_NS);
+        val now: i64 = now_ns();
+
+        var doomed: i64 = 0;
+
+        # a request that has gone unanswered past the deadline
+        val started: i64 = atomic.load(?r.req_at);
+        if (atomic.load(?r.have_id) != 0 && started != 0 && now - started > r.deadline) {
+            atomic.store(?r.timed_out, 1);
+            doomed = atomic.load(?r.pid);
+            if (doomed > 0) { trace.logf("supervisor: worker exceeded the request deadline, ending pid {}", doomed); }
+        }
+
+        # or a worker that has not exited after the client said so
+        val leaving: i64 = atomic.load(?r.exit_at);
+        if (doomed == 0 && leaving != 0 && now - leaving > SHUTDOWN_GRACE_NS) {
+            doomed = atomic.load(?r.pid);
+            if (doomed > 0) { trace.logf("supervisor: worker did not exit, ending pid {}", doomed); }
+        }
+
+        if (doomed > 0) {
+            # under the lock so the reaping thread cannot swap the pid out from
+            # under the signal
+            mutex.lock(?r.mu);
+            val target: i64 = atomic.load(?r.pid);
+            if (target == doomed) {
+                var c: exec.Child;
+                c.pid = target;
+                exec.terminate_child(c);
+            }
+            mutex.unlock(?r.mu);
+        }
+    }
+}
+
+# the monotonic clock in nanoseconds, or 0 when it cannot be read
+fun now_ns() i64 {
+    var ts: os.Timespec;
+    if (os.monotonic(?ts) < 0) { ret 0; }
+    ret ts.sec * 1000000000 + ts.nsec;
+}
+
+# the request deadline, from the environment when it names one
+fun configured_deadline() i64 {
+    var buf: [24]u8;
+    val n: i64 = env.get(DEADLINE_VAR, ?buf[0], 24);
+    if (n <= 0) { ret DEFAULT_DEADLINE_NS; }
+    var ms: i64 = 0;
+    var i: usize = 0;
+    for (i < n::usize) {
+        if (buf[i] < '0' || buf[i] > '9') { ret DEFAULT_DEADLINE_NS; }
+        ms = ms * 10 + (buf[i]::i64 - '0'::i64);
+        i = i + 1;
+    }
+    if (ms <= 0) { ret DEFAULT_DEADLINE_NS; }
+    ret ms * 1000000;
+}
+
+# forward client frames to the worker, recording what a replay would need
+#
+# The mirror is folded under the same lock as the write, so a replacement worker
+# is never told about a document by a replay and by a live frame in the wrong
+# order: whatever the mirror has been told, the worker has been told.
 fun pump_client(arg: *u8) {
     val r: *Relay = arg::*Relay;
     for (atomic.load(?r.stop) == 0) {
         var msg: transport.Message;
         val st: transport.ReadStatus = transport.read_message(?msg, r.alloc);
         if (st != transport.READ_OK) { brk; }
+
         note_request(r, msg.body, msg.body_len);
-        if (!write_frame(r.to_worker, msg.body, msg.body_len)) {
-            transport.message_free(?msg, r.alloc);
-            brk;
+
+        mutex.lock(?r.mu);
+        # a replay is only spent once it lands. Clearing the flag on a failed
+        # write would leave the next worker holding a session it was never told
+        # about, which is worse than not restarting at all: it would answer
+        # confidently about documents it has never seen.
+        if (r.to_worker >= 0 && atomic.load(?r.need_replay) != 0) {
+            if (mirror.replay(?r.mir, r.to_worker)) { atomic.store(?r.need_replay, 0); }
         }
+
+        # the mirror is folded whether or not the frame reaches a worker. A
+        # frame lost to a dying worker's pipe is not lost to the session: it is
+        # already in the state the replacement will be given.
+        mirror.record(?r.mir, msg.body, msg.body_len);
+
+        if (r.to_worker >= 0 && atomic.load(?r.need_replay) == 0) {
+            # a write that fails is a worker that has died, which the main
+            # thread is already reaping. It is NOT the end of the client
+            # connection, and treating it as one would end the session on
+            # exactly the timing this whole mechanism exists to survive: a
+            # request forwarded in the instant between the crash and the
+            # supervisor noticing it.
+            transport.write_frame_to(r.to_worker, msg.body, msg.body_len);
+        }
+        mutex.unlock(?r.mu);
+
         transport.message_free(?msg, r.alloc);
     }
+
     # closing the worker's input is how it learns the client is gone
-    os.close(r.to_worker);
+    mutex.lock(?r.mu);
+    if (r.to_worker >= 0) { os.close(r.to_worker); }
+    r.to_worker = -1;
+    mutex.unlock(?r.mu);
+    atomic.store(?r.stop, 1);
 }
 
 # forget a request the worker has answered
@@ -158,25 +447,93 @@ fun pump_client(arg: *u8) {
 # even when the worker had already answered it - two responses for one id,
 # which is exactly the rule the worker's own dispatcher backstop exists to
 # keep. The parent must know what is actually outstanding, not what was recent.
-fun note_response(r: *Relay, body: str, len: usize) {
-    if (atomic.load(?r.have_id) == 0) { ret; }
+fun note_response(r: *Relay, body: str, len: usize) bool {
+    var relay: bool = true;
     var rd: json.Reader;
-    if (!json.reader_init(?rd, r.alloc)) { ret; }
+    if (!json.reader_init(?rd, r.alloc)) { ret relay; }
     var parsed: json.Message = json.read(?rd, body, len);
     if (parsed.valid) {
+        note_progress(r, ?parsed.root);
         val idv: *sj.Value = json.member(?parsed.root, "id");
         val answered: bool = json.member(?parsed.root, "result") != nil
                           || json.member(?parsed.root, "error") != nil;
         if (idv != nil && answered) {
             val id: str = json.id_text(idv, r.alloc);
             if (id != nil) {
-                if (parse_id(id) == atomic.load(?r.last_id)) { atomic.store(?r.have_id, 0); }
+                # a replayed `initialize` is answered with the id the client
+                # already holds a response for; forwarding the second one would
+                # be two responses for one request
+                if (atomic.load(?r.swallow) != 0) {
+                    val want: str = mirror.replay_id(?r.mir);
+                    if (want != nil && str_equals(id, want)) {
+                        atomic.store(?r.swallow, 0);
+                        relay = false;
+                    }
+                }
+                if (parse_id(id) == atomic.load(?r.last_id)) {
+                    atomic.store(?r.have_id, 0);
+                    atomic.store(?r.req_at, 0);
+                }
                 json.free_str(id, r.alloc);
             }
         }
     }
     json.release(?rd);
     json.reader_dnit(?rd);
+    ret relay;
+}
+
+# follow the worker's progress reports so an abandoned one can be closed
+#
+# A progress token is opened by the worker and closed by the worker, which works
+# until the worker stops existing between the two. What the person is left with
+# is a spinner that never goes away - the visible form of exactly the failure
+# the supervisor exists to clean up after, so it cleans up after this one too.
+#
+# One slot is enough because analysis is one worker running `try_load` to
+# completion before the next: begin and end are strictly nested and never
+# overlap. If that ever stops being true this needs to grow a list, which is why
+# it is written as a replacement rather than an assignment - losing track is
+# reported by the previous token being closed, not by silence.
+fun note_progress(r: *Relay, root: *sj.Value) {
+    if (!json.text_equals(json.member(root, "method"), "$/progress", r.alloc)) { ret; }
+    val params: *sj.Value = json.member(root, "params");
+    val kind: *sj.Value = json.member2(params, "value", "kind");
+
+    if (json.text_equals(kind, "begin", r.alloc)) {
+        val token: str = json.text(json.member(params, "token"), r.alloc);
+        if (token == nil) { ret; }
+        if (r.open_token != nil) { close_progress(r); }
+        r.open_token = token;
+        ret;
+    }
+    if (json.text_equals(kind, "end", r.alloc)) {
+        if (r.open_token == nil) { ret; }
+        val token: str = json.text(json.member(params, "token"), r.alloc);
+        if (token != nil) {
+            if (str_equals(token, r.open_token)) {
+                json.free_str(r.open_token, r.alloc);
+                r.open_token = nil;
+            }
+            json.free_str(token, r.alloc);
+        }
+    }
+}
+
+# end a progress report the worker will never end itself
+fun close_progress(r: *Relay) {
+    if (r.open_token == nil) { ret; }
+    var b: json.Buf = json.buf_init(r.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":");
+    json.buf_push_quoted(?b, r.open_token);
+    json.buf_push(?b, ",\"value\":{\"kind\":\"end\",\"message\":");
+    json.buf_push_quoted(?b, "analysis ended unexpectedly");
+    json.buf_push(?b, "}}}");
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) { transport.send_message(msg, r.alloc); }
+    json.buf_dnit(?b);
+    json.free_str(r.open_token, r.alloc);
+    r.open_token = nil;
 }
 
 # remember the newest request id seen on the client stream
@@ -188,9 +545,15 @@ fun note_request(r: *Relay, body: str, len: usize) {
         val id: str = json.id_text(json.member(?parsed.root, "id"), r.alloc);
         if (id != nil) {
             atomic.store(?r.last_id, parse_id(id));
+            atomic.store(?r.req_at, now_ns());
             atomic.store(?r.have_id, 1);
             json.free_str(id, r.alloc);
         }
+        val m: *sj.Value = json.member(?parsed.root, "method");
+        if (json.text_equals(m, "shutdown", r.alloc)) { atomic.store(?r.down_seen, 1); }
+        # `exit` starts the clock on shutdown: from here the worker has a
+        # bounded time to go on its own before it is ended
+        if (json.text_equals(m, "exit", r.alloc)) { atomic.store(?r.exit_at, now_ns()); }
     }
     json.release(?rd);
     json.reader_dnit(?rd);
@@ -213,27 +576,29 @@ fun parse_id(token: str) i64 {
     ret v;
 }
 
-# copy the worker's frames to the client, returning whether the stream ended
-# on a frame boundary
+# copy the worker's frames to the client until its end closes
 #
-# Every relayed response clears the outstanding id, so a crash is reported
-# against a request that is genuinely unanswered rather than the most recent one.
-fun pump_worker(alloc: *Allocator, fd: i32) bool {
+# `frames` counts what this worker generation actually produced, which is how a
+# worker that died on the session itself is told apart from one that died on a
+# particular request.
+# ---
+# alloc:  the relay allocator
+# fd:     the worker's output
+# frames: receives the number of frames relayed
+# ret:    whether the stream ended on a frame boundary
+fun pump_worker(alloc: *Allocator, fd: i32, frames: *i64) bool {
     for (true) {
         var msg: transport.Message;
         val st: transport.ReadStatus = transport.read_message_from(fd, ?msg, alloc);
         if (st == transport.READ_EOF) { ret true; }
         if (st != transport.READ_OK)  { ret false; }
-        note_response(?RELAY, msg.body, msg.body_len);
-        transport.send_message(msg.body, alloc);
+        @frames = @frames + 1;
+        if (note_response(?RELAY, msg.body, msg.body_len)) {
+            transport.send_message(msg.body, alloc);
+        }
         transport.message_free(?msg, alloc);
     }
     ret true;
-}
-
-# write one Content-Length frame to `fd`
-fun write_frame(fd: i32, body: str, len: usize) bool {
-    ret transport.write_frame_to(fd, body, len);
 }
 
 # tell the client the analysis worker died, and answer the request it died on
@@ -241,8 +606,19 @@ fun write_frame(fd: i32, body: str, len: usize) bool {
 # Two messages, because they serve different readers: the error response
 # unblocks the client's pending request, and the showMessage is what the person
 # sees. Without the first, an editor waits on that id until it gives up.
-fun report_crash(alloc: *Allocator, sig: i64) {
+#
+# `recovering` changes only what the person is told. A session that is coming
+# back should not be described in the same words as one that is not, and the
+# severity follows: a recovered crash is a warning about work that was lost, a
+# final one is an error about a server that has stopped.
+fun report_crash(alloc: *Allocator, sig: i64, recovering: bool) {
     trace.logf("supervisor: analysis worker terminated by signal {}", sig);
+
+    val hung: bool = atomic.load(?RELAY.timed_out) != 0;
+    atomic.store(?RELAY.timed_out, 0);
+
+    # whatever the worker was reporting, it is not reporting it any more
+    close_progress(?RELAY);
 
     if (atomic.load(?RELAY.have_id) != 0) {
         val id: i64 = atomic.load(?RELAY.last_id);
@@ -250,21 +626,39 @@ fun report_crash(alloc: *Allocator, sig: i64) {
             var b: json.Buf = json.buf_init(alloc);
             json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
             json.buf_push_i64(?b, id);
-            json.buf_push(?b, ",\"error\":{\"code\":-32603,\"message\":");
-            json.buf_push_quoted(?b, "the mach analysis worker crashed while handling this request");
+            # a request the server gave up on is ServerCancelled, not an
+            # internal error: nothing went wrong inside the request, it was
+            # abandoned, and a client is entitled to treat the two differently
+            if (hung) { json.buf_push(?b, ",\"error\":{\"code\":-32802,\"message\":"); }
+            or        { json.buf_push(?b, ",\"error\":{\"code\":-32603,\"message\":"); }
+            if (hung) { json.buf_push_quoted(?b, "the mach analysis worker stopped responding and was restarted"); }
+            or        { json.buf_push_quoted(?b, "the mach analysis worker crashed while handling this request"); }
             json.buf_push(?b, "}}");
             val msg: str = json.buf_str(?b);
             if (msg != nil) { transport.send_message(msg, alloc); }
             json.buf_dnit(?b);
+            atomic.store(?RELAY.have_id, 0);
         }
     }
 
     var n: json.Buf = json.buf_init(alloc);
-    json.buf_push(?n, "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":1,\"message\":");
+    json.buf_push(?n, "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":");
+    if (recovering) { json.buf_push(?n, "2"); }
+    or             { json.buf_push(?n, "1"); }
+    json.buf_push(?n, ",\"message\":");
     var text: json.Buf = json.buf_init(alloc);
-    json.buf_push(?text, "mach-lsp: the analysis worker crashed (signal ");
+    if (hung) { json.buf_push(?text, "mach-lsp: the analysis worker stopped responding and was ended (signal "); }
+    or        { json.buf_push(?text, "mach-lsp: the analysis worker crashed (signal "); }
     json.buf_push_i64(?text, sig);
-    json.buf_push(?text, "). This is a compiler front-end fault; the language server has stopped.");
+    json.buf_push(?text, "). ");
+    if (hung) { json.buf_push(?text, "Analysis was stuck and could not be interrupted"); }
+    or        { json.buf_push(?text, "This is a compiler front-end fault"); }
+    if (recovering) {
+        json.buf_push(?text, "; the server has restarted and restored your open documents.");
+    }
+    or {
+        json.buf_push(?text, "; the language server has stopped.");
+    }
     json.buf_push_quoted(?n, json.buf_str(?text));
     json.buf_push(?n, "}}");
     val nmsg: str = json.buf_str(?n);

@@ -1,0 +1,121 @@
+# telling the person that analysis is running
+#
+# A cold project load is seconds during which the server answers nothing and
+# says nothing. From the outside that is indistinguishable from a server that
+# has hung - and it is now MORE important to distinguish them, because the
+# supervisor deliberately waits two minutes before it will call analysis stuck.
+# A progress report is what makes the difference visible without making the
+# deadline shorter.
+#
+# Only the cold load reports. A revalidation is a few hundred milliseconds, and
+# a spinner that appears and vanishes on every keystroke is worse than none: it
+# trains the reader to ignore the one that matters.
+#
+# The token is created and used without waiting for the client's answer.
+# `window/workDoneProgress/create` is a request, and the thread that would wait
+# for its response is the thread that reads responses, so waiting is not
+# available here. A client that refuses the token ignores the reports that
+# follow, which is the same outcome as not sending them - so the cost of not
+# waiting is nothing, while the cost of waiting would be the deadlock.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.Allocator;
+
+use json:      mls.json;
+use transport: mls.transport;
+
+# whether the client said it can render work-done progress
+#
+# Absent this, the reports are not merely useless but wrong: `$/progress` for a
+# token the client never agreed to is noise on the wire.
+var SUPPORTED: bool = false;
+
+# distinguishes one report from the next within a session
+var SEQ: i64 = 0;
+
+# record what the client advertised at `initialize`
+# ---
+# supported: the value of `capabilities.window.workDoneProgress`
+pub fun configure(supported: bool) {
+    SUPPORTED = supported;
+}
+
+# whether reports will be sent
+pub fun active() bool {
+    ret SUPPORTED;
+}
+
+# open a progress report, returning its owned token, or nil when none was sent
+#
+# The caller owns the token and must pass it back to `finish`; a nil token is a
+# report that was never opened and `finish` accepts it, so a caller does not
+# have to test whether progress is on.
+# ---
+# alloc: allocator for the token
+# title: what the person is told is happening
+# ret:   the owned token, or nil
+pub fun start(alloc: *Allocator, title: str) str {
+    if (!SUPPORTED) { ret nil; }
+    SEQ = SEQ + 1;
+
+    var tb: json.Buf = json.buf_init(alloc);
+    json.buf_push(?tb, "mls/progress/");
+    json.buf_push_i64(?tb, SEQ);
+    val view: str = json.buf_str(?tb);
+    if (view == nil) { json.buf_dnit(?tb); ret nil; }
+    val token: str = json.dup(view, alloc);
+    json.buf_dnit(?tb);
+    if (token == nil) { ret nil; }
+
+    var c: json.Buf = json.buf_init(alloc);
+    json.buf_push(?c, "{\"jsonrpc\":\"2.0\",\"id\":\"");
+    json.buf_push(?c, token);
+    json.buf_push(?c, "/create\",\"method\":\"window/workDoneProgress/create\",\"params\":{\"token\":");
+    json.buf_push_quoted(?c, token);
+    json.buf_push(?c, "}}");
+    send(?c, alloc);
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":");
+    json.buf_push_quoted(?b, token);
+    json.buf_push(?b, ",\"value\":{\"kind\":\"begin\",\"cancellable\":false,\"title\":");
+    json.buf_push_quoted(?b, title);
+    json.buf_push(?b, "}}}");
+    send(?b, alloc);
+    ret token;
+}
+
+# close a progress report and release its token
+#
+# A nil token is a report that was never opened, which is the normal case when
+# the client does not support progress.
+# ---
+# alloc: allocator the token came from
+# token: the token from `start`, consumed
+# note:  a closing message, or nil
+pub fun finish(alloc: *Allocator, token: str, note: str) {
+    if (token == nil) { ret; }
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"$/progress\",\"params\":{\"token\":");
+    json.buf_push_quoted(?b, token);
+    json.buf_push(?b, ",\"value\":{\"kind\":\"end\"");
+    if (note != nil) {
+        json.buf_push(?b, ",\"message\":");
+        json.buf_push_quoted(?b, note);
+    }
+    json.buf_push(?b, "}}}");
+    send(?b, alloc);
+    json.free_str(token, alloc);
+}
+
+# frame and send one buffer, then release it
+fun send(b: *json.Buf, alloc: *Allocator) {
+    val msg: str = json.buf_str(b);
+    if (msg != nil) { transport.send_message(msg, alloc); }
+    json.buf_dnit(b);
+}

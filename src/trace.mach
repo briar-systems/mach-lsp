@@ -10,9 +10,20 @@
 # with no syscalls. when it is set the log file is opened once and the
 # descriptor is reused for the life of the process, so each enabled call
 # costs a single write.
+#
+# what a trace may contain is a separate decision from whether it is on. A
+# message body is the user's source code: every `didOpen` carries a whole file
+# and every `didChange` carries whatever they just typed. Writing that to a
+# world-readable path in /tmp is not a reasonable price for finding out which
+# requests arrived in which order, which is what tracing is usually turned on
+# for. So the default records only what a message IS - direction, method, id,
+# size, timing - and the bodies themselves need `MLS_TRACE_BODIES`, which is a
+# deliberate second decision and still capped, because a trace that pages in a
+# 40 KB buffer per keystroke is unreadable as well as invasive.
 
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_equals;
 use std.types.size.usize;
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -26,11 +37,57 @@ use chrono: std.chrono.time;
 use fmtstr: std.format;
 use writer: std.io.writer;
 
-# fixed file the trace log is appended to
+# file the trace log is appended to when nothing overrides it
 val LOG_PATH: str = "/tmp/mach-lsp.log";
+
+# environment variable naming a different file to append to
+#
+# A fixed path in a shared temp directory is the wrong default to force on
+# anyone: it collides between concurrent servers and it puts the log somewhere
+# the user did not choose. It stays the default because a trace has to land
+# somewhere without configuration, but it is only the default.
+val PATH_VAR: str = "MLS_TRACE_FILE";
+
+# storage for a path read from the environment; the descriptor is opened once
+# so this is only touched during that open
+var PATH_BUF: [512]u8;
 
 # environment variable that enables tracing when set
 val TRACE_VAR: str = "MLS_TRACE";
+
+# the value of MLS_TRACE that additionally permits message bodies in the log
+#
+# One variable answers both questions - whether to trace, and what a trace may
+# contain - because they are read at the same moment and a second variable was
+# a second thing to get wrong on a platform this cannot be tested on by hand.
+val BODIES_WORD: str = "bodies";
+
+# most bytes of any one body written to the log
+#
+# Enough to read a request and its arguments; far short of a source file.
+val BODY_CAP: usize = 512;
+
+# cached body gate, resolved with the enable gate
+var BODIES_ENABLED: bool = false;
+
+# whether this process records protocol frames
+#
+# Both halves of the server handle every frame - the worker reads and answers
+# it, the supervisor relays it - so with both recording, each frame was written
+# twice. That is not merely noise: two processes appending to one file race for
+# the offset, and the loser's line is overwritten, which on windows lost whole
+# frames from the middle of the log. The worker sees both directions, so it is
+# the one that records; the supervisor keeps only its own status lines, which
+# are few and far apart.
+var FRAMES: bool = true;
+
+# stop recording protocol frames in this process
+pub fun mute_frames() {
+    FRAMES = false;
+}
+
+# storage for the MLS_TRACE value; read once alongside the gate
+var GATE_BUF: [32]u8;
 
 # whether the MLS_TRACE gate has been evaluated yet
 var LOG_CHECKED: bool = false;
@@ -47,8 +104,13 @@ var LOG_FD: i64 = -1;
 # ---
 # ret: true when MLS_TRACE is present in the environment
 fun trace_enabled() bool {
-    var buf: [1]u8;
-    ret env.get(TRACE_VAR, ?buf[0], 1) >= 0;
+    val n: i64 = env.get(TRACE_VAR, ?GATE_BUF[0], 31);
+    if (n < 0) { ret false; }
+    var len: usize = n::usize;
+    if (len > 31) { len = 31; }
+    GATE_BUF[len] = 0;
+    BODIES_ENABLED = str_equals((?GATE_BUF[0])::str, BODIES_WORD);
+    ret true;
 }
 
 # open the trace log for appending
@@ -56,6 +118,11 @@ fun trace_enabled() bool {
 # ret: a live descriptor, or a negative value on failure
 fun trace_open() i64 {
     val flags: i32 = os.O_WRONLY | os.O_CREAT | os.O_APPEND;
+    val n: i64 = env.get(PATH_VAR, ?PATH_BUF[0], 511);
+    if (n > 0) {
+        PATH_BUF[n::usize] = 0;
+        ret os.open(os.AT_FDCWD, ?PATH_BUF[0], flags, 420);
+    }
     ret os.open(os.AT_FDCWD, LOG_PATH::*u8, flags, 420);
 }
 
@@ -91,6 +158,51 @@ pub fun enabled() bool {
         if (LOG_ENABLED) { LOG_FD = trace_open(); }
     }
     ret LOG_ENABLED && LOG_FD >= 0;
+}
+
+# whether message bodies may be written to the log
+#
+# Requires tracing to be on as well: the body gate widens what a trace contains,
+# it does not turn one on.
+pub fun bodies() bool {
+    if (!enabled()) { ret false; }
+    ret BODIES_ENABLED;
+}
+
+# record one protocol frame
+#
+# `label` names the direction ("recv" / "send"). The size is always recorded
+# because it is the part that is useful without being sensitive: it is how a
+# truncated or oversized frame is recognised. The body follows only when it has
+# been explicitly asked for, and only up to the cap - a truncated line says so
+# rather than trailing off, so a reader is never left wondering whether the
+# server sent something malformed or the log simply stopped.
+# ---
+# label: direction tag
+# body:  the frame body
+# len:   its length in bytes
+pub fun frame(label: str, body: str, len: usize) {
+    if (!FRAMES) { ret; }
+    if (!enabled()) { ret; }
+    if (!bodies()) {
+        logf("{} {} bytes", label, len);
+        ret;
+    }
+    log(label);
+    log(" ");
+    if (len <= BODY_CAP) {
+        log(body);
+        log("\n");
+        ret;
+    }
+    write_prefix(body, BODY_CAP);
+    logf(" ... [{} of {} bytes]", BODY_CAP, len);
+}
+
+# append the first `n` bytes of `s` verbatim
+fun write_prefix(s: str, n: usize) {
+    if (LOG_FD < 0 || s == nil) { ret; }
+    os.write(LOG_FD::i32, s::*u8, n);
 }
 
 # monotonic nanoseconds, for span timing

@@ -120,7 +120,7 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
                 if (match_tier(query, name) == tier) {
                     val spo: Option[token.Span] = features.decl_name_span_of(mv.a, sym);
                     if (is_some[token.Span](spo)) {
-                        push_symbol(b, mv.file, uri, unwrap[token.Span](spo), name,
+                        push_symbol(b, mv.text.file, uri, unwrap[token.Span](spo), name,
                                     features.lsp_symbol_kind(sym.kind), fqn, emitted > 0);
                         emitted = emitted + 1;
                     }

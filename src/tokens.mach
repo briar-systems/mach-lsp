@@ -100,7 +100,7 @@ pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
     json.buf_push(?b, "{\"data\":[");
-    encode(?b, an.file, toks, n);
+    encode(?b, an.text.file, toks, n);
     json.buf_push(?b, "]}");
     render.send(?b, alloc, id_raw);
 

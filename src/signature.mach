@@ -63,12 +63,12 @@ pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     if (!is_some[usize](off_o)) { render.reply_null(alloc, id_raw); ret; }
     val offset: usize = unwrap[usize](off_o);
 
-    val co: Option[CallSite] = enclosing_call(an.file, offset);
+    val co: Option[CallSite] = enclosing_call(an.text, offset);
     if (!is_some[CallSite](co)) { render.reply_null(alloc, id_raw); ret; }
     val call: CallSite = unwrap[CallSite](co);
 
     val ro: Option[features.SymbolRef] =
-        features.ref_at(an.a, an.rr, an.own, an.file, call.callee_offset);
+        features.ref_at(an.a, an.rr, an.own, an.text.file, call.callee_offset);
     if (!is_some[features.SymbolRef](ro)) { render.reply_null(alloc, id_raw); ret; }
     val sr: features.SymbolRef = unwrap[features.SymbolRef](ro);
 
@@ -76,7 +76,7 @@ pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     if (!is_some[*res.Symbol](so)) { render.reply_null(alloc, id_raw); ret; }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
 
-    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
+    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
     if (!is_some[project.Site](site_o)) { render.reply_null(alloc, id_raw); ret; }
     var site: project.Site = unwrap[project.Site](site_o);
 
@@ -91,12 +91,12 @@ pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc:
         render.reply_null(alloc, id_raw); ret;
     }
 
-    emit(alloc, id_raw, site.a, site.file, d, call.active);
+    emit(alloc, id_raw, site.a, site.text, d, call.active);
     project.free_site(ws, ?site);
 }
 
 # send the SignatureHelp for function declaration `d`
-fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: *src.SourceFile,
+fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
          d: *decl.Decl, active: usize) {
     val n: u32 = d.data.fun_.params_len;
 
@@ -162,7 +162,7 @@ fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: *src.SourceFile,
 }
 
 # `name: Type` for the parameter in `typed_names` slot `slot`
-fun push_param_text(b: *json.Buf, a: *ast.Ast, file: *src.SourceFile, slot: u32, alloc: *Allocator) {
+fun push_param_text(b: *json.Buf, a: *ast.Ast, file: positions.Text, slot: u32, alloc: *Allocator) {
     if (a.typed_names == nil) { ret; }
     val tn: *decl.TypedName = ?a.typed_names[slot::usize];
     val pname: str = positions.span_text(file, tn.name, alloc);
@@ -184,7 +184,7 @@ fun push_param_text(b: *json.Buf, a: *ast.Ast, file: *src.SourceFile, slot: u32,
 }
 
 # the declared return type as written, or nil when there is none
-fun return_type_text(a: *ast.Ast, file: *src.SourceFile, d: *decl.Decl, alloc: *Allocator) str {
+fun return_type_text(a: *ast.Ast, file: positions.Text, d: *decl.Decl, alloc: *Allocator) str {
     if (d.data.fun_.return_type == id.TYPE_NIL) { ret nil; }
     val to: Option[*atype.Type] = ast.get_type(a, d.data.fun_.return_type);
     if (!is_some[*atype.Type](to)) { ret nil; }
@@ -192,7 +192,7 @@ fun return_type_text(a: *ast.Ast, file: *src.SourceFile, d: *decl.Decl, alloc: *
 }
 
 # the function's own name as written
-fun decl_name_text(file: *src.SourceFile, d: *decl.Decl, alloc: *Allocator) str {
+fun decl_name_text(file: positions.Text, d: *decl.Decl, alloc: *Allocator) str {
     val nso: Option[token.Span] = features.decl_name_span(d);
     if (!is_some[token.Span](nso)) { ret nil; }
     ret positions.span_text(file, unwrap[token.Span](nso), alloc);
@@ -205,12 +205,13 @@ fun decl_name_text(file: *src.SourceFile, d: *decl.Decl, alloc: *Allocator) str 
 # or close a call, and nesting is tracked so an inner call's parens do not end
 # the search early.
 # ---
-# file:   the buffer
+# t:      the buffer, paired with its length
 # offset: cursor byte offset
 # ret:    the enclosing call, or none when the cursor is not inside one
-fun enclosing_call(file: *src.SourceFile, offset: usize) Option[CallSite] {
-    val text: str = file.text;
-    if (offset == 0 || offset > str_len(text)) { ret none[CallSite](); }
+fun enclosing_call(t: positions.Text, offset: usize) Option[CallSite] {
+    if (t.file == nil) { ret none[CallSite](); }
+    val text: str = t.file.text;
+    if (offset == 0 || offset > t.len) { ret none[CallSite](); }
 
     var depth:  i64   = 0;
     var commas: usize = 0;

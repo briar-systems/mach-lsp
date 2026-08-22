@@ -1,0 +1,330 @@
+# what the supervisor must remember to rebuild a worker
+#
+# Crash containment already answers the request a dying worker was holding and
+# tells the person what happened. It cannot bring the session back, because
+# everything the worker knew - which documents are open, what they currently
+# contain, what the client negotiated at `initialize` - lived only in the
+# process that died. The client is not going to send any of it again: `didOpen`
+# is sent once, and every `didChange` after it is a span against text only the
+# worker was keeping.
+#
+# So the supervisor keeps its own copy. It is a mirror in the strict sense: it
+# is built only from frames the client sent, it is never consulted to answer a
+# request, and it exists to be replayed into a replacement worker so that worker
+# reaches the state the dead one was in.
+#
+# The text is maintained rather than the frames that produced it. Keeping every
+# `didChange` would make replay exact at the cost of growing without bound for
+# the length of an editing session, and the splice that folds them together is
+# the same one the worker applies - `textedit` - so the two cannot drift.
+#
+# Replay is deliberately NOT a transcript. `initialize` and `initialized` go out
+# verbatim because the worker must see exactly what the client negotiated, but
+# the open documents go out as freshly built `didOpen` notifications carrying
+# current text, because that is the state a new worker needs, not the history
+# that produced it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.reallocate;
+use std.allocator.deallocate;
+
+use sj: std.data.json;
+
+use json:      mls.json;
+use textedit:  mls.textedit;
+use transport: mls.transport;
+
+# one open document as the client last described it
+# ---
+# uri:      owned document URI
+# language: owned languageId, replayed so the worker classifies the buffer the
+#           same way it did the first time
+# text:     owned current full text, folded from every change so far
+# version:  the client's last version for this document
+# live:     false once the client closed it; the slot is reused rather than
+#           compacted so a re-open keeps its place
+rec Doc {
+    uri:      str;
+    language: str;
+    text:     str;
+    version:  i64;
+    live:     bool;
+}
+
+# the replayable half of a session
+# ---
+# alloc:      allocator owning every string here
+# init_body:  owned verbatim `initialize` request frame
+# init_id:    owned id token of that request
+# ready_body: owned verbatim `initialized` notification frame, nil until seen
+# docs:       open-document slots
+# len:        number of slots
+pub rec Mirror {
+    alloc:      *Allocator;
+    init_body:  str;
+    init_id:    str;
+    ready_body: str;
+    docs:       *Doc;
+    len:        usize;
+}
+
+# an empty mirror
+pub fun init(m: *Mirror, alloc: *Allocator) {
+    m.alloc      = alloc;
+    m.init_body  = nil;
+    m.init_id    = nil;
+    m.ready_body = nil;
+    m.docs       = nil;
+    m.len        = 0;
+}
+
+# release every owned string and the slot array
+pub fun dnit(m: *Mirror) {
+    if (m.docs != nil && m.len > 0) {
+        var i: usize = 0;
+        for (i < m.len) {
+            clear_doc(m, ?m.docs[i]);
+            i = i + 1;
+        }
+        deallocate[Doc](m.alloc, m.docs, m.len);
+    }
+    free_field(m, ?m.init_body);
+    free_field(m, ?m.init_id);
+    free_field(m, ?m.ready_body);
+    m.docs = nil;
+    m.len  = 0;
+}
+
+# the request id whose replayed response must not reach the client
+#
+# `initialize` is replayed verbatim, so the replacement worker answers it with
+# the id the client used - an id the client already has a response for. Sending
+# the second one would be two responses for one request, which is exactly what
+# the worker's own dispatcher backstop exists to prevent. The supervisor drops
+# it instead, and this is how it recognises it.
+# ---
+# m:   the mirror
+# ret: the borrowed id token, or nil when no initialize was seen
+pub fun replay_id(m: *Mirror) str {
+    ret m.init_id;
+}
+
+# whether there is anything to replay
+pub fun has_session(m: *Mirror) bool {
+    ret m.init_body != nil;
+}
+
+# fold one client frame into the mirror
+#
+# Unrecognised methods are ignored rather than stored: the mirror holds session
+# state, and a frame that does not change that state has nothing to contribute
+# to a replay.
+# ---
+# m:    the mirror
+# body: the frame body
+# len:  its length
+pub fun record(m: *Mirror, body: str, len: usize) {
+    var rd: json.Reader;
+    if (!json.reader_init(?rd, m.alloc)) { ret; }
+    var parsed: json.Message = json.read(?rd, body, len);
+    if (parsed.valid) {
+        val method: *sj.Value = json.member(?parsed.root, "method");
+        val params: *sj.Value = json.member(?parsed.root, "params");
+        if (json.text_equals(method, "initialize", m.alloc)) {
+            record_initialize(m, ?parsed.root, body, len);
+        }
+        or (json.text_equals(method, "initialized", m.alloc)) {
+            free_field(m, ?m.ready_body);
+            m.ready_body = json.dup(body, m.alloc);
+        }
+        or (json.text_equals(method, "textDocument/didOpen", m.alloc)) {
+            record_open(m, params);
+        }
+        or (json.text_equals(method, "textDocument/didChange", m.alloc)) {
+            record_change(m, params);
+        }
+        or (json.text_equals(method, "textDocument/didClose", m.alloc)) {
+            record_close(m, params);
+        }
+    }
+    json.release(?rd);
+    json.reader_dnit(?rd);
+}
+
+fun record_initialize(m: *Mirror, root: *sj.Value, body: str, len: usize) {
+    free_field(m, ?m.init_body);
+    free_field(m, ?m.init_id);
+    m.init_body = json.dup(body, m.alloc);
+    m.init_id   = json.id_text(json.member(root, "id"), m.alloc);
+}
+
+fun record_open(m: *Mirror, params: *sj.Value) {
+    val td: *sj.Value = json.member(params, "textDocument");
+    val uri: str = json.text(json.member(td, "uri"), m.alloc);
+    if (uri == nil) { ret; }
+    val text: str = json.text(json.member(td, "text"), m.alloc);
+    if (text == nil) { json.free_str(uri, m.alloc); ret; }
+
+    val d: *Doc = slot_for(m, uri);
+    if (d == nil) {
+        json.free_str(uri, m.alloc);
+        json.free_str(text, m.alloc);
+        ret;
+    }
+    clear_doc(m, d);
+    d.uri      = uri;
+    d.text     = text;
+    d.language = json.text(json.member(td, "languageId"), m.alloc);
+    d.version  = json.number(json.member(td, "version"), 1);
+    d.live     = true;
+}
+
+fun record_change(m: *Mirror, params: *sj.Value) {
+    val td: *sj.Value = json.member(params, "textDocument");
+    val uri: str = json.text(json.member(td, "uri"), m.alloc);
+    if (uri == nil) { ret; }
+    val d: *Doc = find(m, uri);
+    json.free_str(uri, m.alloc);
+    if (d == nil || !d.live) { ret; }
+
+    val changes: *sj.Value = json.member(params, "contentChanges");
+    val n: usize = json.count(changes);
+    if (n == 0) { ret; }
+
+    val next: str = textedit.apply_changes(m.alloc, d.text, changes, n);
+    # a change the mirror cannot apply leaves the previous text in place; the
+    # worker refuses the same change for the same reason, so the two stay in
+    # step rather than one of them advancing alone
+    if (next == nil) { ret; }
+    json.free_str(d.text, m.alloc);
+    d.text    = next;
+    d.version = json.number(json.member(td, "version"), d.version);
+}
+
+fun record_close(m: *Mirror, params: *sj.Value) {
+    val uri: str = json.text(json.member2(params, "textDocument", "uri"), m.alloc);
+    if (uri == nil) { ret; }
+    val d: *Doc = find(m, uri);
+    json.free_str(uri, m.alloc);
+    if (d == nil) { ret; }
+    clear_doc(m, d);
+}
+
+# write the session into a worker's input as a sequence of client frames
+#
+# Order is the protocol's: the worker must be initialized before it is told
+# about a document. A write failure stops the replay - the replacement worker is
+# already gone, and pushing the rest of the session into a broken pipe would
+# only turn one failure into several.
+# ---
+# m:  the mirror
+# fd: the worker's input
+# ret: true when the whole session was written
+pub fun replay(m: *Mirror, fd: i32) bool {
+    if (m.init_body == nil) { ret true; }
+    if (!transport.write_frame_to(fd, m.init_body, str_len(m.init_body))) { ret false; }
+    if (m.ready_body != nil) {
+        if (!transport.write_frame_to(fd, m.ready_body, str_len(m.ready_body))) { ret false; }
+    }
+
+    var i: usize = 0;
+    for (i < m.len) {
+        val d: *Doc = ?m.docs[i];
+        if (d.live && d.uri != nil && d.text != nil) {
+            if (!replay_open(m, fd, d)) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun replay_open(m: *Mirror, fd: i32, d: *Doc) bool {
+    var b: json.Buf = json.buf_init(m.alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":");
+    json.buf_push_quoted(?b, d.uri);
+    json.buf_push(?b, ",\"languageId\":");
+    if (d.language != nil) { json.buf_push_quoted(?b, d.language); }
+    or { json.buf_push(?b, "\"mach\""); }
+    json.buf_push(?b, ",\"version\":");
+    json.buf_push_i64(?b, d.version);
+    json.buf_push(?b, ",\"text\":");
+    json.buf_push_quoted(?b, d.text);
+    json.buf_push(?b, "}}}");
+
+    val msg: str = json.buf_str(?b);
+    var ok: bool = false;
+    if (msg != nil) { ok = transport.write_frame_to(fd, msg, json.buf_len(?b)); }
+    json.buf_dnit(?b);
+    ret ok;
+}
+
+# the slot holding `uri`, or nil
+fun find(m: *Mirror, uri: str) *Doc {
+    var i: usize = 0;
+    for (i < m.len) {
+        val d: *Doc = ?m.docs[i];
+        if (d.uri != nil && str_equals(d.uri, uri)) { ret d; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the slot to write `uri` into: its existing one, a free one, or a new one
+fun slot_for(m: *Mirror, uri: str) *Doc {
+    val existing: *Doc = find(m, uri);
+    if (existing != nil) { ret existing; }
+    var i: usize = 0;
+    for (i < m.len) {
+        val d: *Doc = ?m.docs[i];
+        if (d.uri == nil) { ret d; }
+        i = i + 1;
+    }
+    ret grow(m);
+}
+
+fun grow(m: *Mirror) *Doc {
+    val new_len: usize = m.len + 1;
+    if (m.docs == nil) {
+        val r: Result[*Doc, str] = allocate[Doc](m.alloc, new_len);
+        if (is_err[*Doc, str](r)) { ret nil; }
+        m.docs = unwrap_ok[*Doc, str](r);
+    }
+    or {
+        val r: Result[*Doc, str] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
+        if (is_err[*Doc, str](r)) { ret nil; }
+        m.docs = unwrap_ok[*Doc, str](r);
+    }
+    val d: *Doc = ?m.docs[m.len];
+    d.uri      = nil;
+    d.language = nil;
+    d.text     = nil;
+    d.version  = 0;
+    d.live     = false;
+    m.len = new_len;
+    ret d;
+}
+
+fun clear_doc(m: *Mirror, d: *Doc) {
+    free_field(m, ?d.uri);
+    free_field(m, ?d.language);
+    free_field(m, ?d.text);
+    d.version = 0;
+    d.live    = false;
+}
+
+fun free_field(m: *Mirror, slot: *str) {
+    if (@slot != nil) { json.free_str(@slot, m.alloc); }
+    @slot = nil;
+}

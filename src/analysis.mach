@@ -43,7 +43,7 @@ use documents: mls.documents;
 # one document's analysis, as a request sees it
 # ---
 # interner: interner the symbol names resolve against
-# file:     source file backing every span
+# text:     source file backing every span, paired with its length
 # sr:       semantic result, or nil when the document has none
 # a:        parsed Ast
 # rr:       resolve side tables
@@ -51,7 +51,7 @@ use documents: mls.documents;
 # root:     the project root that governs it, or nil for a standalone buffer
 pub rec Analyzed {
     interner: *intern.Interner;
-    file:     *src.SourceFile;
+    text:     positions.Text;
     sr:       *sema.SemaResult;
     a:        *ast.Ast;
     rr:       *res.ResolveResult;
@@ -83,7 +83,7 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
         out.a        = v.a;
         out.sr       = v.sr;
         out.interner = v.interner;
-        out.file     = v.file;
+        out.text     = v.text;
         out.root     = v.root;
         out.own      = v.module;
         ret true;
@@ -101,10 +101,35 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     val sr: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
     if (!is_err[*sema.SemaResult, str](sr)) { out.sr = unwrap_ok[*sema.SemaResult, str](sr); }
     out.interner = ?es.s.interner;
-    out.file = unwrap[*src.SourceFile](fo);
+    out.text = positions.text_of(unwrap[*src.SourceFile](fo));
     out.root = nil;
     out.own = doc.file_id::sess.ModuleId;
     ret true;
+}
+
+# the parsed tree for an open document, reusing the buffer's cached parse
+#
+# A syntax-only feature needs the tree and nothing else, and must answer even
+# while the project root cannot load - that is what keeps the outline alive
+# while a manifest is being edited. `editor.parse` is unconditional: it
+# re-lexes and re-parses the whole buffer on every call, which was two thirds of
+# documentSymbol's cost on a 2000-line module, spent rebuilding a tree that had
+# not changed since the last keystroke.
+#
+# Reusing the cached tree is safe by construction rather than by convention:
+# `editor.update` drops a buffer's analysis whenever its text is replaced, so a
+# non-nil `ast_of` IS the parse of the current text. The parse happens here only
+# when there is nothing to reuse.
+# ---
+# es:  the standalone editor session
+# doc: the open document
+# ret: the document's parsed tree, or nil when it cannot be parsed
+pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.Ast {
+    val cached: *ast.Ast = editor.ast_of(es, doc.file_id);
+    if (cached != nil) { ret cached; }
+    val ar: Result[*ast.Ast, str] = editor.parse(es, doc.file_id);
+    if (is_err[*ast.Ast, str](ar)) { ret nil; }
+    ret unwrap_ok[*ast.Ast, str](ar);
 }
 
 # analyze the requested document and convert its cursor position to a byte
@@ -121,19 +146,19 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
 pub fun locate(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store,
                params: *sj.Value, uri: str, out: *Analyzed) Option[usize] {
     if (!analyze(ws, es, docs, uri, out)) { ret none[usize](); }
-    ret offset_of(params, out.file);
+    ret offset_of(params, out.text);
 }
 
 # the byte offset denoted by a request's `position`, or none when it is absent
 # or outside the file
 # ---
 # params: the request's params object
-# file:   the file the position indexes
+# t:      the file the position indexes, paired with its length
 # ret:    the byte offset, or none
-pub fun offset_of(params: *sj.Value, file: *src.SourceFile) Option[usize] {
+pub fun offset_of(params: *sj.Value, t: positions.Text) Option[usize] {
     val pos: *sj.Value = json.member(params, "position");
     val line: i64 = json.number(json.member(pos, "line"), -1);
     val ch:   i64 = json.number(json.member(pos, "character"), -1);
     if (line < 0 || ch < 0) { ret none[usize](); }
-    ret positions.offset_at(file, line::usize, ch::usize);
+    ret positions.offset_at(t, line::usize, ch::usize);
 }

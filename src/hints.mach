@@ -74,8 +74,8 @@ pub fun inlay_hints(ws: *project.Workspace, es: *editor.EditorSession, alloc: *A
     if (!analysis.analyze(ws, es, docs, uri, ?an)) { render.reply_empty_array(alloc, id_raw); ret; }
 
     var lo: usize = 0;
-    var hi: usize = str_len(an.file.text);
-    range_bounds(params, an.file, ?lo, ?hi);
+    var hi: usize = an.text.len;
+    range_bounds(params, an.text, ?lo, ?hi);
 
     # a hint needs both the inferred type and a session to render it against;
     # a standalone buffer has neither in a form this can use
@@ -119,8 +119,8 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
     if (!is_some[*decl.Decl](d_opt)) { ret count; }
     val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
     val site_a: *ast.Ast = callee_ast(ws, an, uri, e.data.call.callee);
-    val site_f: *src.SourceFile = callee_file(ws, an, uri, e.data.call.callee);
-    if (site_a == nil || site_f == nil) { ret count; }
+    val site_f: positions.Text = callee_file(ws, an, uri, e.data.call.callee);
+    if (site_a == nil || site_f.file == nil) { ret count; }
 
     # a one-parameter call has no ambiguity for a name to resolve: `log("x")`
     # gains nothing from being told the parameter is called `msg`
@@ -136,8 +136,8 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
             if (at >= lo && at <= hi && wants_hint(unwrap[*aexpr.Expr](ao))) {
                 val pname: str = param_name(site_a, site_f, d.data.fun_.params_start + i, alloc);
                 if (pname != nil) {
-                    if (!names_itself(an.file, unwrap[*aexpr.Expr](ao).span, pname)) {
-                        push_hint(b, an.file, at, pname, emitted > 0);
+                    if (!names_itself(an.text.file, unwrap[*aexpr.Expr](ao).span, pname)) {
+                        push_hint(b, an.text.file, at, pname, emitted > 0);
                         emitted = emitted + 1;
                     }
                     json.free_str(pname, alloc);
@@ -154,7 +154,7 @@ fun callee_decl(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee:
     val so: Option[*res.Symbol] = callee_symbol(an, callee);
     if (!is_some[*res.Symbol](so)) { ret none[*decl.Decl](); }
     val sym: *res.Symbol = unwrap[*res.Symbol](so);
-    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.file, uri, sym);
+    val site_o: Option[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, sym);
     if (!is_some[project.Site](site_o)) { ret none[*decl.Decl](); }
     var site: project.Site = unwrap[project.Site](site_o);
     val d: Option[*decl.Decl] = ast.get_decl(site.a, sym.decl);
@@ -169,7 +169,7 @@ fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: 
     val so: Option[*res.Symbol] = callee_symbol(an, callee);
     if (!is_some[*res.Symbol](so)) { ret nil; }
     val site_o: Option[project.Site] =
-        project.site_of(ws, an.root, an.own, an.a, an.file, uri, unwrap[*res.Symbol](so));
+        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, unwrap[*res.Symbol](so));
     if (!is_some[project.Site](site_o)) { ret nil; }
     var site: project.Site = unwrap[project.Site](site_o);
     val a: *ast.Ast = site.a;
@@ -178,14 +178,15 @@ fun callee_ast(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: 
 }
 
 # the source file backing the callee's declaration
-fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) *src.SourceFile {
+fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee: id.ExprId) positions.Text {
+    var empty: positions.Text = positions.text_of(nil);
     val so: Option[*res.Symbol] = callee_symbol(an, callee);
-    if (!is_some[*res.Symbol](so)) { ret nil; }
+    if (!is_some[*res.Symbol](so)) { ret empty; }
     val site_o: Option[project.Site] =
-        project.site_of(ws, an.root, an.own, an.a, an.file, uri, unwrap[*res.Symbol](so));
-    if (!is_some[project.Site](site_o)) { ret nil; }
+        project.site_of(ws, an.root, an.own, an.a, an.text.file, uri, unwrap[*res.Symbol](so));
+    if (!is_some[project.Site](site_o)) { ret empty; }
     var site: project.Site = unwrap[project.Site](site_o);
-    val f: *src.SourceFile = site.file;
+    val f: positions.Text = site.text;
     project.free_site(ws, ?site);
     ret f;
 }
@@ -200,7 +201,7 @@ fun callee_symbol(an: analysis.Analyzed, callee: id.ExprId) Option[*res.Symbol] 
 }
 
 # the declared name of the parameter in `typed_names` slot `slot`
-fun param_name(a: *ast.Ast, file: *src.SourceFile, slot: u32, alloc: *Allocator) str {
+fun param_name(a: *ast.Ast, file: positions.Text, slot: u32, alloc: *Allocator) str {
     if (a.typed_names == nil) { ret nil; }
     val tn: *decl.TypedName = ?a.typed_names[slot::usize];
     if (tn.name.len == 0) { ret nil; }
@@ -277,7 +278,7 @@ fun push_position(b: *json.Buf, file: *src.SourceFile, span: token.Span) {
 
 # read the request's `range` into byte offsets, leaving the defaults when it is
 # absent or malformed
-fun range_bounds(params: *sj.Value, file: *src.SourceFile, lo: *usize, hi: *usize) {
+fun range_bounds(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret; }
     val so: Option[usize] = offset_of_member(rng, "start", file);
@@ -286,7 +287,7 @@ fun range_bounds(params: *sj.Value, file: *src.SourceFile, lo: *usize, hi: *usiz
     if (is_some[usize](eo)) { @hi = unwrap[usize](eo); }
 }
 
-fun offset_of_member(rng: *sj.Value, key: str, file: *src.SourceFile) Option[usize] {
+fun offset_of_member(rng: *sj.Value, key: str, file: positions.Text) Option[usize] {
     val p: *sj.Value = json.member(rng, key);
     val line: i64 = json.number(json.member(p, "line"), -1);
     val ch:   i64 = json.number(json.member(p, "character"), -1);

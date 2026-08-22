@@ -86,9 +86,25 @@ protocol over stdin/stdout.
 ## Tracing
 
 The server speaks JSON-RPC on stdout, so it cannot log there. Set the
-`MLS_TRACE` environment variable (to any value) to append a JSON-RPC trace to
+`MLS_TRACE` environment variable (to any value) to append a trace to
 `/tmp/mach-lsp.log`; leave it unset — the default — and the server performs no
 logging.
+
+What a trace contains is a separate decision from whether it is on. A message
+body is your source code: every `didOpen` carries a whole file and every
+`didChange` carries what you just typed. Tracing is normally turned on to see
+which requests arrived in what order, which does not need any of that, so by
+default the log records only what each message *is* — direction, method, id,
+size, timing — and no bodies.
+
+| variable | effect |
+|---|---|
+| `MLS_TRACE` | enables tracing (any value) |
+| `MLS_TRACE=bodies` | also records message bodies, truncated at 512 bytes each |
+| `MLS_TRACE_FILE` | appends to this path instead of `/tmp/mach-lsp.log` |
+
+Use `MLS_TRACE=bodies` only when you need the contents of a message, and be
+aware that the log will then contain fragments of whatever you have open.
 
 ## How the compiler dependency is wired
 

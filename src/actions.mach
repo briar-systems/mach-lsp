@@ -71,7 +71,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
 
     var lo: usize = 0;
     var hi: usize = 0;
-    if (!request_range(params, v.file, ?lo, ?hi)) { render.reply_empty_array(alloc, id_raw); ret; }
+    if (!request_range(params, v.text, ?lo, ?hi)) { render.reply_empty_array(alloc, id_raw); ret; }
 
     # a client may ask for only certain kinds; this server offers quickfix alone,
     # so a filter that excludes it excludes everything
@@ -88,7 +88,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
         if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
             var f: usize = 0;
             for (f < dg.fix_len) {
-                push_action(?b, ws, alloc, ?s.sources, v.file, uri, dg, ?dg.fixes[f], emitted > 0);
+                push_action(?b, ws, alloc, ?s.sources, v.text.file, uri, dg, ?dg.fixes[f], emitted > 0);
                 emitted = emitted + 1;
                 f = f + 1;
             }
@@ -176,7 +176,7 @@ fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
 }
 
 # resolve the request's `range` to byte offsets
-fun request_range(params: *sj.Value, file: *src.SourceFile, lo: *usize, hi: *usize) bool {
+fun request_range(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) bool {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret false; }
     val so: Option[usize] = offset_of(rng, "start", file);
@@ -188,7 +188,7 @@ fun request_range(params: *sj.Value, file: *src.SourceFile, lo: *usize, hi: *usi
     ret true;
 }
 
-fun offset_of(rng: *sj.Value, key: str, file: *src.SourceFile) Option[usize] {
+fun offset_of(rng: *sj.Value, key: str, file: positions.Text) Option[usize] {
     val p: *sj.Value = json.member(rng, key);
     val line: i64 = json.number(json.member(p, "line"), -1);
     val ch:   i64 = json.number(json.member(p, "character"), -1);

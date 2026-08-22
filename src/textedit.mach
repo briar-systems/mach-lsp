@@ -1,0 +1,121 @@
+# applying an LSP change list to a document's text
+#
+# The server advertises incremental sync, so a `didChange` carries spans rather
+# than whole documents and the current text is only ever the result of applying
+# every change in order. That reconstruction is needed in two places now: the
+# worker maintains the buffer it analyses, and the supervisor maintains the copy
+# it replays into a replacement worker after a crash. Two implementations of the
+# same splice would be two chances to disagree about what the buffer contains,
+# and the disagreement would be silent - the worker would answer confidently
+# against text the supervisor could no longer reproduce.
+#
+# Nothing here touches the compiler or a document registry; a change list plus a
+# base string is all the input there is.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.option.Option;
+use std.types.option.none;
+use std.types.option.some;
+use std.types.option.is_some;
+use std.types.option.unwrap;
+
+use std.allocator.Allocator;
+
+use sj: std.data.json;
+
+use json:      mls.json;
+use positions: mls.positions;
+
+# `base` with every change in `changes` applied, as owned text
+#
+# A client may send either form and may mix them. A change carrying a `range`
+# replaces just that span; one without carries the whole document. Ranges are
+# applied in order, each against the result of the previous, because that is how
+# the client computed them - applying them against the original text would place
+# every edit after the first at the wrong offset.
+#
+# A range that does not resolve is refused rather than skipped: the buffer is the
+# input to every other feature, so a silently mis-patched document would produce
+# confidently wrong answers everywhere downstream.
+# ---
+# alloc:   allocator for the returned text and its intermediates
+# base:    the document's text before these changes
+# changes: the `contentChanges` array
+# n:       its length
+# ret:     owned new text, or nil when a change could not be applied
+pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize) str {
+    if (base == nil) { ret nil; }
+
+    var current: str = nil;
+    var owned: bool = false;
+    var i: usize = 0;
+    for (i < n) {
+        val change: *sj.Value = json.element(changes, i);
+        val whole: *sj.Value = json.member(change, "range");
+        val piece: str = json.text(json.member(change, "text"), alloc);
+        if (piece == nil) {
+            if (owned) { json.free_str(current, alloc); }
+            ret nil;
+        }
+
+        if (whole == nil) {
+            # a full-document change discards everything before it
+            if (owned) { json.free_str(current, alloc); }
+            current = piece;
+            owned = true;
+        }
+        or {
+            var from: str = current;
+            if (!owned) { from = base; }
+            val next: str = splice(alloc, from, whole, piece);
+            json.free_str(piece, alloc);
+            if (owned) { json.free_str(current, alloc); }
+            if (next == nil) { ret nil; }
+            current = next;
+            owned = true;
+        }
+        i = i + 1;
+    }
+    if (!owned) { ret nil; }
+    ret current;
+}
+
+# `from` with the bytes covered by `range` replaced by `piece`, as owned text
+# ---
+# alloc: allocator for the returned text
+# from:  the text being patched
+# range: an LSP Range object
+# piece: the replacement text
+# ret:   owned patched text, or nil when the range does not resolve
+pub fun splice(alloc: *Allocator, from: str, range: *sj.Value, piece: str) str {
+    val so: Option[usize] = offset_of_position(from, json.member(range, "start"));
+    val eo: Option[usize] = offset_of_position(from, json.member(range, "end"));
+    if (!is_some[usize](so) || !is_some[usize](eo)) { ret nil; }
+    var lo: usize = unwrap[usize](so);
+    var hi: usize = unwrap[usize](eo);
+    if (hi < lo) { hi = lo; }
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push_range(?b, from, 0, lo);
+    json.buf_push(?b, piece);
+    json.buf_push_range(?b, from, hi, str_len(from));
+    val view: str = json.buf_str(?b);
+    if (view == nil) { json.buf_dnit(?b); ret nil; }
+    val out: str = json.dup(view, alloc);
+    json.buf_dnit(?b);
+    ret out;
+}
+
+# the byte offset of an LSP position object within `text`
+fun offset_of_position(text: str, pos: *sj.Value) Option[usize] {
+    if (pos == nil) { ret none[usize](); }
+    val line: i64 = json.number(json.member(pos, "line"), -1);
+    val ch:   i64 = json.number(json.member(pos, "character"), -1);
+    if (line < 0 || ch < 0) { ret none[usize](); }
+    ret positions.offset_in_text(text, line::usize, ch::usize);
+}

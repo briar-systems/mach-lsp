@@ -51,23 +51,57 @@ pub rec LspRange {
     end_char:   usize;
 }
 
+# a source file paired with the byte length of its text
+#
+# `src.SourceFile` does not carry its length, so the only way to learn it is to
+# scan for the terminating NUL. Doing that inside `span_text` meant every symbol
+# name copied out of a document rescanned the whole document, which made the
+# cost of a response grow with the PRODUCT of how many spans it names and how
+# big the file is. On a 2000-line module that was two thirds of documentSymbol's
+# time, spent entirely on rediscovering one number.
+#
+# The length travels with the file rather than beside it because a bound passed
+# separately is a bound a caller can take from the wrong file, and a span copied
+# against another file's length reads off the end of this one. `text_of` is the
+# only way to build one, so the pair is correct by construction.
+# ---
+# file: the source file
+# len:  byte length of `file.text`, excluding the terminator
+pub rec Text {
+    file: *src.SourceFile;
+    len:  usize;
+}
+
+# pair `file` with its text length, scanning once
+# ---
+# file: the source file to measure, may be nil
+# ret:  the file paired with its length
+pub fun text_of(file: *src.SourceFile) Text {
+    var t: Text;
+    t.file = file;
+    t.len  = 0;
+    if (file != nil) { t.len = str_len(file.text); }
+    ret t;
+}
+
 # the byte offset of a 0-based LSP (line, character) in `file`, or
 # none when the line is out of range. the UTF-16 character column is resolved
 # to a byte offset by walking the line's UTF-8, clamped to the line's end
 # ---
-# file: the source file the position addresses
+# t:    the source file paired with its length
 # line: 0-based LSP line
 # ch:   0-based LSP character (UTF-16 code-unit column)
 # ret:  some(offset) within the file, or none for an out-of-range line
-pub fun offset_at(file: *src.SourceFile, line: usize, ch: usize) Option[usize] {
-    val ls: Option[usize] = src.line_start(file, line + 1);
+pub fun offset_at(t: Text, line: usize, ch: usize) Option[usize] {
+    if (t.file == nil) { ret none[usize](); }
+    val ls: Option[usize] = src.line_start(t.file, line + 1);
     if (!is_some[usize](ls)) { ret none[usize](); }
     val ls_off: usize = unwrap[usize](ls);
 
-    var le_off: usize = str_len(file.text);
-    if (line + 1 < file.line_len) { le_off = file.line_starts[line + 1]; }
+    var le_off: usize = t.len;
+    if (line + 1 < t.file.line_len) { le_off = t.file.line_starts[line + 1]; }
 
-    ret some[usize](u16_col_to_byte(file, ls_off, le_off, ch));
+    ret some[usize](u16_col_to_byte(t.file, ls_off, le_off, ch));
 }
 
 # the LSP range covering a byte span in `file`. a zero-length span
@@ -96,21 +130,20 @@ pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
 # nil on an empty span / allocation failure. used to render the spelling of a
 # decl name or type as written
 # ---
-# file:  the source file the span addresses
+# t:     the source file paired with its length
 # span:  the byte range to copy
 # alloc: allocator backing the returned string
 # ret:   owned copy of the span text, or nil
-pub fun span_text(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
-    if (span.len == 0) { ret nil; }
-    val text_len: usize = str_len(file.text);
-    if (span.offset >= text_len) { ret nil; }
+pub fun span_text(t: Text, span: token.Span, alloc: *Allocator) str {
+    if (span.len == 0 || t.file == nil) { ret nil; }
+    if (span.offset >= t.len) { ret nil; }
     var len: usize = span.len;
-    if (span.offset + len > text_len) { len = text_len - span.offset; }
+    if (span.offset + len > t.len) { len = t.len - span.offset; }
 
     val r: Result[*u8, str] = allocate[u8](alloc, len + 1);
     if (is_err[*u8, str](r)) { ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
-    mem.raw_copy(buf::ptr, (file.text::usize + span.offset)::ptr, len);
+    mem.raw_copy(buf::ptr, (t.file.text::usize + span.offset)::ptr, len);
     buf[len] = 0;
     ret buf::str;
 }
@@ -251,4 +284,82 @@ test "positions: an astral codepoint counts as two utf-16 units" {
     if (unwrap[usize](offset_in_text(t, 0, 3)) != 5) { fail = true; }
     if (fail) { ret 1; }
     ret 0;
+}
+
+# `Text` exists so a span is never copied against a length taken from another
+# file, and so the length is discovered once rather than once per span. Both
+# properties are invisible at a call site, so they are pinned here.
+test "positions: a text pairs a file with its own length" {
+    var starts: [3]usize;
+    starts[0] = 0; starts[1] = 3; starts[2] = 6;
+    var f: src.SourceFile = t_file("ab\ncd\nef", ?starts[0], 3);
+    val t: Text = text_of(?f);
+    var fail: bool = false;
+    if (t.len != 8)      { fail = true; }
+    if (t.file != (?f))  { fail = true; }
+    # a nil file is a well-formed empty pairing, not a crash: `callee_file`
+    # returns one when a call's target cannot be resolved
+    val e: Text = text_of(nil);
+    if (e.file != nil || e.len != 0) { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# the bound is what stops a span from a stale tree reading past the buffer it is
+# applied to; dropping it was the whole cost of pairing the length with the file
+test "positions: span text stays inside the file it is bounded by" {
+    var pa: Allocator;
+    page.make(?pa);
+    var starts: [1]usize;
+    starts[0] = 0;
+    var f: src.SourceFile = t_file("abcdef", ?starts[0], 1);
+    val t: Text = text_of(?f);
+    var fail: bool = false;
+
+    val whole: str = span_text(t, t_span(0, 6), ?pa);
+    if (whole == nil || !str_equals(whole, "abcdef")) { fail = true; }
+
+    # a span running past the end is clamped, not read out of bounds
+    val over: str = span_text(t, t_span(4, 99), ?pa);
+    if (over == nil || !str_equals(over, "ef")) { fail = true; }
+
+    # a span starting past the end has nothing to copy
+    if (span_text(t, t_span(6, 1), ?pa) != nil)  { fail = true; }
+    if (span_text(t, t_span(0, 0), ?pa) != nil)  { fail = true; }
+    if (span_text(text_of(nil), t_span(0, 1), ?pa) != nil) { fail = true; }
+
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# `offset_at` reads the final line's end from the pairing rather than rescanning
+test "positions: the last line ends at the paired length" {
+    var starts: [2]usize;
+    starts[0] = 0; starts[1] = 3;
+    var f: src.SourceFile = t_file("ab\ncdef", ?starts[0], 2);
+    val t: Text = text_of(?f);
+    var fail: bool = false;
+    if (unwrap[usize](offset_at(t, 1, 4)) != 7)  { fail = true; }
+    # a column past the last line's end clamps to that end, not to the file's
+    if (unwrap[usize](offset_at(t, 1, 99)) != 7) { fail = true; }
+    if (is_some[usize](offset_at(text_of(nil), 0, 0))) { fail = true; }
+    if (fail) { ret 1; }
+    ret 0;
+}
+
+# a SourceFile over `text` with a real line index, for the tests above
+fun t_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
+    var f: src.SourceFile;
+    f.path        = "t.mach";
+    f.text        = text;
+    f.line_starts = starts;
+    f.line_len    = nlines;
+    ret f;
+}
+
+fun t_span(offset: usize, len: usize) token.Span {
+    var s: token.Span;
+    s.offset = offset;
+    s.len    = len;
+    ret s;
 }

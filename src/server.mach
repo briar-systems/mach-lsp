@@ -43,6 +43,7 @@ use jobs:        mls.jobs;
 use atomic:      std.sync.atomic;
 use exec:        std.process.exec;
 use documents:   mls.documents;
+use textedit:    mls.textedit;
 use diagnostics: mls.diagnostics;
 use language:    mls.language;
 use workspace:   mls.workspace;
@@ -53,6 +54,7 @@ use actions:     mls.actions;
 use project:     mls.project;
 use trace:       mls.trace;
 use render:      mls.render;
+use progress:    mls.progress;
 use positions:   mls.positions;
 
 # lifecycle statuses
@@ -100,6 +102,7 @@ val WATCH_ACTIVE:   u8 = 2;
 # stop:          set once the reading thread should stop; read atomically
 # deferred:      a document changed but its analysis was postponed behind newer
 #                input, and must run once the queue drains
+# hover_markdown: whether the client renders markdown hover content
 # watch_dynamic: whether the client supports dynamic file-watch registration
 #                (`workspace/didChangeWatchedFiles`), advertised at initialize
 pub rec Server {
@@ -116,6 +119,7 @@ pub rec Server {
     rd_client:     json.Reader;
     stop:          i64;
     deferred:      bool;
+    hover_markdown: bool;
     watch_dynamic: bool;
     watch_state:   u8;
 }
@@ -143,6 +147,7 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     if (!json.reader_init(?srv.rd, alloc)) { ret false; }
     srv.stop = 0;
     srv.deferred = false;
+    srv.hover_markdown = true;
     if (!jobs.init(?srv.q, alloc)) { ret false; }
     if (!jobs.cancels_init(?srv.cancels, alloc)) { ret false; }
     if (!json.reader_init(?srv.rd_client, alloc)) { ret false; }
@@ -246,19 +251,33 @@ fun intercept_cancel(srv: *Server, body: str, len: usize) bool {
     ret handled;
 }
 
+# record which message this was, without recording what it carried
+#
+# The method and id are the parts a reader actually needs to follow a session -
+# what arrived, in what order, and which response answered which request - and
+# neither is user content, so they are recorded whether or not bodies are.
+fun trace_method(srv: *Server, root: *sj.Value) {
+    if (!trace.enabled()) { ret; }
+    val m: str = json.text(json.member(root, "method"), srv.alloc);
+    val i: str = json.id_text(json.member(root, "id"), srv.alloc);
+    if (m != nil && i != nil) { trace.logf("  method {} id {}", m, i); }
+    or (m != nil)            { trace.logf("  method {}", m); }
+    or (i != nil)            { trace.logf("  id {}", i); }
+    if (m != nil) { json.free_str(m, srv.alloc); }
+    if (i != nil) { json.free_str(i, srv.alloc); }
+}
+
 # handle one queued message on the analysis thread
 #
 # The parse arena and every compiler-owned structure belong to this thread.
 fun handle_job(ctx: ptr, body: str, len: usize) {
     val srv: *Server = ctx::*Server;
 
-    trace.log("recv: ");
-    trace.log(body);
-    trace.log("\n");
+    trace.frame("recv:", body, len);
 
     val started_ns: i64 = trace.now_ns();
     var parsed: json.Message = json.read(?srv.rd, body, len);
-    if (parsed.valid) { dispatch(srv, ?parsed.root); }
+    if (parsed.valid) { trace_method(srv, ?parsed.root); dispatch(srv, ?parsed.root); }
     or { reply_parse_error(srv); }
     json.release(?srv.rd);
 
@@ -351,6 +370,15 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     val watched: *sj.Value = json.member(
         json.member2(params, "capabilities", "workspace"), "didChangeWatchedFiles");
     srv.watch_dynamic = json.boolean(json.member(watched, "dynamicRegistration"), false);
+
+    # a client advertises the hover formats it renders, in order of preference.
+    # Sending markdown to one that only takes plaintext puts literal backticks
+    # and fences in front of the reader, which is worse than the plain text it
+    # asked for.
+    srv.hover_markdown = accepts_markdown(
+        json.member(json.member2(params, "capabilities", "textDocument"), "hover"), srv.alloc);
+    progress.configure(json.boolean(
+        json.member(json.member2(params, "capabilities", "window"), "workDoneProgress"), false));
 
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
@@ -476,16 +504,9 @@ fun handle_did_change(srv: *Server, params: *sj.Value) {
 
 # build the document's new text from a change list
 #
-# A client may send either form and may mix them. A change carrying a `range`
-# replaces just that span; one without carries the whole document. Ranges are
-# applied in order, each against the result of the previous, because that is how
-# the client computed them - applying them against the original text would place
-# every edit after the first at the wrong offset.
-#
-# Returns owned text, or nil when the document is unknown or a range cannot be
-# resolved. A range that does not resolve is refused rather than skipped: the
-# buffer is the input to every other feature, so a silently mis-patched document
-# would produce confidently wrong answers everywhere downstream.
+# The splice itself lives in `textedit`, shared with the supervisor's replay
+# mirror; this resolves which document is being changed and hands over its
+# current text as the base.
 # ---
 # srv:     the server
 # uri:     the document being changed
@@ -495,68 +516,7 @@ fun handle_did_change(srv: *Server, params: *sj.Value) {
 fun apply_changes(srv: *Server, uri: str, changes: *sj.Value, n: usize) str {
     val d: *documents.Document = documents.find(?srv.docs, uri);
     if (d == nil) { ret nil; }
-
-    var current: str = nil;
-    var owned: bool = false;
-    var i: usize = 0;
-    for (i < n) {
-        val change: *sj.Value = json.element(changes, i);
-        val whole: *sj.Value = json.member(change, "range");
-        val piece: str = json.text(json.member(change, "text"), srv.alloc);
-        if (piece == nil) {
-            if (owned) { json.free_str(current, srv.alloc); }
-            ret nil;
-        }
-
-        if (whole == nil) {
-            # a full-document change discards everything before it
-            if (owned) { json.free_str(current, srv.alloc); }
-            current = piece;
-            owned = true;
-        }
-        or {
-            var base: str = current;
-            if (!owned) { base = d.text; }
-            val next: str = splice(srv, base, whole, piece);
-            json.free_str(piece, srv.alloc);
-            if (owned) { json.free_str(current, srv.alloc); }
-            if (next == nil) { ret nil; }
-            current = next;
-            owned = true;
-        }
-        i = i + 1;
-    }
-    if (!owned) { ret nil; }
-    ret current;
-}
-
-# `base` with the bytes covered by `range` replaced by `piece`
-fun splice(srv: *Server, base: str, range: *sj.Value, piece: str) str {
-    val so: Option[usize] = offset_of_position(base, json.member(range, "start"));
-    val eo: Option[usize] = offset_of_position(base, json.member(range, "end"));
-    if (!is_some[usize](so) || !is_some[usize](eo)) { ret nil; }
-    var lo: usize = unwrap[usize](so);
-    var hi: usize = unwrap[usize](eo);
-    if (hi < lo) { hi = lo; }
-
-    var b: json.Buf = json.buf_init(srv.alloc);
-    json.buf_push_range(?b, base, 0, lo);
-    json.buf_push(?b, piece);
-    json.buf_push_range(?b, base, hi, str_len(base));
-    val view: str = json.buf_str(?b);
-    if (view == nil) { json.buf_dnit(?b); ret nil; }
-    val out: str = json.dup(view, srv.alloc);
-    json.buf_dnit(?b);
-    ret out;
-}
-
-# the byte offset of an LSP position object within `text`
-fun offset_of_position(text: str, pos: *sj.Value) Option[usize] {
-    if (pos == nil) { ret none[usize](); }
-    val line: i64 = json.number(json.member(pos, "line"), -1);
-    val ch:   i64 = json.number(json.member(pos, "character"), -1);
-    if (line < 0 || ch < 0) { ret none[usize](); }
-    ret positions.offset_in_text(text, line::usize, ch::usize);
+    ret textedit.apply_changes(srv.alloc, d.text, changes, n);
 }
 
 # retire the document, reclaim its cached analysis, and clear its diagnostics# retire the document, reclaim its cached analysis, and clear its diagnostics
@@ -586,7 +546,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     val epoch_before: u32 = project.load_epoch(?srv.ws);
     val sema_before:  u32 = project.sema_epoch(?srv.ws);
 
-    if (which == FEATURE_HOVER)           { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    if (which == FEATURE_HOVER)           { language.hover(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri, srv.hover_markdown); }
     or (which == FEATURE_DEFINITION)      { language.definition(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_REFERENCES)      { language.references(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_RENAME)          { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
@@ -602,6 +562,29 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
     if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
+}
+
+# whether the client's hover capability lists markdown
+#
+# An absent capability means an old client, and the spec's default there is
+# plaintext; an empty list says the same. Markdown is only used when the client
+# actually names it.
+fun accepts_markdown(hover: *sj.Value, alloc: *Allocator) bool {
+    if (hover == nil) { ret false; }
+    val formats: *sj.Value = json.member(hover, "contentFormat");
+    if (formats == nil) { ret false; }
+    val n: usize = json.count(formats);
+    var i: usize = 0;
+    for (i < n) {
+        val f: str = json.text(json.element(formats, i), alloc);
+        if (f != nil) {
+            val md: bool = str_equals(f, "markdown");
+            json.free_str(f, alloc);
+            if (md) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # whether the client withdrew this request before the worker reached it

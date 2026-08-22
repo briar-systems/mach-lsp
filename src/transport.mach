@@ -183,7 +183,7 @@ pub fun send_message(body: str, alloc: *Allocator) bool {
     mem.raw_copy((buf::usize + off)::ptr, CRLF_CRLF::ptr, sep_len); off = off + sep_len;
     mem.raw_copy((buf::usize + off)::ptr, body::ptr, body_len);
 
-    trace.log("send: "); trace.log(body); trace.log("\n");
+    trace.frame("send:", body, body_len);
     val ok: bool = write_all(buf, total);
     deallocate[u8](alloc, buf, total);
     if (!ok) { WRITE_FAILED = true; }

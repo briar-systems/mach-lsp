@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-22
+
+The last epic closed. Analysis now survives a worker that crashes and one that
+stops responding, and the two remaining hot-path costs turned out to be nothing
+anyone had guessed at.
+
+### Added
+- runtime: a crashed analysis worker is replaced and the session replayed into
+  it. Containment already survived a fault; it could not recover from one,
+  because what the worker knew - which documents are open, what they now
+  contain, what the client negotiated at `initialize` - died with it, and a
+  client never re-sends any of that. The supervisor keeps its own mirror, built
+  only from frames the client sent and never consulted to answer a request. The
+  replay is written by the client pump rather than the thread that spawns the
+  worker: a replay is more than a pipe holds and the diagnostics it provokes are
+  more than the other pipe holds, so whoever writes it must not also be draining
+  the answers. (#154)
+- runtime: analysis that has stopped responding is ended. A compiler stuck in
+  non-cooperative code never reaches a point where it could read a cancellation,
+  so the request is answered `ServerCancelled` and the process is ended, which
+  turns the hang into the crash the supervisor already recovers from. The
+  deadline is two minutes and overridable - a cold load is seconds and a warm
+  request is under a millisecond, so the failure mode of a short deadline is
+  killing work that was about to succeed. Shutdown is bounded by the same
+  watchdog, because a server that will not exit is one the user has to hunt
+  down. (#156)
+- progress: a cold project load reports `$/progress`, so seconds of silence look
+  like work rather than a hang - which matters more now that the supervisor
+  waits two minutes before calling analysis stuck. Only the first analysis of a
+  root reports; a spinner on every keystroke teaches the reader to ignore the
+  one that means something. A report whose worker dies is closed by the
+  supervisor rather than left spinning. (#207)
+- hover: content format is negotiated and bare expressions are typed. (#145)
+
+### Fixed
+- perf: documentSymbol no longer rescans the file once per span or re-parses the
+  document once per request. `span_text` bounded every copy with
+  `str_len(file.text)`, so a response cost the product of how many spans it
+  named and how big the file was; `positions.Text` pairs a file with its length
+  and `text_of` is its only constructor, so the two cannot be mismatched.
+  `editor.parse` is unconditional, and `editor.update` drops a buffer's analysis
+  whenever its text changes, so the cached tree is safe to reuse by
+  construction. On a 2166-line module: 32.2 ms to 10.6 ms, and per-line cost is
+  now flat rather than climbing with file size. (#203)
+- trace: enabling `MLS_TRACE` no longer copies your source into `/tmp`. A
+  message body is the user's code - every `didOpen` carries a whole file - and
+  tracing is normally turned on to see which requests arrived in what order,
+  which needs none of it. The default now records direction, method, id, size
+  and timing; `MLS_TRACE=bodies` adds bodies back, capped at 512 bytes each, and
+  `MLS_TRACE_FILE` moves the log off a shared path. (#207)
+- trace: each protocol frame is recorded once, by the worker. Both halves were
+  recording, so two processes appended to one file and raced for the offset;
+  the loser's line was overwritten, which on Windows lost whole frames from the
+  middle of the log. (#207)
+- supervisor: a worker dying mid-forward no longer takes the session with it.
+  Three defects on the same timing - a failed write treated as the end of the
+  client connection, a failed replay marked as spent, and the crash reported
+  before the replacement existed, so the client's reissue landed in a gap with
+  nothing left to answer it. None reproduced serially; running the crash test 12
+  to 20 ways concurrently failed 6 of 12 before and passes 20 of 20 after. (#154)
+- hover: a bare `#` comment line keeps its paragraph break instead of folding
+  into a space. (#145)
+
+### Changed
+- deps: advanced the vendored mach pin to `v4.25.0`. Session memory is flat -
+  232 MiB after a cold load and 233 MiB after 40 edits - verified with a
+  resident-memory series rather than the upstream byte assertion, which passed
+  while RSS climbed.
+
 ## [0.14.0] - 2026-08-21
 
 The last three upstream blockers landed, so the work they held up shipped
