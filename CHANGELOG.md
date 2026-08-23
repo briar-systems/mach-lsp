@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-23
+
+Hover was rendering doc comments as one undifferentiated paragraph. Fixing that
+turned up two more defects behind it, one of them upstream.
+
+### Added
+- hover: a declaration's doc components are named by the kind that owns them -
+  `Parameters` for a function, `Fields` for a record, `Variants` for a union -
+  and the return value gets its own line instead of a bullet among the inputs,
+  where it read as though the function took an argument called `ret`. (#215)
+- hover: a parameter, generic, or comptime parameter carries the description
+  written for it. A field already did; the others did not, so a line an author
+  wrote about an argument was reachable only by hovering the function and
+  reading its list. `doc_span_of` refuses these deliberately - the alternative
+  is dumping the enclosing function's whole doc block under a cursor on one
+  argument - but nothing was reading the component line back out. The `[T]` and
+  `$name` forms are stripped before matching, so a block spelled the way the
+  spec asks for is still found. (#215)
+
+### Fixed
+- hover: a doc comment's bullet lists are no longer folded into the paragraph
+  around them. Every line break became a space, which is right for wrapped prose
+  and wrong for structure the author wrote deliberately: a five-item list
+  arrived as one run-on paragraph with `- item` markers stranded mid-sentence.
+  Indentation is what separates the two cases and was being stripped before the
+  decision was made. A marker starts a line, a line indented further than the
+  marker above it is that item wrapping, and a line back at the prose margin
+  ends the list. Nesting is emitted relative to the list's own first marker, so
+  a comment indenting its top level by four spaces stays a list rather than
+  becoming a code block. (#213)
+- hover: a carriage return is part of the line ending, not part of the line. A
+  file saved with CRLF put a stray control byte into the middle of every wrapped
+  line, and a blank comment line read as content rather than a paragraph break.
+  Pre-existing and invisible on a Linux checkout; the Windows lane found it once
+  a fixture was written the way an editor there would write it. (#213)
+
+### Changed
+- deps: advanced the vendored mach pin past briar-systems/mach#3072, a CRLF
+  doc-block bug this repository found and reported. `is_space` in mach's doc
+  parser did not count a carriage return, so `# ---` measured four characters
+  wide in a CRLF file and the separator never matched - taking every parameter,
+  field and return description out of hover on the platform where editors write
+  CRLF, and out of `mach doc` and the docstring lint with it. Verified across
+  all four combinations of disk and buffer line ending rather than taken from
+  the closed issue. Session memory is flat: 237 MiB after a cold load, 238 MiB
+  after 40 edits.
+
 ## [0.15.0] - 2026-08-22
 
 The last epic closed. Analysis now survives a worker that crashes and one that

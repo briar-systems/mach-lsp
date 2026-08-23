@@ -565,6 +565,56 @@ pub fun field_doc_desc(source: str, doc: token.Span, field_name: token.Span) Opt
     ret none[token.Span]();
 }
 
+# the description a doc block gives for one of a declaration's named parts
+#
+# `field_doc_desc` answers the same question for a field, whose name it already
+# holds as a span into the same source. A parameter or a generic is reached from
+# a resolved Symbol instead, where the name is an interned string rather than a
+# span, and where the component head may carry syntax the name does not: the
+# spec writes a generic as `[T]` and a comptime parameter as `$order`. Both are
+# stripped before comparing, so a doc block spelled the way the spec asks for is
+# still found by a lookup that only knows the binding's name.
+# ---
+# source:     the declaring module's source text (the doc block points into it)
+# doc:        the owning decl's `Decl.doc` span
+# name:       the binding's name as resolution knows it
+# is_generic: true to read the bracket form `# [T]:`
+# ret:        some(description span) for the matching component, or none
+pub fun component_desc_named(source: str, doc: token.Span, name: str, is_generic: bool) Option[token.Span] {
+    if (doc.len == 0 || name == nil) { ret none[token.Span](); }
+    var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
+    var c: fedoc.DocComponent;
+    for (fedoc.component_next(?it, ?c)) {
+        val ident: token.Span = component_ident(source, c.name_span, is_generic);
+        if (ident.len == 0) { cnt; }
+        if (ident_names(source, ident, name)) {
+            if (c.desc_span.len == 0) { ret none[token.Span](); }
+            ret some[token.Span](c.desc_span);
+        }
+    }
+    ret none[token.Span]();
+}
+
+# whether component identifier `ident` names the binding `name`, ignoring a
+# leading `$` on either side
+fun ident_names(source: str, ident: token.Span, name: str) bool {
+    val s: *u8 = source::*u8;
+    val n: *u8 = name::*u8;
+    var io: usize = ident.offset;
+    var il: usize = ident.len;
+    if (il > 0 && s[io] == '$') { io = io + 1; il = il - 1; }
+    var no: usize = 0;
+    var nl: usize = str_len(name);
+    if (nl > 0 && n[0] == '$') { no = 1; nl = nl - 1; }
+    if (il != nl) { ret false; }
+    var i: usize = 0;
+    for (i < il) {
+        if (s[io + i] != n[no + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
 # true when spans `a` and `b` cover identical bytes within
 # the single source text `source`. the same-file analogue of `span_bytes_equal`,
 # used to match a doc component's name against a field name (both spans into the

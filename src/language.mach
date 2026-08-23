@@ -393,7 +393,10 @@ fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symb
                 sig = positions.span_text(site.text, unwrap[token.Span](sso), alloc);
             }
             val dso: Option[token.Span] = features.doc_span_of(site.a, sym);
-            if (is_some[token.Span](dso)) { doc = doc_prose(site.text.file, unwrap[token.Span](dso), alloc); }
+            if (is_some[token.Span](dso)) {
+                doc = doc_prose(site.text.file, unwrap[token.Span](dso), decl_kind_of(site.a, sym), alloc);
+            }
+            or { doc = binding_doc(site, sym, an, alloc); }
         }
         project.free_site(ws, ?site);
     }
@@ -430,19 +433,70 @@ fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *res.Symb
 # span:  the declaration's `Decl.doc` span
 # alloc: request allocator
 # ret:   the rendered Markdown, or nil
-fun doc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
+# the one description a doc block gives for a parameter or a generic
+#
+# `doc_span_of` refuses these on purpose. A parameter's owning decl is the whole
+# function, so rendering that decl's doc block under a cursor on one parameter
+# answers a question nobody asked - the reader wants the line written for that
+# parameter, which the component block already carries and which nothing was
+# reading back out.
+# ---
+# site:  the declaring site, whose Ast and source the doc block belongs to
+# sym:   the parameter or generic under the cursor
+# an:    the analysis, for the interner the symbol's name lives in
+# alloc: request allocator
+# ret:   the folded description, or nil
+fun binding_doc(site: project.Site, sym: *res.Symbol, an: analysis.Analyzed, alloc: *Allocator) str {
+    if (sym.kind != res.SYM_PARAM && sym.kind != res.SYM_GENERIC) { ret nil; }
+    if (sym.decl == id.DECL_NIL) { ret nil; }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(site.a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret nil; }
+    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+    if (d.doc.len == 0) { ret nil; }
+
+    val no: Option[str] = intern.lookup(an.interner, sym.name);
+    if (!is_some[str](no)) { ret nil; }
+    val dso: Option[token.Span] = features.component_desc_named(
+        site.text.file.text, d.doc, unwrap[str](no), sym.kind == res.SYM_GENERIC);
+    if (!is_some[token.Span](dso)) { ret nil; }
+    ret doc_fragment(site.text.file.text, unwrap[token.Span](dso), alloc);
+}
+
+# the kind of the decl a symbol was declared by, for naming its components
+fun decl_kind_of(a: *ast.Ast, sym: *res.Symbol) decl.DeclKind {
+    if (sym.decl == id.DECL_NIL) { ret decl.DECL_KIND_FUN; }
+    val d_opt: Option[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (!is_some[*decl.Decl](d_opt)) { ret decl.DECL_KIND_FUN; }
+    ret unwrap[*decl.Decl](d_opt).kind;
+}
+
+# fold one description span into owned prose, by the same walk the whole block
+# uses so a wrapped component reads the same either way
+fun doc_fragment(source: str, sp: token.Span, alloc: *Allocator) str {
+    if (sp.len == 0) { ret nil; }
+    val total: usize = doc_text(nil, 0, source, sp);
+    if (total == 0) { ret nil; }
+    val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
+    if (is_err[*u8, str](r)) { ret nil; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+    doc_text(buf, 0, source, sp);
+    buf[total] = 0;
+    ret buf::str;
+}
+
+fun doc_prose(file: *src.SourceFile, span: token.Span, kind: decl.DeclKind, alloc: *Allocator) str {
     if (span.len == 0) { ret nil; }
     val source: str = file.text;
 
     var has_text: bool = false;
-    val total: usize = doc_render(source, span, nil, ?has_text);
+    val total: usize = doc_render(source, span, kind, nil, ?has_text);
     if (!has_text) { ret nil; }
 
     val r: Result[*u8, str] = allocate[u8](alloc, total + 1);
     if (is_err[*u8, str](r)) { ret nil; }
     val buf: *u8 = unwrap_ok[*u8, str](r);
 
-    doc_render(source, span, buf, ?has_text);
+    doc_render(source, span, kind, buf, ?has_text);
     buf[total] = 0;
     ret buf::str;
 }
@@ -451,7 +505,7 @@ fun doc_prose(file: *src.SourceFile, span: token.Span, alloc: *Allocator) str {
 # when it is non-nil and only measuring otherwise. both passes share this walk so
 # the sized length and the written bytes stay identical. sets `has_text` when any
 # summary or component byte is rendered. returns the rendered length in bytes
-fun doc_render(source: str, span: token.Span, buf: *u8, has_text: *bool) usize {
+fun doc_render(source: str, span: token.Span, kind: decl.DeclKind, buf: *u8, has_text: *bool) usize {
     @has_text = false;
     var off: usize = 0;
 
@@ -461,26 +515,73 @@ fun doc_render(source: str, span: token.Span, buf: *u8, has_text: *bool) usize {
         @has_text = true;
     }
 
+    # the return value is not one of the inputs, and listing it among them read
+    # as though a function took an argument called `ret`. It is held back and
+    # given its own line, which is also where a reader looks for it
+    var ret_desc: token.Span;
+    ret_desc.offset = 0;
+    ret_desc.len    = 0;
+
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, span);
     var c: fedoc.DocComponent;
     var first: bool = true;
     for (fedoc.component_next(?it, ?c)) {
+        if (kind == decl.DECL_KIND_FUN && span_is(source, c.name_span, "ret")) {
+            ret_desc = c.desc_span;
+            @has_text = true;
+            cnt;
+        }
         if (first) {
             if (off > 0) { off = doc_lf(buf, off); off = doc_lf(buf, off); }
-            off = doc_emit(buf, off, "---");
+            off = doc_emit(buf, off, "**");
+            off = doc_emit(buf, off, component_heading(kind));
+            off = doc_emit(buf, off, "**");
+            off = doc_lf(buf, off);
             first = false;
         }
         off = doc_lf(buf, off);
-        off = doc_emit(buf, off, "- **");
+        off = doc_emit(buf, off, "- `");
         off = doc_text(buf, off, source, c.name_span);
-        off = doc_emit(buf, off, "**");
+        off = doc_emit(buf, off, "`");
         if (c.desc_span.len > 0) {
             off = doc_emit(buf, off, " \xe2\x80\x94 ");
             off = doc_text(buf, off, source, c.desc_span);
         }
         @has_text = true;
     }
+
+    if (ret_desc.len > 0) {
+        if (off > 0) { off = doc_lf(buf, off); off = doc_lf(buf, off); }
+        off = doc_emit(buf, off, "**Returns** \xe2\x80\x94 ");
+        off = doc_text(buf, off, source, ret_desc);
+    }
     ret off;
+}
+
+# what a declaration's components are called
+#
+# The spec names them per declaration kind rather than generically, and a reader
+# scanning a hover is looking for the word that matches what they are reading:
+# `Fields` under a record, `Parameters` under a function.
+fun component_heading(kind: decl.DeclKind) str {
+    if (kind == decl.DECL_KIND_FUN) { ret "Parameters"; }
+    if (kind == decl.DECL_KIND_REC) { ret "Fields"; }
+    if (kind == decl.DECL_KIND_UNI) { ret "Variants"; }
+    ret "Components";
+}
+
+# whether `sp` covers exactly the bytes of `s`
+fun span_is(source: str, sp: token.Span, s: str) bool {
+    val n: usize = str_len(s);
+    if (sp.len != n) { ret false; }
+    val src: *u8 = source::*u8;
+    val txt: *u8 = s::*u8;
+    var i: usize = 0;
+    for (i < n) {
+        if (src[sp.offset + i] != txt[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # write a single newline into `buf` when non-nil, returning the advanced
@@ -498,52 +599,132 @@ fun doc_emit(buf: *u8, off: usize, s: str) usize {
     ret off + n;
 }
 
-# copy a summary / description span into `buf`, folding each embedded
-# comment-line break (`\n` then the next line's `#`, whitespace, and an optional
-# single space) into a single rendered space. a span returned by `fe/doc.mach`
-# spans only the first line's leading `#`; continuation lines keep their `#`
-# prefix, so this strips them to leave clean prose. measures when `buf` is nil
+# copy a summary / description span into `buf`, keeping the line structure the
+# comment carries
+#
+# A doc comment is wrapped prose, so most line breaks are soft and have to fold
+# into a space or every hover arrives as a column of fragments. Not all of them
+# are: a bullet list is structure the author wrote deliberately, and folding it
+# into the surrounding sentence produced exactly one run-on paragraph with
+# `- item` markers stranded mid-sentence, which no renderer reads as a list.
+#
+# What separates the two is the indentation, which is why this keeps it rather
+# than skipping it as whitespace. A marker at any indent starts a line; a line
+# indented further than the marker above it is that item wrapping and folds; a
+# line back at the prose margin ends the list, and needs a blank line after it or
+# the paragraph that follows is absorbed into the final item.
+#
+# Nesting is emitted relative to the list's own first marker rather than
+# verbatim, so a comment that indents its top level by four spaces stays a list
+# instead of turning into an indented code block.
+#
+# A carriage return is treated as part of the line ending rather than as
+# content, so a file saved with CRLF renders the same as one saved with LF.
+#
+# A span from `fe/doc.mach` covers only the first line's leading `#`;
+# continuation lines keep their own, so those are stripped here. Measures when
+# `buf` is nil, by the same walk, so the two passes cannot disagree.
 fun doc_text(buf: *u8, off: usize, source: str, sp: token.Span) usize {
     val s: *u8 = source::*u8;
     val end: usize = sp.offset + sp.len;
     var i: usize = sp.offset;
     var at_break: bool = false;
+    var in_list:  bool = false;
+    var base:     usize = 0;
+    var item:     usize = 0;
+
     for (i < end) {
-        if (s[i] == '\n') {
+        # a carriage return belongs to the line ending, not to the line. A file
+        # saved with CRLF put one at the end of every doc line, and copying it
+        # as content dropped a stray control byte into the middle of the
+        # rendered prose
+        if (s[i] == '\r') { i = i + 1; cnt; }
+
+        if (s[i] != '\n') {
+            if (buf != nil) { buf[off] = s[i]; }
+            off = off + 1;
+            at_break = false;
             i = i + 1;
-            for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
-            if (i < end && s[i] == '#') { i = i + 1; }
-            for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+            cnt;
+        }
 
-            # a comment line with nothing after its `#` is a paragraph break, not
-            # a wrapped line. folding it to a space ran two paragraphs together
-            # and left the join marked only by a double space, which no renderer
-            # treats as a boundary
-            if (i >= end || s[i] == '\n') {
-                if (!at_break) {
-                    if (buf != nil) { buf[off] = '\n'; }
-                    if (buf != nil) { buf[off + 1] = '\n'; }
-                    off = off + 2;
-                    at_break = true;
-                }
-                cnt;
-            }
+        # step over the break and the next line's comment prefix, then measure
+        # the indentation that follows it
+        i = i + 1;
+        for (i < end && (s[i] == ' ' || s[i] == '\t')) { i = i + 1; }
+        if (i < end && s[i] == '#') { i = i + 1; }
+        var indent: usize = 0;
+        for (i < end && (s[i] == ' ' || s[i] == '\t')) { indent = indent + 1; i = i + 1; }
 
-            # a paragraph break already separated these; the joining space a
-            # wrapped line needs would show as an indent on the new paragraph
+        # a comment line with nothing after its `#` is a paragraph break, not a
+        # wrapped line. Folding it to a space ran two paragraphs together and
+        # left the join marked only by a double space, which no renderer treats
+        # as a boundary
+        if (i >= end || s[i] == '\n' || s[i] == '\r') {
             if (!at_break) {
-                if (buf != nil) { buf[off] = ' '; }
-                off = off + 1;
+                off = doc_lf(buf, off);
+                off = doc_lf(buf, off);
+                at_break = true;
             }
+            in_list = false;
+            cnt;
+        }
+
+        if (marker_at(s, i, end)) {
+            if (in_list) { off = doc_lf(buf, off); }
+            or {
+                if (!at_break) { off = doc_lf(buf, off); off = doc_lf(buf, off); }
+                in_list = true;
+                base    = indent;
+            }
+            item = indent;
+            var k: usize = base;
+            for (k < indent) { off = doc_ch(buf, off, ' '); k = k + 1; }
             at_break = false;
             cnt;
         }
-        if (buf != nil) { buf[off] = s[i]; }
-        off = off + 1;
+
+        if (in_list && indent > item) {
+            off = doc_ch(buf, off, ' ');
+            at_break = false;
+            cnt;
+        }
+
+        if (in_list) {
+            off = doc_lf(buf, off);
+            off = doc_lf(buf, off);
+            in_list  = false;
+            at_break = true;
+            cnt;
+        }
+
+        if (!at_break) { off = doc_ch(buf, off, ' '); }
         at_break = false;
-        i = i + 1;
     }
     ret off;
+}
+
+# whether a list marker starts at `i`
+#
+# The bullet forms plus the ordered ones, because this renders whatever the
+# reader has open and not only the comments in this repository. A marker needs
+# the space after it: `-1` and `1.5` are text, not list items.
+fun marker_at(s: *u8, i: usize, end: usize) bool {
+    if (i >= end) { ret false; }
+    if (s[i] == '-' || s[i] == '*' || s[i] == '+') {
+        ret i + 1 < end && (s[i + 1] == ' ' || s[i + 1] == '\t');
+    }
+    if (s[i] < '0' || s[i] > '9') { ret false; }
+    var j: usize = i;
+    for (j < end && s[j] >= '0' && s[j] <= '9') { j = j + 1; }
+    if (j >= end || (s[j] != '.' && s[j] != ')')) { ret false; }
+    ret j + 1 < end && (s[j + 1] == ' ' || s[j + 1] == '\t');
+}
+
+# write one byte into `buf` when non-nil, returning the advanced offset
+fun doc_ch(buf: *u8, off: usize, c: u8) usize {
+    if (buf != nil) { buf[off] = c; }
+    ret off + 1;
 }
 
 # a `<kind> <name>` rendering for a symbol with no local
