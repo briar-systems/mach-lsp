@@ -295,12 +295,22 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
     }
 }
 
+# a response has an id, no method, and exactly one of `result` or `error`.
+fun is_response(root: *sj.Value) bool {
+    if (json.member(root, "id") == nil) { ret false; }
+    if (json.member(root, "method") != nil) { ret false; }
+    val result: *sj.Value = json.member(root, "result");
+    val error: *sj.Value = json.member(root, "error");
+    ret (result != nil && error == nil) || (result == nil && error != nil);
+}
+
 # route one parsed message by its `method` member
 #
-# a message with no `method` is a response to something the server asked for.
 # an unknown method gets a JSON-RPC method-not-found error when it carries an
 # id, and is dropped when it does not - a notification owes no response.
 fun dispatch(srv: *Server, root: *sj.Value) {
+    if (is_response(root)) { handle_response(srv, root); ret; }
+
     val id: *sj.Value = json.member(root, "id");
     if (id == nil) { dispatch_inner(srv, root); ret; }
 
@@ -320,7 +330,7 @@ fun dispatch(srv: *Server, root: *sj.Value) {
 fun dispatch_inner(srv: *Server, root: *sj.Value) {
     val a: *Allocator = srv.alloc;
     val method_v: *sj.Value = json.member(root, "method");
-    if (method_v == nil) { handle_response(srv, root); ret; }
+    if (method_v == nil) { reply_invalid_request(srv, root); ret; }
     val method: str = json.text(method_v, a);
     if (method == nil) { reply_invalid_request(srv, root); ret; }
     val params: *sj.Value = json.member(root, "params");

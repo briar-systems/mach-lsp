@@ -17,7 +17,7 @@
 # world-readable path in /tmp is not a reasonable price for finding out which
 # requests arrived in which order, which is what tracing is usually turned on
 # for. So the default records only what a message IS - direction, method, id,
-# size, timing - and the bodies themselves need `MLS_TRACE_BODIES`, which is a
+# size, timing - and the bodies themselves need `MLS_TRACE=bodies`, which is a
 # deliberate second decision and still capped, because a trace that pages in a
 # 40 KB buffer per keystroke is unreadable as well as invasive.
 

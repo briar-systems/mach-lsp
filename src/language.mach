@@ -69,6 +69,7 @@ use positions: mls.positions;
 use render:    mls.render;
 use project:   mls.project;
 use analysis:  mls.analysis;
+use mtypes:    mls.types;
 
 # the resolved analysis of one request's target document
 # ---
@@ -1596,41 +1597,114 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
     emit_document_symbols(an, alloc, id_raw);
 }
 
-# answer textDocument/completion with the in-scope top-level names
-# (module decls, `use` aliases / imports, primitives) as CompletionItems
+# answer completion from the newest analysis already available
+#
+# a current project snapshot supplies dependency-aware names and members. when
+# input is queued ahead of a rebuild, the isolated editor analysis supplies an
+# exact view of the current buffer without blocking on the whole project. that
+# result is incomplete because imports cannot resolve in the isolated session.
+# snapshot and editor identities are never joined: offsets, Ast nodes, resolve
+# tables, sema types, and source text in one answer all come from one owner.
 pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an: analysis.Analyzed;
-    if (!analysis.analyze(ws, es, docs, uri, ?an)) { reply_empty_completion(alloc, id_raw); ret; }
+    val doc: *documents.Document = documents.find(docs, uri);
+    if (doc == nil) { reply_empty_completion(alloc, id_raw, false); ret; }
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (!is_some[*src.SourceFile](fo)) { reply_empty_completion(alloc, id_raw, false); ret; }
+    val file: *src.SourceFile = unwrap[*src.SourceFile](fo);
 
-    # completion is the one feature whose answer depends on where the cursor is
-    # rather than merely what it is on: the identifier being typed narrows the
-    # set, and a preceding `.` replaces it entirely.
     val pos: *sj.Value = json.member(params, "position");
     val line: i64 = json.number(json.member(pos, "line"), -1);
-    val ch:   i64 = json.number(json.member(pos, "character"), -1);
-    var offset: usize = 0;
-    var have_offset: bool = false;
-    if (line >= 0 && ch >= 0) {
-        val oo: Option[usize] = positions.offset_at(an.text, line::usize, ch::usize);
-        if (is_some[usize](oo)) { offset = unwrap[usize](oo); have_offset = true; }
+    val ch: i64 = json.number(json.member(pos, "character"), -1);
+    if (line < 0 || ch < 0) {
+        reply_empty_completion(alloc, id_raw, false); ret;
     }
-    if (!have_offset) { emit_completions(an, alloc, id_raw, empty_span(), nil); ret; }
-
-    val prefix: token.Span = ident_prefix_before(an.text.file, offset);
+    val oo: Option[usize] = positions.offset_at(positions.text_of(file), line::usize, ch::usize);
+    if (!is_some[usize](oo)) {
+        reply_empty_completion(alloc, id_raw, false); ret;
+    }
+    val offset: usize = unwrap[usize](oo);
+    val prefix: token.Span = ident_prefix_before(file, offset);
     val dot: usize = prefix.offset;
-    if (dot > 0 && an.text.file.text[dot - 1] == '.') {
-        if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
-        # a receiver we cannot resolve offers nothing rather than the whole file,
-        # which would be a list of names that cannot legally follow the dot
-        reply_empty_completion(alloc, id_raw);
-        ret;
+
+    var an: analysis.Analyzed;
+    val vr: Result[project.DocumentView, str] = project.document_view_loaded(ws, doc);
+    if (!is_err[project.DocumentView, str](vr)) {
+        val view: project.DocumentView = unwrap_ok[project.DocumentView, str](vr);
+        an.interner = view.interner;
+        an.text = view.text;
+        an.sr = view.sr;
+        an.a = view.a;
+        an.rr = view.rr;
+        an.own = view.module;
+        an.root = view.root;
+
+        if (dot > 0 && file.text[dot - 1] == '.') {
+            if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            reply_empty_completion(alloc, id_raw, false); ret;
+        }
+        emit_completions(an, alloc, id_raw, prefix, file, false); ret;
     }
 
-    emit_completions(an, alloc, id_raw, prefix, an.text.file);
+    if (project.root_for_loaded(ws, uri) == nil) {
+        if (!analysis.analyze(ws, es, docs, uri, ?an)) {
+            reply_empty_completion(alloc, id_raw, false); ret;
+        }
+        if (dot > 0 && file.text[dot - 1] == '.') {
+            if (an.root != nil) {
+                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            } or {
+                if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+            }
+            reply_empty_completion(alloc, id_raw, false); ret;
+        }
+        emit_completions(an, alloc, id_raw, prefix, file, false); ret;
+    }
+
+    if (!editor_completion_analysis(es, doc, dot > 0 && file.text[dot - 1] == '.', ?an)) {
+        reply_empty_completion(alloc, id_raw, true); ret;
+    }
+    if (dot > 0 && file.text[dot - 1] == '.') {
+        if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
+        reply_empty_completion(alloc, id_raw, true); ret;
+    }
+    emit_completions(an, alloc, id_raw, prefix, file, true);
 }
+
+# build one exact, isolated analysis from the current editor buffer
+fun editor_completion_analysis(es: *editor.EditorSession, doc: *documents.Document,
+                               with_sema: bool, out: *analysis.Analyzed) bool {
+    var rr: *res.ResolveResult = nil;
+    var sr: *sema.SemaResult = nil;
+    if (with_sema) {
+        val ar: Result[*sema.SemaResult, str] = editor.analyze(es, doc.file_id);
+        if (!is_err[*sema.SemaResult, str](ar)) {
+            sr = unwrap_ok[*sema.SemaResult, str](ar);
+            rr = editor.resolve_of(es, doc.file_id);
+        }
+    } or {
+        val rr_result: Result[*res.ResolveResult, str] = editor.resolve(es, doc.file_id);
+        if (!is_err[*res.ResolveResult, str](rr_result)) {
+            rr = unwrap_ok[*res.ResolveResult, str](rr_result);
+        }
+    }
+    if (rr == nil) { ret false; }
+    val a: *ast.Ast = editor.ast_of(es, doc.file_id);
+    val fo: Option[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (a == nil || !is_some[*src.SourceFile](fo)) { ret false; }
+
+    out.interner = ?es.s.interner;
+    out.text = positions.text_of(unwrap[*src.SourceFile](fo));
+    out.sr = sr;
+    out.a = a;
+    out.rr = rr;
+    out.own = doc.file_id::sess.ModuleId;
+    out.root = nil;
+    ret true;
+}
+
 
 # the identifier being typed immediately before `offset`, as a span
 #
@@ -2134,9 +2208,10 @@ fun decl_lsp_kind(kind: decl.DeclKind) i64 {
 # send a CompletionItem[] of the file's top-level names, each
 # deduped by spelling so a name declared once appears once. takes ownership of
 # `id_raw` and frees it
-fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, pfile: *src.SourceFile) {
+fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                     prefix: token.Span, pfile: *src.SourceFile, incomplete: bool) {
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, incomplete);
 
     var emitted: usize = 0;
     var i: u32 = 0;
@@ -2195,51 +2270,50 @@ fun emit_member_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc
     ret emit_field_completions(ws, an, alloc, id_raw, prefix, eid);
 }
 
-# offer a module's public symbols
-fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
-                        prefix: token.Span, mid: sess.ModuleId) bool {
+# offer a module's public symbols, including `fwd` re-exports
+fun emit_module_members(ws: *project.Workspace, an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span, mid: sess.ModuleId) bool {
     if (an.root == nil) { ret false; }
     val mvo: Option[project.ModuleView] = project.module_view(ws, an.root, mid);
     if (!is_some[project.ModuleView](mvo)) { ret false; }
     val mv: project.ModuleView = unwrap[project.ModuleView](mvo);
     if (mv.rr == nil) { ret false; }
-
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
-
+    push_completion_head(?b, id_raw, false);
     var emitted: usize = 0;
     var i: u32 = 0;
-    for (i < mv.rr.symbol_count) {
+    for (i < mv.rr.pub_count) {
         val sym: *res.Symbol = ?mv.rr.symbols[i];
-        if ((sym.flags & res.SYM_FLAG_PUB) != 0 && sym.origin == mid) {
-            val no: Option[str] = intern.lookup(?an.root.s.interner, sym.name);
-            if (is_some[str](no)) {
-                val name: str = unwrap[str](no);
-                if (span_is_prefix_of(an.text.file, prefix, name) && !name_already_emitted(mv.rr, i, mid)) {
-                    push_completion_item(?b, name, features.lsp_completion_kind(sym.kind),
-                                         features.kind_label(sym.kind), nil, emitted > 0);
-                    emitted = emitted + 1;
-                }
+        val no: Option[str] = intern.lookup(?an.root.s.interner, sym.name);
+        if (is_some[str](no)) {
+            val name: str = unwrap[str](no);
+            if (span_is_prefix_of(an.text.file, prefix, name)) {
+                push_completion_item(?b, name, features.lsp_completion_kind(sym.kind),
+                                     features.kind_label(sym.kind), nil, emitted > 0);
+                emitted = emitted + 1;
             }
         }
         i = i + 1;
     }
-
     push_completion_tail(?b, alloc, id_raw);
     ret true;
 }
 
-# whether an earlier pub symbol of the same module already carries this name, so
-# a name bound more than once is offered once
-fun name_already_emitted(rr: *res.ResolveResult, sid: res.SymbolId, mid: sess.ModuleId) bool {
-    val target: intern.StrId = (?rr.symbols[sid]).name;
-    var i: u32 = 0;
-    for (i < sid::u32) {
-        val other: *res.Symbol = ?rr.symbols[i];
-        if (other.name == target && (other.flags & res.SYM_FLAG_PUB) != 0 && other.origin == mid) { ret true; }
-        i = i + 1;
-    }
-    ret false;
+# offer fields resolved entirely inside the isolated editor session
+fun emit_editor_member_completions(es: *editor.EditorSession, an: analysis.Analyzed,
+                                   alloc: *Allocator, id_raw: str,
+                                   prefix: token.Span, dot: usize) bool {
+    if (an.sr == nil || dot == 0) { ret false; }
+    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
+    if (eid == id.EXPR_NIL) { ret false; }
+    val tid: type.TypeId = mtypes.type_of(an.sr, eid);
+    val no: Option[mtypes.Nominal] = mtypes.nominal_of(?es.s.types, tid);
+    if (!is_some[mtypes.Nominal](no)) { ret false; }
+    val nominal: mtypes.Nominal = unwrap[mtypes.Nominal](no);
+    if (nominal.origin != an.own) { ret false; }
+    val rso: Option[project.RecordSite] =
+        project.record_site_at(nil, nil, an.own, an.a, an.text.file, nominal.decl);
+    if (!is_some[project.RecordSite](rso)) { ret false; }
+    ret emit_record_fields(an, alloc, id_raw, prefix, unwrap[project.RecordSite](rso), true);
 }
 
 # offer the fields of the record or union the receiver expression types to
@@ -2250,10 +2324,14 @@ fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc:
     val rso: Option[project.RecordSite] =
         project.record_decl_in(ws, an.root, an.own, an.a, an.text.file, tid);
     if (!is_some[project.RecordSite](rso)) { ret false; }
-    val rs: project.RecordSite = unwrap[project.RecordSite](rso);
+    ret emit_record_fields(an, alloc, id_raw, prefix, unwrap[project.RecordSite](rso), false);
+}
 
+# emit one record or union's fields with the requested completeness marker
+fun emit_record_fields(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+                       prefix: token.Span, rs: project.RecordSite, incomplete: bool) bool {
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, incomplete);
 
     var emitted: usize = 0;
     var i: u32 = 0;
@@ -2280,17 +2358,20 @@ fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc:
 #
 # The same shape as a populated reply rather than a bare `[]`, so a client sees
 # one response type from this method whatever the cursor is on.
-fun reply_empty_completion(alloc: *Allocator, id_raw: str) {
+fun reply_empty_completion(alloc: *Allocator, id_raw: str, incomplete: bool) {
     var b: json.Buf = json.buf_init(alloc);
-    push_completion_head(?b, id_raw);
+    push_completion_head(?b, id_raw, incomplete);
     push_completion_tail(?b, alloc, id_raw);
 }
 
 # the response envelope every completion list shares
-fun push_completion_head(b: *json.Buf, id_raw: str) {
+fun push_completion_head(b: *json.Buf, id_raw: str, incomplete: bool) {
     json.buf_push(b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push(b, id_raw);
-    json.buf_push(b, ",\"result\":{\"isIncomplete\":false,\"items\":[");
+    json.buf_push(b, ",\"result\":{\"isIncomplete\":");
+    if (incomplete) { json.buf_push(b, "true"); }
+    or { json.buf_push(b, "false"); }
+    json.buf_push(b, ",\"items\":[");
 }
 
 # close the envelope, send it, and release the request id
@@ -2330,18 +2411,3 @@ fun completion_first(an: analysis.Analyzed, sid: res.SymbolId) bool {
     }
     ret true;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

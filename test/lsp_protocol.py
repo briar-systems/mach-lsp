@@ -131,6 +131,41 @@ class LspSession:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
 
+    def request_after_notifications(
+        self,
+        notifications: list[tuple[str, dict[str, Any]]],
+        method: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write a queued notification burst followed by one request."""
+        request_id = self.next_id
+        self.next_id += 1
+        messages = [
+            {"jsonrpc": "2.0", "method": name, "params": notification_params}
+            for name, notification_params in notifications
+        ]
+        request: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            request["params"] = params
+        messages.append(request)
+
+        frames = []
+        for message in messages:
+            payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
+            frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
+        started = time.monotonic()
+        try:
+            self.proc.stdin.write(b"".join(frames))
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
+
+        response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
+        self.timings.append((f"{method}#{request_id}", time.monotonic() - started))
+        if "error" in response:
+            raise ProtocolError(f"{method} returned {response['error']!r}")
+        return response
+
     def respond_error(self, request: dict[str, Any], code: int, message: str) -> None:
         """Reject one server-initiated request."""
         self._send({"jsonrpc": "2.0", "id": request.get("id"),
@@ -166,6 +201,35 @@ class LspSession:
             self.message_count += 1
             if predicate(item):
                 return item
+            self.pending.append(item)
+
+    def assert_no_message(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        description: str,
+        settle: float = 0.3,
+    ) -> None:
+        """Require that no matching message arrives during a short settle period."""
+        for message in self.pending:
+            if predicate(message):
+                raise ProtocolError(f"unexpected {description}: {message!r}")
+        deadline = time.monotonic() + settle
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                item = self.inbox.get(timeout=remaining)
+            except queue.Empty:
+                return
+            if item is None:
+                raise ProtocolError(f"server exited while waiting for {description}; stderr: {self.stderr_text()}")
+            if isinstance(item, BaseException):
+                raise ProtocolError(f"response reader failed: {item}") from item
+            assert isinstance(item, dict)
+            self.message_count += 1
+            if predicate(item):
+                raise ProtocolError(f"unexpected {description}: {item!r}")
             self.pending.append(item)
 
     def diagnostics(self, uri: str, version: object = ANY_VERSION) -> dict[str, Any]:
@@ -320,6 +384,7 @@ need = []
     )
     alias = "vals" if project_id == "beta" else "rootmod"
     import_line = (f"use {alias}: {project_id}.defs;\n"
+                   f"use exports: {project_id}.bridge;\n"
                    f"use direct: {project_id}.defs.answer;\n"
                    f"use forwarded: {project_id}.bridge.answer;\n"
                    f"use {project_id}.defs.Box;\n"
@@ -347,7 +412,7 @@ pub fun take[T](b: Box[T]) i32 {{ ret 7; }}
         encoding="utf-8",
     )
     (source / "bridge.mach").write_text(
-        f"fwd {project_id}.defs.answer;\n", encoding="utf-8",
+        f"pub val own: i32 = {value};\nfwd {project_id}.defs.answer;\n", encoding="utf-8",
     )
     return main, definition, text
 
@@ -499,6 +564,10 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
                 "dynamic watcher registration",
             )
             session.respond_error(registration, -32601, "watch registration rejected")
+            session.assert_no_message(
+                lambda item: item.get("id") == registration.get("id"),
+                "reply to rejected watcher registration",
+            )
 
             session.notify(
                 "textDocument/didOpen",
@@ -1058,6 +1127,11 @@ def run_completion_context(server: Path, timeout: float) -> None:
             require("main" not in members,
                     f"a module alias offered the requesting file's names: {members!r}")
 
+            # a module's public prefix includes its own declarations and re-exports
+            exports = complete("exports.")
+            require("own" in exports and "answer" in exports,
+                    f"a mixed module surface lost an export: {exports!r}")
+
             # a partial member narrows
             narrowed = complete("rootmod.an")
             require(narrowed and all(label.startswith("an") for label in narrowed),
@@ -1076,6 +1150,80 @@ def run_completion_context(server: Path, timeout: float) -> None:
                     f"a partial identifier did not filter: {prefixed!r}")
             require(len(prefixed) < len(everything),
                     "filtering returned as many items as no filter at all")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_completion_freshness(server: Path, timeout: float) -> None:
+    """Queued completion uses current text without consuming stale semantics."""
+    with tempfile.TemporaryDirectory(prefix="mls-compl-fresh-") as directory:
+        root = Path(directory).resolve()
+        main, _, text = write_project(root, "complfresh", 5)
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+
+            stale_lines = text.splitlines()
+            stale_lines.extend([
+                "",
+                "rec Fresh { live: i32; }",
+                "fun pending() i32 {",
+                "    var current: Fresh;",
+                "    current.",
+                "    ret 0;",
+                "}",
+            ])
+            stale_text = "\n".join(stale_lines) + "\n"
+            stale_line = next(i for i, value in enumerate(stale_lines) if value.strip() == "current.")
+            version = 1
+            notifications = []
+            for _ in range(32):
+                version += 1
+                notifications.append((
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": stale_text}]},
+                ))
+
+            pending = session.request_after_notifications(
+                notifications,
+                "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": stale_line, "character": len("    current.")}},
+            )
+            pending_result = pending.get("result")
+            require(isinstance(pending_result, dict)
+                    and pending_result.get("isIncomplete") is True,
+                    f"stale completion did not identify its isolated result: {pending!r}")
+            pending_labels = [item.get("label") for item in pending_result.get("items", [])]
+            require("live" in pending_labels,
+                    f"current editor member was absent before rebuild: {pending_labels!r}")
+            require(session.timings[-1][1] < 1.0,
+                    f"isolated completion blocked for {session.timings[-1][1]:.3f}s")
+
+            session.diagnostics(main.as_uri(), version)
+            rebuilt = session.request(
+                "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": stale_line, "character": len("    current.")}},
+            ).get("result")
+            require(isinstance(rebuilt, dict) and rebuilt.get("isIncomplete") is False,
+                    f"completion stayed isolated after the deferred rebuild: {rebuilt!r}")
+            rebuilt_labels = [item.get("label") for item in rebuilt.get("items", [])]
+            require("live" in rebuilt_labels,
+                    f"deferred rebuild lost the current member: {rebuilt_labels!r}")
 
             session.finish()
             finished = True
@@ -2001,6 +2149,10 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
                 "watch registration",
             )
             session.respond_result(registration)
+            session.assert_no_message(
+                lambda item: item.get("id") == registration.get("id"),
+                "reply to accepted watcher registration",
+            )
             session.notify(
                 "textDocument/didOpen",
                 {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
@@ -2038,6 +2190,48 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             repaired = definition(session, main, text, "watched")
             require(repaired.get("uri") == defs.as_uri(),
                     f"failed root did not retry after disk source repair: {repaired!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_response_envelopes(server: Path, timeout: float) -> None:
+    """Responses of every legal id type are ignored, not answered."""
+    with tempfile.TemporaryDirectory(prefix="mls-response-") as directory:
+        root = Path(directory).resolve()
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            response_ids: tuple[str | int | None, ...] = ("foreign", 42, None)
+            session._send({"jsonrpc": "2.0", "id": response_ids[0], "result": None})
+            session._send({"jsonrpc": "2.0", "id": response_ids[1],
+                           "error": {"code": -32601, "message": "unknown request"}})
+            session._send({"jsonrpc": "2.0", "id": response_ids[2], "result": None})
+            session.assert_no_message(
+                lambda item: ("id" in item
+                              and any(item["id"] == response_id for response_id in response_ids)),
+                "reply to a server response",
+            )
+
+            invalid_requests = (
+                {"jsonrpc": "2.0", "result": None},
+                {"jsonrpc": "2.0", "id": "missing-method"},
+                {"jsonrpc": "2.0", "id": "both-response-fields", "result": None,
+                 "error": {"code": -32601, "message": "unknown request"}},
+            )
+            for invalid_request in invalid_requests:
+                invalid_id = invalid_request.get("id")
+                session._send(invalid_request)
+                invalid = session.wait_for(
+                    lambda item: item.get("id") == invalid_id,
+                    "invalid request response",
+                )
+                error = invalid.get("error")
+                require(isinstance(error, dict) and error.get("code") == -32600,
+                        f"a method-less non-response was not rejected: {invalid!r}")
             session.finish()
             finished = True
         finally:
@@ -2453,6 +2647,15 @@ def run_progress_reporting(server: Path, timeout: float) -> None:
                                   "version": 1, "text": text}},
             )
             session.diagnostics(main.as_uri(), 1)
+            create = session.wait_for(
+                lambda item: item.get("method") == "window/workDoneProgress/create",
+                "progress token creation",
+            )
+            session.respond_result(create)
+            session.assert_no_message(
+                lambda item: item.get("id") == create.get("id"),
+                "reply to progress token creation",
+            )
             for version in (2, 3):
                 session.notify(
                     "textDocument/didChange",
@@ -2733,9 +2936,11 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
+        run_response_envelopes(server, args.timeout)
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
         run_completion_context(server, args.timeout)
+        run_completion_freshness(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
@@ -2766,6 +2971,7 @@ def main() -> int:
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  completion answers for the cursor: members, exports, prefixes")
+    print("  queued completion uses current editor analysis before the deferred rebuild")
     print("  documentHighlight classifies reads and writes in the active file")
     print("  workspace/symbol searches loaded roots, best matches first")
     print("  signatureHelp tracks the active argument through incomplete calls")

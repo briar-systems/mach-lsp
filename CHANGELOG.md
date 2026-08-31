@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-31
+
+Completion now stays responsive while project analysis catches up to edits,
+without combining offsets, syntax, or types from different revisions. Protocol
+replies and module re-exports are also classified at their actual boundaries.
+
+### Fixed
+- completion: a request queued behind an edit no longer waits for a synchronous
+  project rebuild. When the loaded project snapshot is stale, completion uses
+  one exact analysis of the current editor buffer and marks the result
+  incomplete because dependencies are unavailable there. A current project
+  snapshot still supplies dependency-aware names, while a cold project keeps
+  the existing strict load path. This preserves revision identity throughout
+  an answer and leaves the deferred diagnostics pass to rebuild the project.
+  (#227)
+- completion: module members now come from the resolver's complete public
+  prefix. A module that declares its own public names and also forwards names
+  from another module offers both sets, rather than dropping the forwarded
+  exports. (#227)
+- protocol: valid replies to server-initiated watcher and progress requests no
+  longer fall through the request backstop and receive a spurious
+  `InternalError`. A response is recognized only when it has an ID, has no
+  method, and contains exactly one of `result` or `error`, so malformed
+  methodless envelopes still receive `InvalidRequest`. (#226)
+
+### Changed
+- trace: the module documentation now names the body opt-in that the server
+  actually reads, `MLS_TRACE=bodies`.
+
 ## [0.16.0] - 2026-08-23
 
 Hover was rendering doc comments as one undifferentiated paragraph. Fixing that
