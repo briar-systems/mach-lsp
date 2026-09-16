@@ -304,6 +304,12 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
         srv.deferred = false;
         republish_all(srv);
     }
+
+    # and a boundary on the way out, too: work this message made pending, such as
+    # warming the spare session a load just left cold, starts now rather than
+    # when the next message arrives - which is usually the edit that needed it.
+    # a server that is shutting down starts nothing new
+    if (srv.status == STATUS_RUNNING) { collect_rebuilds(srv); }
     trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
 
     if (srv.status == STATUS_EXITED || transport.write_failed()) {

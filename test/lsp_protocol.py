@@ -944,6 +944,75 @@ need = []
     return main, text
 
 
+def run_spare_warmup(server: Path, timeout: float) -> None:
+    """The spare session is built once after load, before any edit needs it.
+
+    A root keeps two sessions and each rebuild runs into the one not serving.
+    The first load builds only one of them, so without a warm-up the first
+    edit's rebuild is a whole cold build (#252). Asserted from the server's own
+    build log, not a clock: a build is scheduled with no edit at all, nothing
+    further is scheduled while idle, and an edit then costs exactly one build.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-warmup-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "warm", 8)
+        trace_path = root / "trace.log"
+        session = LspSession(server, root, timeout,
+                             {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(trace_path)})
+        finished = False
+        try:
+            def log() -> str:
+                return trace_path.read_text(encoding="utf-8", errors="replace")
+
+            def scheduled() -> int:
+                return log().count("off the analysis thread")
+
+            def quiesced() -> bool:
+                text_log = log()
+                done = max(0, text_log.count("project: rebuilt")
+                              - text_log.count("project: analyzed"))
+                return done >= scheduled()
+
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            eventually(lambda: scheduled() >= 1 and quiesced(), lambda done: done,
+                       "the spare to be built without an edit", 60.0)
+
+            # idle message boundaries pump the builder, and a primed spare must not
+            # be built again: a warm-up that re-arms itself would spin forever
+            for _ in range(3):
+                session.request("textDocument/documentSymbol",
+                                {"textDocument": {"uri": main.as_uri()}})
+            require(scheduled() == 1,
+                    f"an idle server scheduled {scheduled()} builds, expected the one warm-up")
+
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": text + "\n# one edit\n"}]},
+            )
+            session.diagnostics(main.as_uri(), 2)
+            eventually(lambda: scheduled() >= 2 and quiesced(), lambda done: done,
+                       "the edit's rebuild to land", 60.0)
+            for _ in range(2):
+                session.request("textDocument/documentSymbol",
+                                {"textDocument": {"uri": main.as_uri()}})
+            require(scheduled() == 2,
+                    f"one edit after warm-up scheduled {scheduled() - 1} builds, expected 1")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_rebuild_concurrency(server: Path, timeout: float) -> None:
     """Prove a request is ANSWERED while a project rebuild is still running.
 
@@ -990,7 +1059,10 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                                   "version": 1, "text": text}},
             )
             session.diagnostics(main.as_uri(), 1)
-            eventually(quiesced, lambda done: done, "the initial load to quiesce", 60.0)
+            # the load is followed by a warm-up of the spare session (#252), which
+            # is scheduled after the load's diagnostics are written
+            eventually(lambda: scheduled() >= 1 and quiesced(), lambda done: done,
+                       "the initial load and spare warm-up to quiesce", 60.0)
 
             edited = text + "\n# one edit, one rebuild\n"
             session.notify(
@@ -3924,6 +3996,7 @@ def main() -> int:
     try:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
+        run_spare_warmup(server, args.timeout)
         run_failed_rebuild_keeps_serving(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_response_envelopes(server, args.timeout)
