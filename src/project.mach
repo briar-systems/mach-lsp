@@ -1101,7 +1101,8 @@ fun schedule_build(w: *Workspace, r: *Root, index: u32) bool {
     }
     w.building      = true;
     w.building_root = index;
-    trace.logf("project: rebuilding {} off the analysis thread", r.path);
+    if (warmup) { trace.logf("project: warming {} off the analysis thread", r.path); }
+    or          { trace.logf("project: rebuilding {} off the analysis thread", r.path); }
     ret true;
 }
 
@@ -1137,11 +1138,14 @@ pub val PUMP_SWAPPED: u8 = 1;
 # With no root stale, the slot warms a root whose spare has never built. The
 # first load builds only one of a root's two sessions, and without this the
 # first edit's rebuild pays a whole cold build (#252). Stale roots go first,
-# because an edit waiting on a warm-up is the latency this exists to remove.
+# because an edit waiting on a warm-up is the latency this exists to remove, and
+# no warm-up starts while input is queued: an edit already waiting would sit
+# behind a whole cold build of text it has replaced, then pay its own rebuild.
 # ---
-# w:   the workspace
-# ret: PUMP_SWAPPED when a snapshot changed and diagnostics must republish
-pub fun pump(w: *Workspace) u8 {
+# w:        the workspace
+# may_warm: no input is queued, so an idle slot may warm a spare
+# ret:      PUMP_SWAPPED when a snapshot changed and diagnostics must republish
+pub fun pump(w: *Workspace, may_warm: bool) u8 {
     var moved: u8 = PUMP_IDLE;
 
     val done: ptr = build.take(?w.builder);
@@ -1167,6 +1171,7 @@ pub fun pump(w: *Workspace) u8 {
         }
         i = i + 1;
     }
+    if (!may_warm) { ret moved; }
     i = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
@@ -1387,7 +1392,7 @@ fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, pr: *driver.Project
             free_path_snapshot(alloc, paths, fingerprints, n, i);
             ret res[bool, str].err{"project: failed to normalize loaded module path"};
         }
-        fingerprints[i] = file_fingerprint(paths[i]);
+        fingerprints[i] = verified_fingerprint(alloc, sn, fo.some, paths[i]);
         i               = i + 1;
     }
     o.mod_paths        = paths;
@@ -1666,6 +1671,38 @@ fun file_fingerprint(path: str) SourceFingerprint {
     fp.mtime = chrono.time_unix_nsec(fi.modified);
     fp.size  = fi.size;
     ret fp;
+}
+
+# a fingerprint no stat produces, so the next scan always reports a change
+fun unknown_fingerprint() SourceFingerprint {
+    var fp: SourceFingerprint;
+    fp.mtime = -1;
+    fp.size  = ~(0::usize);
+    ret fp;
+}
+
+# the on-disk fingerprint of `path`, provided the file still holds exactly the
+# text the build analyzed
+#
+# A fingerprint taken after the build can describe bytes written after the
+# compiler read the file. Recorded as-is, that change would read as the
+# snapshot's own and never be rebuilt. So the stat comes first and the file is
+# then compared with what was analyzed, through the same read the loader uses: a
+# write that landed in between is a mismatch, recorded as unknown so the next
+# scan rebuilds it. An open document is analyzed from its overlay, whose bytes
+# the disk is not expected to hold, and is not compared.
+fun verified_fingerprint(alloc: *Allocator, sn: *sess.Session, file: *src.SourceFile, path: str) SourceFingerprint {
+    val fp: SourceFingerprint = file_fingerprint(path);
+    val ov: opt[str]          = sess.overlay_get(sn, file.path);
+    if (sel ov.some) { ret fp; }
+    val tr:   res[str, fs.FsError] = fs.read_string(alloc, path);
+    var same: bool                 = false;
+    if (sel tr.ok) {
+        same = str_equals(tr.ok, file.text);
+        strutil.str_free(alloc, tr.ok);
+    }
+    if (same) { ret fp; }
+    ret unknown_fingerprint();
 }
 
 # whether `path` still matches the fingerprint recorded in `prev`

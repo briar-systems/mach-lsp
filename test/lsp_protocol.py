@@ -487,6 +487,42 @@ need = []
     return main, dep, main_text, live_dep_text
 
 
+class BuildLog:
+    """The server's own record of the project builds it ran, read from its trace.
+
+    Every background build logs when it is scheduled and when it finishes, and
+    the inline first load also logs that it was analyzed, so subtracting those
+    leaves the background ones. Counting the server's record is deterministic,
+    where waiting for the diagnostics stream to fall quiet is not: a build that
+    is still running is quiet.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def env(self) -> dict[str, str]:
+        return {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(self.path)}
+
+    def text(self) -> str:
+        try:
+            return self.path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return ""
+
+    def scheduled(self) -> int:
+        return self.text().count("off the analysis thread")
+
+    def quiesced(self) -> bool:
+        log = self.text()
+        done = max(0, log.count("project: rebuilt") - log.count("project: analyzed"))
+        return done >= log.count("off the analysis thread")
+
+    def settle(self, at_least: int, description: str, deadline: float = 60.0) -> None:
+        """Wait until at least `at_least` background builds ran and none is running."""
+        eventually(lambda: self.scheduled() >= at_least and self.quiesced(),
+                   lambda done: done, description, deadline)
+
+
 def eventually(
     probe: Callable[[], Any],
     want: Callable[[Any], bool],
@@ -956,22 +992,10 @@ def run_spare_warmup(server: Path, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="mls-warmup-") as directory:
         root = Path(directory).resolve()
         main, text = write_wide_project(root, "warm", 8)
-        trace_path = root / "trace.log"
-        session = LspSession(server, root, timeout,
-                             {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(trace_path)})
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
         finished = False
         try:
-            def log() -> str:
-                return trace_path.read_text(encoding="utf-8", errors="replace")
-
-            def scheduled() -> int:
-                return log().count("off the analysis thread")
-
-            def quiesced() -> bool:
-                text_log = log()
-                done = max(0, text_log.count("project: rebuilt")
-                              - text_log.count("project: analyzed"))
-                return done >= scheduled()
 
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
             session.notify("initialized", {})
@@ -981,16 +1005,15 @@ def run_spare_warmup(server: Path, timeout: float) -> None:
                                   "version": 1, "text": text}},
             )
             session.diagnostics(main.as_uri(), 1)
-            eventually(lambda: scheduled() >= 1 and quiesced(), lambda done: done,
-                       "the spare to be built without an edit", 60.0)
+            builds.settle(1, "the spare to be built without an edit")
 
             # idle message boundaries pump the builder, and a primed spare must not
             # be built again: a warm-up that re-arms itself would spin forever
             for _ in range(3):
                 session.request("textDocument/documentSymbol",
                                 {"textDocument": {"uri": main.as_uri()}})
-            require(scheduled() == 1,
-                    f"an idle server scheduled {scheduled()} builds, expected the one warm-up")
+            require(builds.scheduled() == 1,
+                    f"an idle server scheduled {builds.scheduled()} builds, expected the one warm-up")
 
             session.notify(
                 "textDocument/didChange",
@@ -998,13 +1021,203 @@ def run_spare_warmup(server: Path, timeout: float) -> None:
                  "contentChanges": [{"text": text + "\n# one edit\n"}]},
             )
             session.diagnostics(main.as_uri(), 2)
-            eventually(lambda: scheduled() >= 2 and quiesced(), lambda done: done,
-                       "the edit's rebuild to land", 60.0)
+            builds.settle(2, "the edit's rebuild to land")
             for _ in range(2):
                 session.request("textDocument/documentSymbol",
                                 {"textDocument": {"uri": main.as_uri()}})
-            require(scheduled() == 2,
-                    f"one edit after warm-up scheduled {scheduled() - 1} builds, expected 1")
+            require(builds.scheduled() == 2,
+                    f"one edit after warm-up scheduled {builds.scheduled() - 1} builds, expected 1")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_warmup_yields_to_queued_edit(server: Path, timeout: float) -> None:
+    """An edit that arrives during the first load is built before any warm-up.
+
+    The load is synchronous, so an edit typed during it is already waiting when
+    it ends. Warming the spare first would put that edit behind a whole cold
+    build of text it replaced, and then its own rebuild. Built first, the edit
+    lands in the never-built spare, and the swap leaves the loaded session as the
+    new spare, so no warm-up is owed at all.
+
+    The edit has to arrive while the load runs, not before it starts: an edit
+    already queued when the open is handled is folded into the load itself.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-queued-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "queued", 192)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            eventually(builds.text, lambda log: "method textDocument/didOpen" in log,
+                       "the load to start")
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": text + "\n# typed during the load\n"}]},
+            )
+            session.diagnostics(main.as_uri(), 2)
+            builds.settle(1, "the queued edit's build")
+            for _ in range(3):
+                session.request("textDocument/documentSymbol",
+                                {"textDocument": {"uri": main.as_uri()}})
+            background = [line for line in builds.text().splitlines()
+                          if "off the analysis thread" in line]
+            require(len(background) == 1 and "rebuilding" in background[0],
+                    f"a queued edit was not the only background build: {background!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+def run_failed_build_primes_spare(server: Path, timeout: float) -> None:
+    """A build that fails still primes the session it ran into.
+
+    Warming is for a spare that has never built. If a failed build left its
+    session counted as cold, a root that stays broken would be warmed, fail, and
+    be warmed again for as long as the server lives. The failing build has to
+    land on a never-built spare for that to show, which is what a second root
+    arranges: the small root breaks while the big root's warm-up holds the build
+    slot, and a stale root is built before any warm-up.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-primed-") as directory:
+        root = Path(directory).resolve()
+        big, big_text = write_wide_project(root, "big", 384)
+        small, small_text = write_wide_project(root, "small", 2)
+        manifest = small.parents[1] / "mach.toml"
+        manifest_text = manifest.read_text(encoding="utf-8")
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            for uri, text in ((big.as_uri(), big_text), (small.as_uri(), small_text)):
+                session.notify(
+                    "textDocument/didOpen",
+                    {"textDocument": {"uri": uri, "languageId": "mach",
+                                      "version": 1, "text": text}},
+                )
+                session.diagnostics(uri, 1)
+
+            manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+            time.sleep(FINGERPRINT_WINDOW)
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": small.as_uri(), "version": 2},
+                 "contentChanges": [{"text": small_text + "\n# breaks with its manifest\n"}]},
+            )
+            session.diagnostics(small.as_uri(), 2)
+            session.wait_for(
+                lambda item: (item.get("method") == "window/showMessage"
+                              and "failed to load project" in str(item.get("params"))),
+                "the small root's failed rebuild",
+            )
+            builds.settle(2, "the warm-up and the failing build to finish")
+
+            # the failing build must be the small root's first background build,
+            # or its spare was already warm and this proves nothing
+            small_builds = [line for line in builds.text().splitlines()
+                            if "off the analysis thread" in line and "/small" in line]
+            require(small_builds and "rebuilding" in small_builds[0],
+                    f"the small root was warmed before it broke: {small_builds!r}")
+
+            settled = builds.scheduled()
+            for _ in range(4):
+                session.request("textDocument/documentSymbol",
+                                {"textDocument": {"uri": small.as_uri()}})
+            require(builds.scheduled() == settled,
+                    f"a broken root kept being rebuilt while idle: "
+                    f"{builds.scheduled() - settled} more builds")
+
+            session.finish()
+            finished = True
+        finally:
+            manifest.write_text(manifest_text, encoding="utf-8")
+            if not finished:
+                session.abort()
+
+
+def run_disk_change_during_build(server: Path, timeout: float) -> None:
+    """A file written while a build runs is rebuilt, not mistaken for the snapshot's.
+
+    A build reads a module early and records its disk fingerprint at the end. A
+    write landing in between leaves a snapshot of the old bytes beside a
+    fingerprint of the new ones, and a fingerprint scan then finds nothing to
+    rebuild. Where in a build the write lands is not observable from outside, so
+    it is tried across the build's duration; the window is most of the build,
+    and every attempt must converge on what is on disk.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-midbuild-") as directory:
+        root = Path(directory).resolve()
+        main, text = write_wide_project(root, "mid", 384)
+        module = main.parent / "m0.mach"
+        module_text = module.read_text(encoding="utf-8")
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": text}},
+            )
+            session.diagnostics(main.as_uri(), 1)
+            builds.settle(1, "the spare warm-up")
+
+            lines = text.splitlines()
+            line = next(i for i, value in enumerate(lines) if value.lstrip().startswith("ret "))
+            position = {"line": line, "character": lines[line].index("base0") + 2}
+            version = 1
+
+            def rebuild() -> None:
+                nonlocal version
+                version += 1
+                before = builds.scheduled()
+                session.notify(
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
+                )
+                eventually(builds.scheduled, lambda n: n > before, "the rebuild to start")
+
+            # one warm rebuild to learn how long one takes on this machine
+            rebuild()
+            builds.settle(0, "the timing rebuild")
+            durations = re.findall(r"project: rebuilt .* in (\d+)ms", builds.text())
+            warm = int(durations[-1]) / 1000.0
+
+            for attempt, fraction in enumerate((0.1, 0.3, 0.5, 0.7, 0.9)):
+                value = 1000 + attempt
+                rebuild()
+                time.sleep(warm * fraction)
+                module.write_text(module_text.replace("pub val base0: i32 = 0;",
+                                                      f"pub val base0: i32 = {value};"),
+                                  encoding="utf-8")
+                builds.settle(0, "the interrupted rebuild")
+                time.sleep(FINGERPRINT_WINDOW)
+                settled_result(
+                    session, "textDocument/hover",
+                    {"textDocument": {"uri": main.as_uri()}, "position": position},
+                    lambda r, want=value: f"base0: i32 = {want}" in json.dumps(r),
+                    f"hover reflecting a write at {int(fraction * 100)}% of a rebuild")
 
             session.finish()
             finished = True
@@ -1026,30 +1239,10 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="mls-rebuild-") as directory:
         root = Path(directory).resolve()
         main, text = write_wide_project(root, "wide", 48)
-        trace_path = root / "trace.log"
-        session = LspSession(server, root, timeout,
-                             {"MLS_TRACE": "1", "MLS_TRACE_FILE": str(trace_path)})
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
         finished = False
         try:
-            def log() -> str:
-                return trace_path.read_text(encoding="utf-8", errors="replace")
-
-            def scheduled() -> int:
-                return log().count("off the analysis thread")
-
-            def quiesced() -> bool:
-                """True when every scheduled rebuild has finished.
-
-                Every build logs that it finished; the inline first one also logs
-                that it was analyzed, so subtracting those leaves the off-thread
-                ones. Counting the server's own record is deterministic, where
-                waiting for the diagnostics stream to fall quiet is not: a build
-                that is still running is quiet.
-                """
-                text_log = log()
-                finished = max(0, text_log.count("project: rebuilt")
-                                  - text_log.count("project: analyzed"))
-                return finished >= text_log.count("off the analysis thread")
 
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
             session.notify("initialized", {})
@@ -1061,8 +1254,7 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
             session.diagnostics(main.as_uri(), 1)
             # the load is followed by a warm-up of the spare session (#252), which
             # is scheduled after the load's diagnostics are written
-            eventually(lambda: scheduled() >= 1 and quiesced(), lambda done: done,
-                       "the initial load and spare warm-up to quiesce", 60.0)
+            builds.settle(1, "the initial load and spare warm-up to quiesce")
 
             edited = text + "\n# one edit, one rebuild\n"
             session.notify(
@@ -1087,11 +1279,11 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
 
             # and the rebuild does land, republishing the document it moved
             session.diagnostics(main.as_uri(), 2)
-            eventually(quiesced, lambda done: done, "the rebuild to quiesce", 60.0)
+            builds.settle(0, "the rebuild to quiesce")
 
             # a burst of edits during a build coalesces into ONE follow-up build,
             # not one per edit. counted from the server's own log, not timed.
-            before = scheduled()
+            before = builds.scheduled()
             version = 2
             for _ in range(12):
                 version += 1
@@ -1101,8 +1293,8 @@ def run_rebuild_concurrency(server: Path, timeout: float) -> None:
                      "contentChanges": [{"text": text + f"\n# edit {version}\n"}]},
                 )
             session.diagnostics(main.as_uri(), version)
-            eventually(quiesced, lambda done: done, "the burst's rebuilds to quiesce", 60.0)
-            after = scheduled()
+            builds.settle(0, "the burst's rebuilds to quiesce")
+            after = builds.scheduled()
             require(after - before <= 2,
                     f"a burst of 12 edits started {after - before} rebuilds, not at most 2")
 
@@ -1970,7 +2162,8 @@ def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, flo
         manifest = main.parents[1] / "mach.toml"
         manifest_text = manifest.read_text(encoding="utf-8")
         uri = main.as_uri()
-        session = LspSession(server, main.parents[1], timeout)
+        builds = BuildLog(root / "trace.log")
+        session = LspSession(server, main.parents[1], timeout, builds.env())
         finished = False
         try:
             session.request("initialize", {"rootUri": main.parents[1].as_uri(),
@@ -1986,6 +2179,10 @@ def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, flo
             assert_diagnostics(session.diagnostics(uri, 1), False, 1)
 
             for feature in SYNTAX_ONLY_FEATURES:
+                # background builds are legitimate work this test is not about: the
+                # spare warm-up after load, and the rebuild after the manifest is
+                # restored. measured through them, the ratio reads their contention
+                builds.settle(1, "background builds to finish before sampling")
                 syntax_only_median(session, feature, uri, text,
                                    "warming the project load", SYNTAX_ONLY_WARMUP)
                 healthy, healthy_result = syntax_only_median(
@@ -3997,6 +4194,9 @@ def main() -> int:
         (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_spare_warmup(server, args.timeout)
+        run_warmup_yields_to_queued_edit(server, args.timeout)
+        run_failed_build_primes_spare(server, args.timeout)
+        run_disk_change_during_build(server, args.timeout)
         run_failed_rebuild_keeps_serving(server, args.timeout)
         run_active_watcher_fallback(server, args.timeout)
         run_response_envelopes(server, args.timeout)

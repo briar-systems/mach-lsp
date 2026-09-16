@@ -283,8 +283,9 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
     # a message boundary is the only place a rebuilt snapshot may be swapped in,
     # because it is the only place no request holds a pointer into the outgoing
     # session. doing it before dispatch also means this message is answered from
-    # the freshest snapshot that has actually finished building.
-    collect_rebuilds(srv);
+    # the freshest snapshot that has actually finished building. the message in
+    # hand is input like any queued one, so no warm-up starts here
+    collect_rebuilds(srv, false);
 
     trace.frame("recv:", body, len);
 
@@ -309,7 +310,7 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
     # warming the spare session a load just left cold, starts now rather than
     # when the next message arrives - which is usually the edit that needed it.
     # a server that is shutting down starts nothing new
-    if (srv.status == STATUS_RUNNING) { collect_rebuilds(srv); }
+    if (srv.status == STATUS_RUNNING) { collect_rebuilds(srv, jobs.depth(?srv.q) == 0); }
     trace.logf("server: handled message in {}ms", (trace.now_ns() - started_ns) / 1000000);
 
     if (srv.status == STATUS_EXITED || transport.write_failed()) {
@@ -320,9 +321,13 @@ fun handle_job(ctx: ptr, body: str, len: usize) {
 # swap in any finished rebuild and republish what it moved
 #
 # Runs on the analysis thread only.
-fun collect_rebuilds(srv: *Server) {
-    if (project.pump(?srv.ws) != project.PUMP_SWAPPED) { ret; }
-    if (srv.status != STATUS_RUNNING)                  { ret; }
+# ---
+# srv:      the server
+# may_warm: no input is waiting to be handled, so an idle build slot may warm a
+#           spare session
+fun collect_rebuilds(srv: *Server, may_warm: bool) {
+    if (project.pump(?srv.ws, may_warm) != project.PUMP_SWAPPED) { ret; }
+    if (srv.status != STATUS_RUNNING)                            { ret; }
     republish_all(srv);
 }
 
@@ -342,7 +347,7 @@ fun wake_analysis(ctx: ptr) {
 # editor, so the swap and its republish cannot wait for the next keystroke.
 fun handle_signal(ctx: ptr) {
     val srv: *Server = ctx::*Server;
-    collect_rebuilds(srv);
+    collect_rebuilds(srv, srv.status == STATUS_RUNNING && jobs.depth(?srv.q) == 0);
 }
 
 # a response has an id, no method, and exactly one of `result` or `error`.
