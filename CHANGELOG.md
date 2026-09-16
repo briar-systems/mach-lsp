@@ -42,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for them - see #249.
 
 ### Fixed
+- fix(project): the first rebuild after a project loads no longer runs into a
+  cold spare session (#252). The load builds only one of a root's two sessions,
+  so the first edit paid a whole cold build: 32.7s to the first fresh answer on
+  this repo, against 6.5s for every later edit. The idle build slot now primes
+  the spare right after the load. A warm-up never starts while input is queued,
+  and it does not republish, since it describes what is already serving. A
+  failed build still counts as primed, so a broken root is not warmed forever.
+  The analysis thread now pumps the builder after each message as well as
+  before it, so the warm-up starts when the load ends rather than on the next
+  keystroke.
+- fix(project): a source file written while a build ran is rebuilt rather than
+  recorded as already seen. A build fingerprints its modules after analyzing
+  them, so a write landing in between left a snapshot of the old bytes beside a
+  fingerprint of the new ones, and no scan would find it. A fingerprint is now
+  kept only when the file still holds the analyzed bytes.
 - a `use`d symbol carries its referent's `origin` but no `DeclId` of its own,
   so a decl-keyed cross-module identity test reports that no module importing a
   function calls it. `features.symbol_denotes` adds the interned canonical name
