@@ -3895,13 +3895,20 @@ def run_completion_dependency_alias_while_behind(server: Path, timeout: float) -
     """Completion after a dependency-module alias's `.` while the buffer is ahead.
 
     The reporter's exact shape: `use prt: std.print;` then `prt.` typed on a
-    line the snapshot has not seen yet. The isolated editor analysis resolving
-    that buffer loads the dependency's own sources, which grows the session's
-    source map and moves its backing array; a stale SourceFile pointer read
-    afterwards faulted the worker on macOS, where the freed page is unmapped
-    (#297). A local module never triggered it because its source is already
-    resident. The worker surviving with an `isIncomplete` answer that carries
-    the module's members is the whole point of this case.
+    line the snapshot has not seen yet. The members are resolved from the loaded
+    snapshot read through the edit window (#235); the path that used to answer
+    this loaded the dependency's own sources into the editor session, growing
+    its source map and moving the backing array under a stale SourceFile pointer,
+    which faulted the worker on macOS (#297). A local module never triggered it
+    because its source is already resident.
+
+    The members assertion is unconditional because a load barrier runs first
+    (#330): the `.` in `prt.println` is a caught-up receiver only a loaded root
+    answers project-backed, so waiting for that settles exactly when the initial
+    inline load has finished, on every leg and with no wall-clock wait. Without
+    it, a leg where the load had not finished answered from the not-loaded path
+    with empty members, and the assertion had to be skipped there - a check that
+    could pass without checking.
     """
     if os.name != "posix":
         print("  completion dependency alias while behind: skipped (rebuild gate needs flock)")
@@ -3983,13 +3990,33 @@ need = []
             session.diagnostics(main.as_uri(), 1)
 
             lines = base.splitlines()
-            insert_at = next(i for i, v in enumerate(lines) if "prt.println" in v) + 1
+            probe_line = next(i for i, v in enumerate(lines) if "prt.println" in v)
+            probe_col = lines[probe_line].index("prt.") + len("prt.")
+
+            # the project-load barrier (#330): the initial dependency load runs
+            # inline on didOpen and is not gated by the turnstile, but whether it
+            # has finished when the burst arrives is a timing question the gate
+            # does not touch. The `.` in `prt.println` is a caught-up receiver;
+            # only a loaded root answers it project-backed (isIncomplete false)
+            # with the module's members, so this settles exactly when the root is
+            # loaded. It never waits on wall-clock and never on a rebuild.
+            settled_result(
+                session, "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": probe_line, "character": probe_col}},
+                lambda r: (isinstance(r, dict) and r.get("isIncomplete") is False
+                           and "println" in [i.get("label") for i in r.get("items", [])]),
+                "the dependency root to load")
+
+            insert_at = probe_line + 1
             ahead = lines[:insert_at] + ["    prt."] + lines[insert_at:]
             version = 1
             notifications = []
             # each keystroke carries distinct text so a completed rebuild is always
-            # for an older revision: the buffer stays ahead and the completion is
-            # answered from the isolated editor analysis, which is the crashing path
+            # for an older revision: the buffer stays ahead of the loaded snapshot,
+            # so completion is answered from that snapshot read through the edit
+            # window (#235), the path that used to reload the dependency into the
+            # editor session (#297)
             for keystroke in range(32):
                 version += 1
                 typed = "\n".join(ahead) + f"\n# keystroke {keystroke}\n"
@@ -4004,22 +4031,15 @@ need = []
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": insert_at, "character": len("    prt.")}})
             result = answer.get("result")
-            require(isinstance(result, dict) and isinstance(result.get("items"), list),
-                    f"a dependency-module alias completion crashed or errored while behind: {answer!r}")
-            # a worker fault on this path returns an error response, which the
-            # request helper raises, so reaching here means the worker survived
-            # loading the dependency's sources - the regression this guards. The
-            # gate holds the off-thread rebuild, so the snapshot cannot catch up
-            # to the buffer. Whether the initial dependency load has finished is
-            # a separate timing question the gate does not touch: until a loaded
-            # root exists the answer is an empty isolated one, so the members
-            # check stays guarded on the isolated ahead-path's isIncomplete
-            # signature, on which the aliased module's members must be offered.
-            # #330: guarded because the initial std load may not have finished here. A project-load barrier would let this be unconditional.
-            if result.get("isIncomplete") is True:
-                labels = [item.get("label") for item in result.get("items", [])]
-                require("println" in labels and "print" in labels,
-                        f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
+            # the root is loaded (barrier above) and the buffer is held ahead of
+            # it, so the answer is the loaded-but-behind one: incomplete, with the
+            # aliased module's members resolved through the snapshot. no guard -
+            # the barrier makes this the state on every leg (#330)
+            require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                    f"a dependency-module alias was not answered from the loaded snapshot while behind: {answer!r}")
+            labels = [item.get("label") for item in result.get("items", [])]
+            require("println" in labels and "print" in labels,
+                    f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
 
             gate.release()
             session.finish()
