@@ -65,4 +65,4 @@ ref = "tag/v4.0.0"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v5.5.1"
+ref = "tag/v5.8.0"
