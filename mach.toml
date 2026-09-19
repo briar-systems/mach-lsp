@@ -1,6 +1,6 @@
 [project]
 id = "mls"
-version = "1.2.0"
+version = "1.2.1"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 mach = "^5.3"

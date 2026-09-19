@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-19
+
+Two completion fixes on the 1.2 surface, both reported by @Angluca and both
+about a `.` on a receiver the resolver could not reach while the buffer is ahead
+of the snapshot. No contract change: same asset set, CLI and options as 1.2.0.
+
+**The linked mach is unchanged at v5.8.0**, and std at v4.0.0.
+
 ### Fixed
 - fix(#332): completion after a `.` no longer comes back empty when the
   receiver's type is reached through a `fwd` re-export. While the buffer is
