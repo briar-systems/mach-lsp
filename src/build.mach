@@ -27,6 +27,8 @@ use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
 
+use mls.frontend;
+
 # the work itself, run on the worker thread
 #
 # Takes ownership of the submitted input and returns an owned result, or nil
@@ -81,7 +83,7 @@ var BOUND: *Builder = nil;
 #
 # The "while behind the snapshot" protocol tests need the buffer to stay ahead
 # of the last completed rebuild at the moment they ask for a completion: that
-# lag is the state whose isolated answer they assert. With nothing to hold it,
+# lag is the state whose snapshot-mapped answer they assert. With nothing to hold it,
 # the off-thread rebuild can land first and the assertion races the scheduler.
 # When the environment variable `MLS_TEST_REBUILD_GATE` names a file, every
 # finished off-thread rebuild passes through this turnstile before its result is
@@ -141,7 +143,10 @@ pub fun init(b: *Builder, f: RunFn, wake: WakeFn, ctx: ptr) {
 pub fun start(b: *Builder) bool {
     if (b.live || b.f == nil) { ret false; }
     BOUND = b;
-    thread.spawn_with(worker_main, (b)::*u8, ?b.th);
+    var c: thread.Config;
+    thread.config_default(?c);
+    c.stack_reserve = frontend.STACK_RESERVE;
+    thread.spawn_with_config(worker_main, (b)::*u8, ?c, ?b.th);
     if (b.th.tid < 0) { ret false; }
     b.live = true;
     ret true;

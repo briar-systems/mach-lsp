@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-19
+
+Completion while the buffer is ahead of the snapshot answers from the snapshot
+like every other feature, the editor session is confined to documents outside
+any project, and the two threads that run the linked frontend hold the
+compiler's own stack reserve. No contract change: same asset set, CLI and
+options as 1.2.0.
+
+**The linked mach moves from v5.8.0 to v5.9.0.** std stays at v4.0.0, now
+selected by the version range `^4.0`.
+
+### Changed
+- feat(#235): completion while the buffer is ahead of the snapshot answers
+  from the snapshot, read against the buffer through the text mapping (#251),
+  as every other feature already did. The editor session answered that case
+  from its own analysis of the buffer, which the compiler serves by loading the
+  project's closure into the server's session again on every keystroke: 65s
+  and 475MB for the first answer against this repository, over a second for
+  each later one, on the analysis thread, and empty for a local whose type is
+  imported. It is 11ms and no extra memory now, and the answer is the members
+  of the local's type. The receiver walk (#336) runs against the snapshot with
+  the live buffer contributing only bytes: a receiver the snapshot typed is
+  answered by the resolver's own semantics whatever its shape, a binding typed
+  inside the edit is found by name where the edit begins, and one declared
+  inside the edit is read from the parse of the buffer. The answer stays
+  `isIncomplete` until the rebuild lands, and a local shadowed in a block that
+  closed is the one shape the by-name lookup answers approximately until then.
+  The editor session now serves only documents outside any project.
+- chore(#343): **the linked mach moves from v5.8.0 to v5.9.0** (128-bit
+  integers in the compiler, three codegen fixes, no editor API change). std
+  stays at v4.0.0, as mach 5.9.0 itself pins it, and is now selected by the
+  version range `^4.0` rather than the exact tag. The family CI workflow
+  fetches each submodule's release tag before the build, since the shallow
+  checkout carries none and a range dependency verifies against it.
+
+### Fixed
+- fix(#345): the analysis thread and the rebuild worker, the two threads that
+  run the linked compiler frontend, are spawned with the stack reserve the
+  compiler holds for that frontend (16 MiB, `dep/mach/mach.toml`) instead of
+  std's 2 MiB thread default. A project load deep enough to pass 2 MiB of
+  frames killed the worker with nothing on stderr, seen on windows-x86_64
+  loading a 768-module fixture once mach v5.9.0's larger comptime frames were
+  linked (#343).
+
 ## [1.2.2] - 2026-09-19
 
 One completion fix on the 1.2 surface, the third of @Angluca's reports about a

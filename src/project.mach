@@ -2468,11 +2468,12 @@ pub fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, 
     ret opt[TypeSite].some{ts};
 }
 
-# the nominal back-link of `tid` against the session type interner,
-# guarded on a loaded root. none when there is no project or `tid` is not nominal
+# the nominal back-link of `tid` against the type interner the request's
+# analysis ran under: the root's when there is one, else the standalone
+# session's. none when `tid` is not nominal or the root is not loaded
 fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) opt[mtypes.Nominal] {
-    if (root == nil || !root.loaded) { ret opt[mtypes.Nominal].none{}; }
-    ret mtypes.nominal_of(?root.s.types, tid);
+    if (root != nil && !root.loaded) { ret opt[mtypes.Nominal].none{}; }
+    ret mtypes.nominal_of(type_interner(w, root), tid);
 }
 
 # build a RecordSite for the rec / uni decl `decl` in `a` (backed
@@ -2572,9 +2573,9 @@ pub fun module_fqn(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
 
 # the loaded module in `root` called `fqn`, or none
 #
-# A name is the one identity that can cross from a different session into this
-# root's snapshot: an isolated editor analysis cannot resolve a `use`, but the
-# path it names is text, and this finds what that text means here.
+# A name is the one identity that can cross from the client's buffer into this
+# root's snapshot: a `use` typed since the snapshot resolves to nothing there,
+# but the path it names is text, and this finds what that text means here.
 # ---
 # w:    the workspace
 # root: the root to search, or nil
