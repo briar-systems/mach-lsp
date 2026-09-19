@@ -5033,6 +5033,23 @@ def run_inlay_hints(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def decode_semantic_tokens(data: list[int]) -> list[tuple[int, int, int, int, int]]:
+    """Absolute (line, character, length, type, modifiers) for each delta-encoded group."""
+    require(len(data) % 5 == 0, f"token data is not a multiple of five: {len(data)}")
+    tokens: list[tuple[int, int, int, int, int]] = []
+    line = 0
+    char = 0
+    for index in range(0, len(data), 5):
+        d_line, d_char, length, kind, mods = data[index:index + 5]
+        if d_line == 0:
+            char += d_char
+        else:
+            line += d_line
+            char = d_char
+        tokens.append((line, char, length, kind, mods))
+    return tokens
+
+
 def run_semantic_tokens(server: Path, timeout: float) -> None:
     """Classification from the resolved tables, in a wire format that decodes.
 
@@ -5050,6 +5067,8 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
                 "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
             provider = result.get("capabilities", {}).get("semanticTokensProvider")
             require(isinstance(provider, dict), f"semanticTokensProvider missing: {provider!r}")
+            require(provider.get("full") is True and provider.get("range") is True,
+                    f"semanticTokensProvider does not offer full and range: {provider!r}")
             legend = provider.get("legend", {})
             types = legend.get("tokenTypes")
             require(isinstance(types, list) and types, f"no token legend: {legend!r}")
@@ -5098,6 +5117,55 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
             # the point of the feature: kinds a syntax highlighter cannot infer
             require("type" in seen_types, f"no type tokens: {sorted(seen_types)}")
             require("function" in seen_types, f"no function tokens: {sorted(seen_types)}")
+
+            # range answers exactly the tokens of full that touch the range (#225):
+            # same classifications, a straddling token kept whole, nothing else
+            full = decode_semantic_tokens(data)
+            # the range starts one character into `head` and ends one character
+            # before the end of `tail`, so both are straddled; neither is on the
+            # file's first or last token line, so the range is a proper subset
+            wide = [tok for tok in full if tok[2] >= 2 and full[0][0] < tok[0] < full[-1][0]]
+            require(len(wide) >= 2, f"the fixture has too few multi-character tokens: {wide!r}")
+            head, tail = wide[0], wide[-1]
+            viewport = {"start": {"line": head[0], "character": head[1] + 1},
+                        "end": {"line": tail[0], "character": tail[1] + tail[2] - 1}}
+            ranged = session.request(
+                "textDocument/semanticTokens/range",
+                {"textDocument": {"uri": main.as_uri()}, "range": viewport})["result"]
+            require(isinstance(ranged, dict) and isinstance(ranged.get("data"), list),
+                    f"semanticTokens/range is not a token payload: {ranged!r}")
+            got = decode_semantic_tokens(ranged["data"])
+
+            def touches(tok: tuple[int, int, int, int, int]) -> bool:
+                line, char, length, _kind, _mods = tok
+                start = (line, char)
+                end = (line, char + length)
+                lo = (viewport["start"]["line"], viewport["start"]["character"])
+                hi = (viewport["end"]["line"], viewport["end"]["character"])
+                return start < hi and end > lo
+
+            expected = [tok for tok in full if touches(tok)]
+            require(got == expected,
+                    f"semanticTokens/range differs from the touching tokens of full:\n"
+                    f"  got      {got!r}\n  expected {expected!r}")
+            require(0 < len(got) < len(full),
+                    f"range returned {len(got)} of {len(full)} tokens, not a proper subset")
+            require(got[0] == head and got[-1] == tail,
+                    f"a token straddling the range edge was not kept whole: {got[0]!r} .. {got[-1]!r}")
+
+            # a range holding no token answers an empty payload, and a request
+            # without a range answers nothing rather than the whole file
+            blank = next(i for i, value in enumerate(lines) if not value.strip())
+            empty = session.request(
+                "textDocument/semanticTokens/range",
+                {"textDocument": {"uri": main.as_uri()},
+                 "range": {"start": {"line": blank, "character": 0}, "end": {"line": blank, "character": 0}}})
+            require(empty.get("result") == {"data": []},
+                    f"an empty range did not answer no tokens: {empty!r}")
+            missing = session.request(
+                "textDocument/semanticTokens/range", {"textDocument": {"uri": main.as_uri()}})
+            require(missing.get("result") == {"data": []},
+                    f"a range request without a range did not answer no tokens: {missing!r}")
 
             session.finish()
             finished = True
@@ -6600,7 +6668,7 @@ def main() -> int:
     print("  workspace/symbol searches loaded roots, best matches first")
     print("  signatureHelp tracks the active argument through incomplete calls")
     print("  inlayHint names literal arguments at multi-parameter calls")
-    print("  semanticTokens decode in order, within the legend and the file")
+    print("  semanticTokens decode in order, within the legend and the file, and range answers only its viewport")
     print("  a withdrawn request is answered RequestCancelled")
     print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  codeAction offers the compiler's own fixes as applicable edits")
