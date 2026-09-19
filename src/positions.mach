@@ -9,11 +9,17 @@
 #
 # the compiler core is byte-oriented (parser spans, `source.position`), so the
 # byte representation stays internal and the conversion to and from the
-# protocol's UTF-16 code-unit `character` happens only here, at the boundary.
-# lines are encoding-agnostic (newlines are single-byte), so only the column is
-# converted: inbound, a UTF-16 column walks the line's UTF-8 to a byte offset;
-# outbound, a byte offset's line prefix is measured in UTF-16 code units. the
-# server advertises no `positionEncoding`, so the client's UTF-16 default holds.
+# protocol's `character` column happens only here, at the boundary. lines are
+# encoding-agnostic (newlines are single-byte), so only the column is converted:
+# inbound, a column walks the line's UTF-8 to a byte offset; outbound, a byte
+# offset's line prefix is measured in the client's units.
+#
+# which units those are is negotiated at `initialize` (#269) and set through
+# `use_encoding`. UTF-16 is the default and what 1.0 promised: a client that
+# advertises no `positionEncoding` still gets it. A client that offers UTF-8
+# gets UTF-8, where the column is the byte offset and no conversion is needed
+# against the compiler's own offsets; UTF-32 counts codepoints. Every column
+# measurement runs through `col_units`, so the encoding lives in one place.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -34,12 +40,31 @@ use src: mach.lang.source;
 
 use mls.textdiff;
 
+# the LSP position encoding in force: which code units the `character` column
+# counts. UTF-16 is the protocol default and the 1.0 contract; UTF-8 counts
+# bytes (so the column is the byte offset outright); UTF-32 counts codepoints.
+pub def Encoding: u8;
+pub val ENC_UTF16: Encoding = 0;
+pub val ENC_UTF8:  Encoding = 1;
+pub val ENC_UTF32: Encoding = 2;
+
+# negotiated once at `initialize`; the worker re-runs `initialize` on a respawn,
+# so this is re-established with it. requests only convert positions after
+# `initialize`, so the UTF-16 default covers the gap.
+var g_encoding: Encoding = ENC_UTF16;
+
+# set the negotiated encoding. the single point that changes what a `character`
+# column means across every conversion below.
+pub fun use_encoding(e: Encoding) {
+    g_encoding = e;
+}
+
 # a 0-based LSP range, the form a `Location` / hover range needs
 # ---
 # start_line: 0-based start line
-# start_char: 0-based start character (UTF-16 code-unit column)
+# start_char: 0-based start character (in the negotiated encoding)
 # end_line:   0-based end line
-# end_char:   0-based end character (UTF-16 code-unit column)
+# end_char:   0-based end character (in the negotiated encoding)
 pub rec LspRange {
     start_line: usize;
     start_char: usize;
@@ -236,12 +261,12 @@ fun client_len(t: Text) usize {
 
 # the analysis offset of a 0-based LSP (line, character), or none when the
 # line is out of range or the position lies in a paired buffer's window. the
-# position indexes the client's buffer; its UTF-16 column is resolved by walking
+# position indexes the client's buffer; its column is resolved, in the negotiated encoding, by walking
 # that line's UTF-8, clamped to the line's end
 # ---
 # t:    the pairing the analysis indexes
 # line: 0-based LSP line
-# ch:   0-based LSP character (UTF-16 code-unit column)
+# ch:   0-based LSP character, in the negotiated encoding
 # ret:  some(offset) into `t.file`, or none
 pub fun offset_at(t: Text, line: usize, ch: usize) opt[usize] {
     val qo: opt[usize] = client_offset(t, line, ch);
@@ -284,7 +309,7 @@ fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
     var le_off: usize = client_len(t);
     if (line + 1 < file.line_len) { le_off = file.line_starts[line + 1]; }
 
-    ret opt[usize].some{u16_col_to_byte(file, ls_off, le_off, ch)};
+    ret opt[usize].some{byte_of_col(file, ls_off, le_off, ch)};
 }
 
 # the client's LSP range for a span of the analyzed text, or none when the span
@@ -309,7 +334,7 @@ pub fun span_range_around(t: Text, span: token.Span) opt[LspRange] {
 }
 
 # the LSP range covering a byte span in `file`. a zero-length span
-# yields an empty range at its offset. columns are reported as UTF-16 code-unit
+# yields an empty range at its offset. columns are reported in the negotiated encoding's code-unit
 # offsets within their line
 # ---
 # file: the source file the span addresses
@@ -319,13 +344,13 @@ pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
     var r:  LspRange;
     val sp: src.Position = src.position(file, span.offset);
     r.start_line = dec(sp.line);
-    r.start_char = u16_col(file, sp.line, span.offset);
+    r.start_char = col_of(file, sp.line, span.offset);
 
     var end_off: usize = span.offset + span.len;
     if (span.len == 0) { end_off = span.offset; }
     val ep: src.Position = src.position(file, end_off);
     r.end_line = dec(ep.line);
-    r.end_char = u16_col(file, ep.line, end_off);
+    r.end_char = col_of(file, ep.line, end_off);
     if (r.end_line == r.start_line && r.end_char < r.start_char) { r.end_char = r.start_char; }
     ret r;
 }
@@ -370,39 +395,39 @@ pub fun span_text(t: Text, span: token.Span, alloc: *Allocator) str {
     ret buf::str;
 }
 
-# the 0-based UTF-16 code-unit column of a byte `offset` on its
-# 1-based `line`, measured by walking the line prefix's UTF-8
+# the 0-based `character` column of a byte `offset` on its 1-based `line`, in
+# the negotiated encoding, measured by walking the line prefix's UTF-8
 # ---
 # file:   the source file the offset addresses
 # line:   1-based line the offset falls on (as `source.position` reports)
 # offset: byte offset whose column is measured
-# ret:    0-based UTF-16 code-unit column
-fun u16_col(file: *src.SourceFile, line: usize, offset: usize) usize {
+# ret:    0-based column in the negotiated encoding
+fun col_of(file: *src.SourceFile, line: usize, offset: usize) usize {
     var o:     usize = file.line_starts[line - 1];
     var units: usize = 0;
     for (o < offset) {
         val b: u8 = file.text[o];
-        units = units + u16_units(b);
+        units = units + col_units(b);
         o     = o + u8_seq_len(b);
     }
     ret units;
 }
 
-# the byte offset of a 0-based UTF-16 code-unit column on the
-# line spanning [start, end), or `end` when the column runs past the line. a
-# column landing inside a codepoint snaps to that codepoint's start
+# the byte offset of a 0-based `character` column (in the negotiated encoding)
+# on the line spanning [start, end), or `end` when the column runs past the
+# line. a column landing inside a codepoint snaps to that codepoint's start
 # ---
 # file:  the source file
 # start: byte offset of the line's first byte
 # end:   byte offset just past the line (exclusive walk bound)
-# col:   0-based UTF-16 code-unit column to locate
+# col:   0-based column, in the negotiated encoding, to locate
 # ret:   the byte offset at that column, clamped to `end`
-fun u16_col_to_byte(file: *src.SourceFile, start: usize, end: usize, col: usize) usize {
+fun byte_of_col(file: *src.SourceFile, start: usize, end: usize, col: usize) usize {
     var o:     usize = start;
     var units: usize = 0;
     for (o < end) {
         val b: u8    = file.text[o];
-        val u: usize = u16_units(b);
+        val u: usize = col_units(b);
         if (units + u > col) { brk; }
         units = units + u;
         o     = o + u8_seq_len(b);
@@ -419,10 +444,14 @@ fun u8_seq_len(b: u8) usize {
     ret 4;
 }
 
-# the UTF-16 code units the codepoint led by `b` encodes to - 2 for a
-# 4-byte sequence (a surrogate pair), 1 otherwise
-fun u16_units(b: u8) usize {
-    if (b >= 0xF0) { ret 2; }
+# the LSP `character` units the codepoint led by `b` contributes, in the
+# negotiated encoding. this is the whole of the encoding difference: UTF-8
+# counts the sequence's bytes, UTF-32 one per codepoint, and UTF-16 a surrogate
+# pair (2) for a 4-byte sequence and 1 otherwise.
+fun col_units(b: u8) usize {
+    if (g_encoding == ENC_UTF8)  { ret u8_seq_len(b); }
+    if (g_encoding == ENC_UTF32) { ret 1; }
+    if (b >= 0xF0)               { ret 2; }
     ret 1;
 }
 
@@ -437,13 +466,13 @@ fun dec(n: usize) usize {
 # The file-based `offset_at` needs a `SourceFile` and its line index, which an
 # open document does not carry: it owns text. Incremental sync applies edits to
 # that text before any of it reaches the compiler, so the conversion has to work
-# from the bytes alone. Same UTF-16 column rule, same clamping - a character
+# from the bytes alone. Same column rule, same clamping - a character
 # past the end of its line lands at the line's end rather than failing, which is
 # what a client sends when it means "end of line".
 # ---
 # text: the buffer to index
 # line: 0-based LSP line
-# ch:   0-based LSP character (UTF-16 code-unit column)
+# ch:   0-based LSP character, in the negotiated encoding
 # ret:  some(offset), or none when the line is past the end of the text
 pub fun offset_in_text(text: str, line: usize, ch: usize) opt[usize] {
     if (text == nil) { ret opt[usize].none{}; }
@@ -469,7 +498,7 @@ pub fun offset_in_text(text: str, line: usize, ch: usize) opt[usize] {
     var units: usize = 0;
     for (o < end) {
         val b: u8    = text[o];
-        val u: usize = u16_units(b);
+        val u: usize = col_units(b);
         if (units + u > ch) { brk; }
         units = units + u;
         o     = o + u8_seq_len(b);
@@ -517,6 +546,36 @@ test "positions: an astral codepoint counts as two utf-16 units" {
     if (!some_is(offset_in_text(t, 0, 1), 1)) { fail = true; }
     if (!some_is(offset_in_text(t, 0, 3), 5)) { fail = true; }
     if (fail)                                 { ret 1; }
+    ret 0;
+}
+
+# the negotiated encoding decides what a `character` column counts, so the same
+# byte offset is reached by a different column in each. against "a"+U+1F600+"b"
+# the trailing "b" sits at byte 5: three utf-16 units, five utf-8 bytes, two
+# utf-32 codepoints in. the astral codepoint is exactly where they diverge.
+test "positions: the negotiated encoding decides the column units" {
+    var fail: bool = false;
+    # "a" + U+1F600 (4 bytes) + "b"
+    val t: str = "a\xF0\x9F\x98\x80b";
+
+    use_encoding(ENC_UTF16);
+    if (!some_is(offset_in_text(t, 0, 3), 5)) { fail = true; }
+    use_encoding(ENC_UTF8);
+    if (!some_is(offset_in_text(t, 0, 5), 5)) { fail = true; }
+    use_encoding(ENC_UTF32);
+    if (!some_is(offset_in_text(t, 0, 2), 5)) { fail = true; }
+
+    # the astral codepoint's own start is byte 1 in every encoding
+    use_encoding(ENC_UTF16);
+    if (!some_is(offset_in_text(t, 0, 1), 1)) { fail = true; }
+    use_encoding(ENC_UTF8);
+    if (!some_is(offset_in_text(t, 0, 1), 1)) { fail = true; }
+    use_encoding(ENC_UTF32);
+    if (!some_is(offset_in_text(t, 0, 1), 1)) { fail = true; }
+
+    # restore the default so tests that assume utf-16 are unaffected by order
+    use_encoding(ENC_UTF16);
+    if (fail) { ret 1; }
     ret 0;
 }
 

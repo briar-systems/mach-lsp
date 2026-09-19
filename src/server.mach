@@ -722,10 +722,20 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     srv.refresh_tokens = json.boolean(json.member(json.member(ws_caps, "semanticTokens"), "refreshSupport"), false);
     srv.refresh_hints  = json.boolean(json.member(json.member(ws_caps, "inlayHint"), "refreshSupport"), false);
 
+    # negotiate the position encoding both sides will use. utf-16 is the base
+    # default and 1.0's promise; a client offering utf-8 (mach's own byte
+    # offsets) or utf-32 gets it instead. applied to `positions` and echoed
+    # back below so the client uses the same units.
+    val enc: positions.Encoding = negotiate_encoding(
+        json.member2(params, "capabilities", "general"), srv.alloc);
+    positions.use_encoding(enc);
+
     var b: json.Buf = json.buf_init(srv.alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
     json.buf_push_id(?b, json.member(root, "id"));
-    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[");
+    json.buf_push(?b, ",\"result\":{\"capabilities\":{\"positionEncoding\":");
+    json.buf_push_quoted(?b, encoding_name(enc));
+    json.buf_push(?b, ",\"semanticTokensProvider\":{\"legend\":{\"tokenTypes\":[");
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
@@ -993,6 +1003,42 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     if (uri != nil) { json.free_str(uri, srv.alloc); }
 
     if (project.load_epoch(?srv.ws) != epoch_before || project.sema_epoch(?srv.ws) != sema_before) { republish_all(srv); }
+}
+
+# a client lists the position encodings it accepts in `general.positionEncodings`.
+# utf-16 is the base protocol's guarantee and exactly what 1.0 promised, so it
+# stays the fallback when the client offers nothing or nothing better. of what
+# is offered, utf-8 is preferred because it matches mach's byte offsets and
+# needs no conversion at all, then utf-32; utf-16 is chosen only when it is the
+# only option. the choice is set once, here, and drives every conversion in
+# `positions`, the single conversion point.
+fun negotiate_encoding(general: *sj.Value, alloc: *Allocator) positions.Encoding {
+    val encs: *sj.Value = json.member(general, "positionEncodings");
+    if (encs == nil) { ret positions.ENC_UTF16; }
+    val n:         usize = json.count(encs);
+    var has_utf8:  bool  = false;
+    var has_utf32: bool  = false;
+    var i:         usize = 0;
+    for (i < n) {
+        val e: str = json.text(json.element(encs, i), alloc);
+        if (e != nil) {
+            if (str_equals(e, "utf-8"))  { has_utf8 = true; }
+            if (str_equals(e, "utf-32")) { has_utf32 = true; }
+            json.free_str(e, alloc);
+        }
+        i = i + 1;
+    }
+    if (has_utf8)  { ret positions.ENC_UTF8; }
+    if (has_utf32) { ret positions.ENC_UTF32; }
+    ret positions.ENC_UTF16;
+}
+
+# the LSP name for a negotiated encoding, echoed back in ServerCapabilities so
+# the client sends and reads positions in the same units.
+fun encoding_name(e: positions.Encoding) str {
+    if (e == positions.ENC_UTF8)  { ret "utf-8"; }
+    if (e == positions.ENC_UTF32) { ret "utf-32"; }
+    ret "utf-16";
 }
 
 # whether the client's hover capability lists markdown

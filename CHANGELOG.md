@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-19
+
+The server negotiates the LSP position encoding, and the linked mach moves to
+v5.8.0. No contract change beyond the additive positionEncoding capability:
+same asset set, CLI and options as 1.1.1.
+
+**The linked mach moves from v5.5.1 to v5.8.0**, and std is unchanged at v4.0.0.
+
+### Added
+- feat(#269): the server negotiates the LSP position encoding. utf-16 is the
+  base-protocol default and stays the promise for any client that advertises
+  none, so existing behaviour is unchanged. A client that offers `utf-8` in
+  `general.positionEncodings` gets it (its columns are byte offsets, matching
+  the compiler's own with no conversion), or `utf-32` (codepoint columns). The
+  chosen encoding is echoed back in `ServerCapabilities.positionEncoding`. Every
+  column conversion runs through the single point in `positions`, so the
+  negotiated units apply uniformly to inbound positions and outbound ranges.
+
+### Changed
+- chore: the linked mach moves from v5.5.1 to v5.8.0. The driver's Project now
+  holds its modules in stable storage (a `handle.StableChunks`), so the snapshot
+  and lookup paths move to the driver's `module_count` and `module_at`
+  accessors. No behaviour change, and v5.7.0's backend-refusal reshaping
+  (mach#3656) does not reach this frontend.
+
+### Test
+- test(#325): the completion tests that assert the isolated answer while the
+  buffer is ahead of the snapshot now hold the off-thread rebuild through a
+  lock-file turnstile the harness releases, so that state is controlled rather
+  than raced. The `MLS_TEST_REBUILD_GATE` environment variable driving it exists
+  for the protocol harness only and is inert when unset.
+
 ## [1.1.1] - 2026-09-19
 
 A completion fix on a 1.1 surface. No contract change: same asset set, CLI,
