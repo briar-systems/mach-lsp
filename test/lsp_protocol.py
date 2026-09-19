@@ -3338,11 +3338,19 @@ SYNTAX_ONLY_FEATURES = (
     ),
 )
 
-# the first requests against a healthy project pay a one-time cold project load,
-# so the contract is about steady state and these samples are discarded
+# the first requests against a healthy project pay a cold project load, once
+# per manifest restore, so the contract is about steady state and these samples
+# are discarded at the start of every round
 SYNTAX_ONLY_WARMUP = 2
-# odd, so the median is a sample rather than a mean of two
-SYNTAX_ONLY_SAMPLES = 9
+# the samples of each condition are taken in rounds that alternate with the other
+# condition's, so a load change on the machine lands on both. taken as two
+# blocks, a burst under the healthy block and a lull under the standalone one
+# read as a reload: 15.0ms against 6.4ms (2.36x) on a shared x86 mac runner
+# whose previous runs measured 1.02x (#341)
+SYNTAX_ONLY_ROUNDS = 3
+# per condition per round. rounds x samples is odd, so the pooled median is a
+# sample rather than a mean of two
+SYNTAX_ONLY_SAMPLES = 3
 # healthy-project median over standalone median. measured in the same process on
 # the same machine, so machine load cancels: over seven runs each way the
 # absolute medians moved by 5x while the ratio stayed inside 2.77-5.41x against
@@ -3436,9 +3444,9 @@ def ratio_text(healthy: float, standalone: float) -> str:
     return f"{healthy / standalone:.2f}x"
 
 
-def syntax_only_median(session: LspSession, feature: SyntaxOnlyFeature, uri: str,
-                       text: str, label: str, samples: int) -> tuple[float, Any]:
-    """Median latency over `samples` identical requests, with the last reply.
+def syntax_only_samples(session: LspSession, feature: SyntaxOnlyFeature, uri: str,
+                        text: str, label: str, samples: int) -> tuple[list[float], Any]:
+    """Latency of `samples` identical requests, with the last reply.
 
     perf_counter, not monotonic: monotonic ticks about every 15.6ms on Windows,
     which reads a millisecond-scale request as zero elapsed.
@@ -3452,8 +3460,12 @@ def syntax_only_median(session: LspSession, feature: SyntaxOnlyFeature, uri: str
         result = response.get("result")
         require(feature.valid(result),
                 f"{feature.name} answered nothing usable {label}: {response!r}")
-    durations.sort()
-    return durations[len(durations) // 2], result
+    return durations, result
+
+
+def median(durations: list[float]) -> float:
+    ordered = sorted(durations)
+    return ordered[len(ordered) // 2]
 
 
 def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, float, float]]:
@@ -3471,7 +3483,9 @@ def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, flo
     and a dependency-free fixture shows nothing. And the bound is a ratio against
     the standalone path measured in the same run rather than a wall-clock
     threshold, so it neither flakes under machine load nor passes because the
-    machine was fast.
+    machine was fast. The ratio cancels load only when both paths see the same
+    load, so the two are sampled in alternating rounds rather than as two blocks
+    (#341).
     """
     require(SYNTAX_ONLY_FEATURES, "no syntax-only feature is under a latency assertion")
     measured: list[tuple[str, float, float]] = []
@@ -3497,28 +3511,35 @@ def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, flo
             assert_diagnostics(session.diagnostics(uri, 1), False, 1)
 
             for feature in SYNTAX_ONLY_FEATURES:
-                syntax_only_median(session, feature, uri, text,
-                                   "warming the project load", SYNTAX_ONLY_WARMUP)
-                healthy, healthy_result = syntax_only_median(
-                    session, feature, uri, text,
-                    "against a healthy project", SYNTAX_ONLY_SAMPLES)
-
-                manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
-                time.sleep(FINGERPRINT_WINDOW)
-                try:
-                    standalone, standalone_result = syntax_only_median(
+                healthy_samples: list[float] = []
+                standalone_samples: list[float] = []
+                for _ in range(SYNTAX_ONLY_ROUNDS):
+                    syntax_only_samples(session, feature, uri, text,
+                                        "warming the project load", SYNTAX_ONLY_WARMUP)
+                    durations, healthy_result = syntax_only_samples(
                         session, feature, uri, text,
-                        "under a broken manifest", SYNTAX_ONLY_SAMPLES)
-                finally:
-                    manifest.write_text(manifest_text, encoding="utf-8")
+                        "against a healthy project", SYNTAX_ONLY_SAMPLES)
+                    healthy_samples.extend(durations)
+
+                    manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
                     time.sleep(FINGERPRINT_WINDOW)
+                    try:
+                        durations, standalone_result = syntax_only_samples(
+                            session, feature, uri, text,
+                            "under a broken manifest", SYNTAX_ONLY_SAMPLES)
+                        standalone_samples.extend(durations)
+                    finally:
+                        manifest.write_text(manifest_text, encoding="utf-8")
+                        time.sleep(FINGERPRINT_WINDOW)
 
-                # a syntax-only answer is a function of the buffer, so losing the
-                # project must not change it. without this the ratio could be met
-                # by answering less.
-                require(healthy_result == standalone_result,
-                        f"{feature.name} answered differently once the project was lost")
+                    # a syntax-only answer is a function of the buffer, so losing
+                    # the project must not change it. without this the ratio could
+                    # be met by answering less.
+                    require(healthy_result == standalone_result,
+                            f"{feature.name} answered differently once the project was lost")
 
+                healthy = median(healthy_samples)
+                standalone = median(standalone_samples)
                 allowed = max(standalone * SYNTAX_ONLY_RATIO, SYNTAX_ONLY_FLOOR)
                 # require's message is built whether or not it fails, so the
                 # ratio cannot be divided here unguarded
