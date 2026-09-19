@@ -1320,6 +1320,71 @@ def run_stale_hover(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_stale_fast_features(server: Path, timeout: float) -> None:
+    """Every positional feature but the strict ones answers behind the snapshot (#235).
+
+    A request queued behind a keystroke burst is answered from the snapshot the
+    root already holds, read through the edit window, and never waits for the
+    rebuild that keystroke started. `run_stale_hover` proves the mapping for
+    hover; this proves each other fast feature takes the same path, with the
+    build log confirming no rebuild landed before the answer. Rename and
+    references are the strict ones, held instead: `run_stale_strict_requests`.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-fast-") as directory:
+        root = Path(directory).resolve()
+        main, text, ret_line = stale_fixture(root, "fast", "    val called: i32 = f2_0(1, 2);\n")
+        text = "use fast.m2.f2_0;\n" + text
+        main.write_text(text, encoding="utf-8")
+        ret_line += 1
+        uri = main.as_uri()
+        session, builds = open_stale_session(server, root, timeout, main, text)
+        finished = False
+        try:
+            lines = text.splitlines()
+            call_line = next(i for i, value in enumerate(lines) if "f2_0(" in value)
+            column = lines[ret_line].index("base3 ")
+            above = "# a line the snapshot never saw\n" + text
+            version = 1
+
+            def behind(method: str, params: dict[str, Any], what: str) -> Any:
+                nonlocal version
+                version += 1
+                response = stale_request(session, builds, change(uri, version, above), method, params)
+                require("error" not in response, f"{what} was refused while behind: {response!r}")
+                require("result" in response, f"{what} was not answered while behind: {response!r}")
+                builds.settle(version - 1, f"the rebuild after {what}")
+                return response["result"]
+
+            definition = behind("textDocument/definition", at(uri, ret_line + 1, column + 2), "definition")
+            require(isinstance(definition, dict) and definition.get("uri", "").endswith("/m3.mach"),
+                    f"definition behind the snapshot did not reach the declaring module: {definition!r}")
+            type_definition = behind("textDocument/typeDefinition", at(uri, ret_line + 1, column + 2), "typeDefinition")
+            require(type_definition is None or isinstance(type_definition, (dict, list)),
+                    f"typeDefinition behind the snapshot answered nonsense: {type_definition!r}")
+            signature = behind("textDocument/signatureHelp",
+                               at(uri, call_line + 1, lines[call_line].index("1, 2")), "signatureHelp")
+            require(isinstance(signature, dict) and signature.get("signatures"),
+                    f"signatureHelp behind the snapshot offered no signature: {signature!r}")
+            hints = behind("textDocument/inlayHint",
+                           {"textDocument": {"uri": uri},
+                            "range": {"start": {"line": call_line + 1, "character": 0},
+                                      "end": {"line": call_line + 2, "character": 0}}}, "inlayHint")
+            require(isinstance(hints, list) and hints,
+                    f"inlayHint behind the snapshot offered no parameter hint: {hints!r}")
+            highlights = behind("textDocument/documentHighlight", at(uri, ret_line + 1, column + 2), "documentHighlight")
+            require(isinstance(highlights, list) and highlights,
+                    f"documentHighlight behind the snapshot found nothing: {highlights!r}")
+            tokens = behind("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}}, "semanticTokens")
+            require(isinstance(tokens, dict) and tokens.get("data"),
+                    f"semanticTokens behind the snapshot carried no tokens: {tokens!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_stale_strict_requests(server: Path, timeout: float) -> None:
     """A rename or reference list waits for the snapshot that covers its edit.
 
@@ -6175,6 +6240,7 @@ def main() -> int:
         run_rename_validation(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
+        run_stale_fast_features(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)
         run_stale_held_release(server, args.timeout)
         run_stale_refresh(server, args.timeout)
