@@ -247,8 +247,45 @@ fun analyzed_offset(t: Text, q: usize) opt[usize] {
     ret opt[usize].some{(q::i64 - shift_before(t, i))::usize};
 }
 
+# a span of the client's buffer carried into the analysis, or none when either
+# end lies inside a window: bytes the analysis never saw name nothing in it
+# ---
+# t:    the pairing
+# span: a non-empty span of `client_file(t)`
+# ret:  the same bytes' span in `t.file`, or none
+pub fun analyzed_span(t: Text, span: token.Span) opt[token.Span] {
+    if (span.len == 0) { ret opt[token.Span].none{}; }
+    val ao: opt[usize] = analyzed_offset(t, span.offset);
+    if (sel ao.none) { ret opt[token.Span].none{}; }
+    val bo: opt[usize] = analyzed_offset(t, span.offset + span.len - 1);
+    if (sel bo.none) { ret opt[token.Span].none{}; }
+    val a: usize = ao.some;
+    val b: usize = bo.some;
+    if (b < a) { ret opt[token.Span].none{}; }
+    var out: token.Span;
+    out.offset = a;
+    out.len    = b - a + 1;
+    ret opt[token.Span].some{out};
+}
+
+# the analysis offset the client's offset `q` stands at, widened to the start
+# of the window when `q` lies inside one: what the analysis last saw before
+# the edit, which is where a name typed inside the edit is looked up
+# ---
+# t:   the pairing
+# q:   an offset into `client_file(t)`
+# ret: an offset into `t.file`
+pub fun analyzed_anchor(t: Text, q: usize) usize {
+    val ao: opt[usize] = analyzed_offset(t, q);
+    if (sel ao.some) { ret ao.some; }
+    if (t.blind)     { ret 0; }
+    val i: usize = first_after_new(t, q);
+    if (i >= t.win_count) { ret t.len; }
+    ret t.wins[i].old_start;
+}
+
 # the file the client's positions index: its live buffer when one is paired
-fun client_file(t: Text) *src.SourceFile {
+pub fun client_file(t: Text) *src.SourceFile {
     if (t.live != nil) { ret t.live; }
     ret t.file;
 }
