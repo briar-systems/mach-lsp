@@ -2333,13 +2333,36 @@ pub fun record_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name:
         val no:  opt[str]     = intern.lookup(?root.s.interner, sym.name);
         if (sel no.some) {
             if (str_equals(no.some, type_name)) {
-                val site: opt[RecordSite] = record_site_from(mo.some, sym.decl, mv.file_id, sym.name, mv.a, mv.text);
+                val site: opt[RecordSite] = record_site_for_symbol(w, root, mo.some, mv, sym);
                 if (sel site.some) { ret site; }
             }
         }
         i = i + 1;
     }
     ret opt[RecordSite].none{};
+}
+
+# the record / union site a module's public symbol names, following a `fwd`
+# re-export to the module that declares the type (#332)
+#
+# A symbol that carries its own declaration is a rec / uni declared right here.
+# A `fwd raylib.Rectangle;` binding carries the target's kind but no DeclId of
+# its own: it names its definition by canonical name, kind and origin module,
+# and `defining_symbol_in` walks that to the declaration-bearing symbol in the
+# module that declares it. The origin is flattened by the compiler, so a chain
+# of re-exports resolves in one step to its ultimate declaration, however many
+# `fwd` hops the language put between them. The site is then built from the
+# declaring module's own view, so its fields read from where the type lives.
+fun record_site_for_symbol(w: *Workspace, root: *Root, mid: sess.ModuleId, mv: ModuleView, sym: *rslv.Symbol) opt[RecordSite] {
+    if (sym.decl != id.DECL_NIL) {
+        ret record_site_from(mid, sym.decl, mv.file_id, sym.name, mv.a, mv.text);
+    }
+    val def: *rslv.Symbol = defining_symbol_in(root, sym);
+    if (def == nil || def.decl == id.DECL_NIL) { ret opt[RecordSite].none{}; }
+    val dmvo: opt[ModuleView] = module_view(w, root, def.origin);
+    if (sel dmvo.none) { ret opt[RecordSite].none{}; }
+    val dmv: ModuleView = dmvo.some;
+    ret record_site_from(def.origin, def.decl, dmv.file_id, def.name, dmv.a, dmv.text);
 }
 
 # a RecordSite for the rec / uni declaration `decl` in the active
