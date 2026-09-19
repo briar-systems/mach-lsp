@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that would hide no line is not reported. Syntax-only, like documentSymbol:
   it answers from the buffer's own parse, while the project's manifest cannot
   load and without waiting on a snapshot, and holds the same latency contract.
+- feat(#222): `textDocument/selectionRange`. A cursor expands one syntax level
+  at a time: the name under it, then each enclosing expression, type,
+  statement and the declaration, every step strictly containing the one
+  before. A cursor at the end of a word still starts from the word. A position
+  nothing holds answers an empty range at the cursor, so the reply keeps one
+  entry per position. Syntax-only, on the same parse as documentSymbol and
+  foldingRange, under the same latency contract.
 
 ## [1.3.0] - 2026-09-19
 

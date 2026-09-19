@@ -9,8 +9,9 @@ editor APIs.
 mach-lsp implements lifecycle, incremental text synchronization, diagnostics
 (including a project's own, on its `mach.toml`), hover, definition, type
 definition, references, rename and prepareRename, document highlight, document
-symbols, folding ranges, workspace symbols, call hierarchy, semantic tokens,
-inlay hints, signature help, quick-fix code actions, and completion.
+symbols, folding ranges, selection ranges, workspace symbols, call hierarchy,
+semantic tokens, inlay hints, signature help, quick-fix code actions, and
+completion.
 
 Project documents are analyzed by the compiler's retained frontend API. Each
 manifest root owns a stable long-lived compiler Session and one current Project
@@ -85,8 +86,8 @@ While the buffer is ahead of the project's last analysis, the alias's module
 is taken from that analysis by name, so the list is there while you type.
 
 The first semantic request still performs a synchronous whole-project frontend
-analysis. Syntax-only document symbols and folding ranges do not pay that cost;
-moving semantic work off the request path is tracked by #143.
+analysis. Syntax-only document symbols, folding ranges and selection ranges do
+not pay that cost; moving semantic work off the request path is tracked by #143.
 
 ## Known limits
 
@@ -336,6 +337,7 @@ a new mls major.
 | `render` | one spelling per LSP value: ranges, locations, symbol kinds |
 | `signature` | signatureHelp |
 | `folding` | folding ranges from the buffer's own parse |
+| `selection` | selection ranges: a cursor expanding outward through the parse |
 | `hints` | inlay hints naming arguments at a call |
 | `tokens` | semantic tokens, classified from resolved meaning |
 | `actions` | code actions from the compiler's own fixes |

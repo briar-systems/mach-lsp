@@ -3381,6 +3381,130 @@ def run_folding_range(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+SELECTION_BUFFER = """use std.types.size.usize;
+
+pub rec P {
+    x: i32;
+    y: i32;
+}
+
+pub fun area(p: P, scale: i32) i32 {
+    var total: i32 = 0;
+    if (scale > 0) {
+        total = (p.x + p.y) * scale;
+    }
+    ret total;
+}
+"""
+
+
+def selection_texts(chain: dict[str, Any] | None, text: str) -> list[str]:
+    """The source under each step of a SelectionRange chain, innermost first."""
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line.encode("utf-8")))
+    data = text.encode("utf-8")
+    steps: list[str] = []
+    while chain is not None:
+        start, end = chain["range"]["start"], chain["range"]["end"]
+        lo = offsets[start["line"]] + start["character"]
+        hi = offsets[end["line"]] + end["character"]
+        steps.append(data[lo:hi].decode("utf-8"))
+        chain = chain.get("parent")
+    return steps
+
+
+def run_selection_range(server: Path, timeout: float) -> None:
+    """selectionRange expands a cursor one syntax level at a time.
+
+    Each step strictly contains the one before it, a cursor inside a nested
+    expression walks out through every enclosing expression and statement to
+    the declaration, a cursor at the end of a word still selects the word, and
+    a position nothing holds answers an empty range at the cursor with no
+    parent, so the reply keeps one entry per position.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-selrange-") as directory:
+        root = Path(directory).resolve()
+        buffer = root / "sel.mach"
+        buffer.write_text(SELECTION_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}})["result"]["capabilities"]
+            require(capabilities.get("selectionRangeProvider") is True,
+                    f"selectionRangeProvider is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": buffer.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": SELECTION_BUFFER}},
+            )
+            session.diagnostics(buffer.as_uri(), 1)
+            lines = SELECTION_BUFFER.splitlines()
+            assign = next(i for i, value in enumerate(lines) if "total = (" in value)
+            rec_field = next(i for i, value in enumerate(lines) if value.startswith("    x:"))
+            positions = [
+                {"line": assign, "character": lines[assign].index("p.x") + 2},
+                {"line": assign, "character": lines[assign].index("p.x") + 3},
+                {"line": rec_field, "character": 4},
+                {"line": 0, "character": lines[0].index("size")},
+                {"line": 1, "character": 0},
+                {"line": 99, "character": 0},
+            ]
+            chains = session.request(
+                "textDocument/selectionRange",
+                {"textDocument": {"uri": buffer.as_uri()}, "positions": positions},
+            )["result"]
+            require(isinstance(chains, list) and len(chains) == len(positions),
+                    f"selectionRange did not answer one chain per position: {chains!r}")
+
+            # every step strictly contains the one before it
+            for position, chain in zip(positions, chains):
+                previous = None
+                node = chain
+                while node is not None:
+                    current = node["range"]
+                    if previous is not None:
+                        key = lambda p: (p["line"], p["character"])
+                        require(key(current["start"]) <= key(previous["start"])
+                                and key(current["end"]) >= key(previous["end"])
+                                and current != previous,
+                                f"a step at {position} does not strictly contain the one "
+                                f"before it: {previous!r} then {current!r}")
+                    previous = current
+                    node = node.get("parent")
+
+            # a cursor on `x` in `p.x` walks out one level at a time
+            steps = selection_texts(chains[0], SELECTION_BUFFER)
+            require(steps[:3] == ["x", "p.x", "p.x + p.y"] and steps[-1].startswith("pub fun area")
+                    and "total = (p.x + p.y) * scale;" in steps
+                    and "if (scale > 0) {" in steps[-3],
+                    f"the cursor in a nested expression did not walk out level by level: {steps!r}")
+            # a cursor just after `x` still starts from the word it follows
+            require(selection_texts(chains[1], SELECTION_BUFFER)[:2] == ["x", "p.x"],
+                    f"a cursor at the end of a word did not select the word: "
+                    f"{selection_texts(chains[1], SELECTION_BUFFER)!r}")
+            # a field name, then its record
+            require(selection_texts(chains[2], SELECTION_BUFFER) == ["x", "pub rec P {\n    x: i32;\n    y: i32;\n}"],
+                    f"a field did not expand to its record: {selection_texts(chains[2], SELECTION_BUFFER)!r}")
+            # an import path, then its use
+            require(selection_texts(chains[3], SELECTION_BUFFER)
+                    == ["std.types.size.usize", "use std.types.size.usize;"],
+                    f"an import path did not expand to its use: {selection_texts(chains[3], SELECTION_BUFFER)!r}")
+            # nothing holds a blank line or a line past the end
+            for index, expected in ((4, {"line": 1, "character": 0}), (5, {"line": 99, "character": 0})):
+                require(chains[index] == {"range": {"start": expected, "end": expected}},
+                        f"a position nothing holds did not answer an empty range: {chains[index]!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
     """A record's fields and a function's parameters belong in the outline.
 
@@ -3509,8 +3633,7 @@ class SyntaxOnlyFeature(NamedTuple):
 
 # every handler that answers from `analysis.syntax_of`, the PHASE_PARSE view of
 # the open buffer alone. a syntax-only handler answers from the buffer and must
-# never touch the project, so each one is held to the same latency contract;
-# #222 selectionRange joins the table when it lands.
+# never touch the project, so each one is held to the same latency contract.
 SYNTAX_ONLY_FEATURES = (
     SyntaxOnlyFeature(
         name="documentSymbol",
@@ -3524,7 +3647,22 @@ SYNTAX_ONLY_FEATURES = (
         params=lambda uri, text: {"textDocument": {"uri": uri}},
         valid=lambda result: isinstance(result, list) and bool(result),
     ),
+    SyntaxOnlyFeature(
+        name="selectionRange",
+        method="textDocument/selectionRange",
+        params=lambda uri, text: {"textDocument": {"uri": uri},
+                                  "positions": [syntax_only_cursor(text)]},
+        valid=lambda result: isinstance(result, list) and len(result) == 1
+        and "parent" in result[0],
+    ),
 )
+
+
+def syntax_only_cursor(text: str) -> dict[str, int]:
+    """A position inside the fixture's function body, where a chain has depth."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if value.strip().startswith("ret "))
+    return {"line": line, "character": lines[line].index("ret ") + 4}
 
 # the first requests against a healthy project pay a cold project load, once
 # per manifest restore, so the contract is about steady state and these samples
@@ -6406,6 +6544,7 @@ def main() -> int:
         run_document_symbol_hierarchy(server, args.timeout)
         run_document_symbol_kinds(server, args.timeout)
         run_folding_range(server, args.timeout)
+        run_selection_range(server, args.timeout)
         run_type_definition(server, args.timeout)
         run_call_hierarchy(server, args.timeout)
         syntax_only = run_syntax_only_latency(server, args.timeout)
@@ -6451,6 +6590,7 @@ def main() -> int:
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  one SymbolKind table: every feature that names a declaration agrees")
     print("  foldingRange folds decl bodies, import runs and doc blocks from the buffer's parse")
+    print("  selectionRange expands a cursor one syntax level at a time")
     print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
     print("  call hierarchy resolves items across modules, and reports calls through fun values")
     print("  a syntax-only request answers from the buffer without reloading the project")
