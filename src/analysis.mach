@@ -206,6 +206,37 @@ pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.As
     ret an.a;
 }
 
+# the syntax-only view of an open document: its parse and its text, nothing
+# semantic
+#
+# A feature that needs only the shape of the buffer (documentSymbol, folding)
+# answers from the buffer's own parse and never waits on, or pays for, a
+# project snapshot. That is what makes it answer while a project's manifest
+# cannot load, and in milliseconds while the snapshot is behind. `rr` and `sr`
+# are nil by construction, and `text` is the buffer itself, so nothing maps.
+# ---
+# es:  the standalone editor session
+# doc: the open document
+# out: receives the view on success
+# ret: true when the document parsed
+pub fun syntax_of(es: *editor.EditorSession, doc: *documents.Document, out: *Analyzed) bool {
+    val tree: *ast.Ast = syntax_tree(es, doc);
+    if (tree == nil) { ret false; }
+    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (sel fo.none) { ret false; }
+    out.interner = nil;
+    out.text     = positions.text_of(fo.some);
+    out.sr       = nil;
+    out.a        = tree;
+    out.rr       = nil;
+    out.own      = sess.MODULE_NIL;
+    out.own_fid  = doc.file_id;
+    out.root     = nil;
+    out.stale    = false;
+    out.current  = true;
+    ret true;
+}
+
 # analyze the requested document and convert its cursor position to a byte
 # offset, or none when the document is unknown, unanalyzable, or the position
 # falls outside it

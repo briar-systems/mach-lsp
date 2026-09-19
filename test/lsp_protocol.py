@@ -3263,6 +3263,124 @@ def run_document_symbol_kinds(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+FOLD_BUFFER = """use std.types.bool.bool;
+use std.types.size.usize;
+fwd std.types.string.str;
+
+# a record with two fields
+# and a doc block above it
+pub rec R {
+    a: i32;
+    b: i32;
+}
+
+pub uni U { a: i32; b: f32; }
+
+pub tag T: u8 {
+    one;
+    two: i32;
+}
+
+pub val V: i32 = 1;
+
+# one doc line hides nothing
+pub fun f(
+    n: i32,
+) i32 {
+    if (n > 0) {
+        ret n;
+    }
+    ret 0;
+}
+
+use std.types.string.str_len;
+"""
+
+
+def run_folding_range(server: Path, timeout: float) -> None:
+    """foldingRange folds decl bodies, import runs and doc blocks, and nothing else.
+
+    A body folds from the line that opens its brace to the line that closes it,
+    with `endCharacter` at the closing brace. A function folds its body
+    statement, not its signature, so a signature spread over lines stays in
+    view. A run of adjacent `use` / `fwd` lines is one `imports` range and a doc
+    block one `comment` range. A range that would hide no line is not reported:
+    the one-line union, the one-line doc comment and the lone trailing `use`
+    all fold nothing.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-fold-") as directory:
+        root = Path(directory).resolve()
+        buffer = root / "fold.mach"
+        buffer.write_text(FOLD_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}})["result"]["capabilities"]
+            require(capabilities.get("foldingRangeProvider") is True,
+                    f"foldingRangeProvider is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": buffer.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": FOLD_BUFFER}},
+            )
+            session.diagnostics(buffer.as_uri(), 1)
+            ranges = session.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": buffer.as_uri()}},
+            )["result"]
+            expected = [
+                {"startLine": 0, "endLine": 2, "kind": "imports"},
+                {"startLine": 4, "endLine": 5, "kind": "comment"},
+                {"startLine": 6, "endLine": 9, "endCharacter": 0},
+                {"startLine": 13, "endLine": 16, "endCharacter": 0},
+                {"startLine": 23, "endLine": 28, "endCharacter": 0},
+            ]
+            require(ranges == expected,
+                    f"folding ranges differ from the buffer's shape:\n"
+                    f"  got      {ranges!r}\n  expected {expected!r}")
+
+            # an edit is reflected through the buffer's own parse: indenting the
+            # closing brace moves `endCharacter`, and joining the doc block onto
+            # one line removes its range
+            edited = FOLD_BUFFER.replace("    b: i32;\n}", "    b: i32;\n    }").replace(
+                "# a record with two fields\n# and a doc block above it", "# a record with two fields")
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": buffer.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            session.diagnostics(buffer.as_uri(), 2)
+            ranges = session.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": buffer.as_uri()}},
+            )["result"]
+            expected = [
+                {"startLine": 0, "endLine": 2, "kind": "imports"},
+                {"startLine": 5, "endLine": 8, "endCharacter": 4},
+                {"startLine": 12, "endLine": 15, "endCharacter": 0},
+                {"startLine": 22, "endLine": 27, "endCharacter": 0},
+            ]
+            require(ranges == expected,
+                    f"folding ranges did not follow the edit:\n"
+                    f"  got      {ranges!r}\n  expected {expected!r}")
+
+            # a document the server does not hold answers an empty list, not an error
+            missing = session.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": (root / "absent.mach").as_uri()}},
+            )
+            require(missing.get("result") == [],
+                    f"an unopened document did not answer []: {missing!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
     """A record's fields and a function's parameters belong in the outline.
 
@@ -3389,15 +3507,20 @@ class SyntaxOnlyFeature(NamedTuple):
     valid: Callable[[Any], bool]
 
 
-# every handler that reaches `analysis.standalone` at `editor.PHASE_PARSE`, which
-# today is `document_symbol` by way of `analysis.syntax_tree`. a syntax-only
-# handler answers from the buffer and must never touch the project, so each one
-# is held to the same latency contract; #221 foldingRange and #222 selectionRange
-# join the table when they land.
+# every handler that answers from `analysis.syntax_of`, the PHASE_PARSE view of
+# the open buffer alone. a syntax-only handler answers from the buffer and must
+# never touch the project, so each one is held to the same latency contract;
+# #222 selectionRange joins the table when it lands.
 SYNTAX_ONLY_FEATURES = (
     SyntaxOnlyFeature(
         name="documentSymbol",
         method="textDocument/documentSymbol",
+        params=lambda uri, text: {"textDocument": {"uri": uri}},
+        valid=lambda result: isinstance(result, list) and bool(result),
+    ),
+    SyntaxOnlyFeature(
+        name="foldingRange",
+        method="textDocument/foldingRange",
         params=lambda uri, text: {"textDocument": {"uri": uri}},
         valid=lambda result: isinstance(result, list) and bool(result),
     ),
@@ -6282,6 +6405,7 @@ def main() -> int:
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
         run_document_symbol_kinds(server, args.timeout)
+        run_folding_range(server, args.timeout)
         run_type_definition(server, args.timeout)
         run_call_hierarchy(server, args.timeout)
         syntax_only = run_syntax_only_latency(server, args.timeout)
@@ -6326,6 +6450,7 @@ def main() -> int:
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  one SymbolKind table: every feature that names a declaration agrees")
+    print("  foldingRange folds decl bodies, import runs and doc blocks from the buffer's parse")
     print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
     print("  call hierarchy resolves items across modules, and reports calls through fun values")
     print("  a syntax-only request answers from the buffer without reloading the project")

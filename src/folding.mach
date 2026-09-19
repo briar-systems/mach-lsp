@@ -1,0 +1,199 @@
+# folding ranges: the regions of a buffer an editor may collapse
+#
+# Syntax-only, like documentSymbol: the buffer's own parse says where every
+# declaration body, doc comment block and run of imports begins and ends, and
+# nothing semantic is consulted. That is what lets it answer while the project's
+# manifest cannot load, and in the time a parse of one file takes while the
+# project snapshot is behind (#221).
+#
+# A brace body folds from the line that opens it to the closing brace, with
+# `endCharacter` at the brace itself so a client that folds by character keeps
+# the brace in view. A doc comment folds as a `comment` and a run of `use` and
+# `fwd` lines as `imports`, so a client's fold-all-comments and fold-all-imports
+# commands find them. A range that would hide no line is not reported.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.Allocator;
+
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.stmt;
+use mach.lang.fe.token;
+use sj: std.data.json;
+
+use mls.analysis;
+use mls.documents;
+use mls.features;
+use mls.json;
+use mls.positions;
+use mls.render;
+use mls.transport;
+
+# answer textDocument/foldingRange for an open document
+# ---
+# es:     the standalone editor session
+# alloc:  request allocator
+# docs:   the open-document registry
+# id:     the request id
+# params: the request params, holding `textDocument`
+# uri:    the requested document
+pub fun folding_range(es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
+    if (id_raw == nil) { ret; }
+
+    val d:  *documents.Document = documents.find(docs, uri);
+    var an: analysis.Analyzed;
+    if (d == nil || !analysis.syntax_of(es, d, ?an)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
+
+    var b: json.Buf = json.buf_init(alloc);
+    json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"id\":");
+    json.buf_push(?b, id_raw);
+    json.buf_push(?b, ",\"result\":[");
+    var e: Emitter;
+    e.b       = ?b;
+    e.text    = an.text;
+    e.emitted = 0;
+    collect(?e, an.a);
+    json.buf_push(?b, "]}");
+
+    val msg: str = json.buf_str(?b);
+    if (msg != nil) {
+        transport.send_message(msg, alloc);
+        render.note_response();
+        json.free_str(id_raw, alloc);
+    }
+    or {
+        render.reply_empty_array(alloc, id_raw);
+    }
+    json.buf_dnit(?b);
+}
+
+# the folding ranges of every module-scope declaration, in source order
+#
+# Imports are gathered as one run per group of adjacent `use` / `fwd` lines: a
+# run ends at the first declaration of another kind, which is the shape a
+# module's import block has.
+fun collect(e: *Emitter, a: *ast.Ast) {
+    var run:    token.Span;
+    var in_run: bool = false;
+    val n:      u32  = features.top_level_count(a);
+    var i:      u32  = 0;
+    for (i < n) {
+        val d_opt: opt[*decl.Decl] = ast.get_decl(a, features.top_level_decl(a, i));
+        i = i + 1;
+        if (sel d_opt.none) { cnt; }
+        val d: *decl.Decl = d_opt.some;
+
+        if (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_FWD) {
+            if (in_run) { run = join(run, d.span); }
+            or {
+                run    = d.span;
+                in_run = true;
+            }
+            cnt;
+        }
+        if (in_run) {
+            push(e, run, KIND_IMPORTS, false);
+            in_run = false;
+        }
+        if (d.doc.len > 0) { push(e, d.doc, KIND_COMMENT, false); }
+        push_body(e, a, d);
+    }
+    if (in_run) { push(e, run, KIND_IMPORTS, false); }
+}
+
+# the brace-delimited body of a declaration, when it has one
+#
+# A function or test folds its body statement, so a signature that spans lines
+# stays visible. A record, union, tag or comptime branch set folds from its own
+# first line, where its opening brace is.
+fun push_body(e: *Emitter, a: *ast.Ast, d: *decl.Decl) {
+    if (d.kind == decl.DECL_KIND_FUN || d.kind == decl.DECL_KIND_TEST) {
+        var sid: id.StmtId = d.data.fun_.body;
+        if (d.kind == decl.DECL_KIND_TEST) { sid = d.data.test_.body; }
+        val so: opt[*stmt.Stmt] = ast.get_stmt(a, sid);
+        if (sel so.none) { ret; }
+        push(e, so.some.span, nil, true);
+        ret;
+    }
+    if (d.kind == decl.DECL_KIND_REC || d.kind == decl.DECL_KIND_UNI
+        || d.kind == decl.DECL_KIND_TAG || d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        push(e, d.span, nil, true);
+    }
+}
+
+val KIND_COMMENT: str = "comment";
+val KIND_IMPORTS: str = "imports";
+
+# the response being built
+# ---
+# b:       output buffer
+# text:    the buffer the spans index
+# emitted: ranges written so far, for the separating comma
+rec Emitter {
+    b:       *json.Buf;
+    text:    positions.Text;
+    emitted: usize;
+}
+
+# append one FoldingRange for `span`, or nothing when it hides no line
+# ---
+# e:     the response
+# span:  the region, from its first byte to one past its last
+# kind:  the FoldingRangeKind, or nil for a plain region
+# brace: the span ends at a closing brace, reported as `endCharacter` so the
+#        brace stays in view
+fun push(e: *Emitter, span: token.Span, kind: str, brace: bool) {
+    if (span.len == 0) { ret; }
+    val so: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset));
+    val eo: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset + span.len - 1));
+    if (sel so.none) { ret; }
+    if (sel eo.none) { ret; }
+    val start: positions.LspRange = so.some;
+    val end:   positions.LspRange = eo.some;
+    if (end.start_line <= start.start_line) { ret; }
+
+    if (e.emitted > 0) { json.buf_push_byte(e.b, ','); }
+    e.emitted = e.emitted + 1;
+    json.buf_push(e.b, "{\"startLine\":");
+    json.buf_push_usize(e.b, start.start_line);
+    json.buf_push(e.b, ",\"endLine\":");
+    json.buf_push_usize(e.b, end.start_line);
+    if (brace) {
+        json.buf_push(e.b, ",\"endCharacter\":");
+        json.buf_push_usize(e.b, end.start_char);
+    }
+    if (kind != nil) {
+        json.buf_push(e.b, ",\"kind\":\"");
+        json.buf_push(e.b, kind);
+        json.buf_push_byte(e.b, '"');
+    }
+    json.buf_push_byte(e.b, '}');
+}
+
+# the span from the start of `a` to the end of `b`
+fun join(a: token.Span, b: token.Span) token.Span {
+    var s: token.Span;
+    s.offset = a.offset;
+    s.len    = b.offset + b.len - a.offset;
+    ret s;
+}
+
+# an empty span at `offset`
+fun point(offset: usize) token.Span {
+    var s: token.Span;
+    s.offset = offset;
+    s.len    = 0;
+    ret s;
+}
