@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-19
+
+Completion while the buffer is ahead of the snapshot answers from the snapshot
+like every other feature, the editor session is confined to documents outside
+any project, and the two threads that run the linked frontend hold the
+compiler's own stack reserve. No contract change: same asset set, CLI and
+options as 1.2.0.
+
+**The linked mach moves from v5.8.0 to v5.9.0.** std stays at v4.0.0, now
+selected by the version range `^4.0`.
+
 ### Changed
 - feat(#235): completion while the buffer is ahead of the snapshot answers
   from the snapshot, read against the buffer through the text mapping (#251),
