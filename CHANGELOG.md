@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- feat(#221): `textDocument/foldingRange`. A `fun` or `test` folds its body
+  statement, so a signature spread over lines stays in view; a `rec`, `uni`,
+  `tag` or `$if` folds from its first line to its closing brace, reported as
+  `endCharacter` so a client that folds by character keeps the brace. A run of
+  adjacent `use` and `fwd` lines is one `imports` range and a doc block one
+  `comment` range, so fold-all-imports and fold-all-comments find them. A range
+  that would hide no line is not reported. Syntax-only, like documentSymbol:
+  it answers from the buffer's own parse, while the project's manifest cannot
+  load and without waiting on a snapshot, and holds the same latency contract.
+
 ## [1.3.0] - 2026-09-19
 
 Completion while the buffer is ahead of the snapshot answers from the snapshot

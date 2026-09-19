@@ -1890,27 +1890,12 @@ pub fun document_symbol(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
     val id_raw: str = json.id_text(id, alloc);
     if (id_raw == nil) { ret; }
 
-    val d: *documents.Document = documents.find(docs, uri);
-    if (d == nil) {
-        render.reply_empty_array(alloc, id_raw);
-        ret;
-    }
-    val tree: *ast.Ast = analysis.syntax_tree(es, d);
-    if (tree == nil) {
-        render.reply_empty_array(alloc, id_raw);
-        ret;
-    }
-    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, d.file_id);
-    if (sel fo.none) {
-        render.reply_empty_array(alloc, id_raw);
-        ret;
-    }
+    val d:  *documents.Document = documents.find(docs, uri);
     var an: analysis.Analyzed;
-    an.a       = tree;
-    an.text    = positions.text_of(fo.some);
-    an.stale   = false;
-    an.current = true;
-
+    if (d == nil || !analysis.syntax_of(es, d, ?an)) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
     emit_document_symbols(an, alloc, id_raw);
 }
 

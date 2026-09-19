@@ -34,6 +34,7 @@ use mls.actions;
 use mls.callhierarchy;
 use mls.diagnostics;
 use mls.documents;
+use mls.folding;
 use mls.hints;
 use mls.jobs;
 use mls.json;
@@ -80,6 +81,7 @@ val FEATURE_TYPE_DEFINITION:    u8 = 12;
 val FEATURE_CALL_PREPARE:       u8 = 13;
 val FEATURE_CALL_INCOMING:      u8 = 14;
 val FEATURE_CALL_OUTGOING:      u8 = 15;
+val FEATURE_FOLDING_RANGE:      u8 = 16;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
@@ -634,6 +636,11 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_feature(srv, root, params, FEATURE_COMPLETION);
         ret;
     }
+    if (str_equals(method, "textDocument/foldingRange")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_FOLDING_RANGE);
+        ret;
+    }
     if (str_equals(method, "textDocument/documentHighlight")) {
         json.free_str(method, a);
         handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT);
@@ -739,7 +746,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":");
+    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"foldingRangeProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":");
     json.buf_push_quoted(?b, version.VERSION);
     json.buf_push(?b, ",\"mach\":");
     json.buf_push_quoted(?b, version.MACH);
@@ -990,6 +997,7 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_RENAME)             { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_PREPARE_RENAME)     { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_SYMBOL)    { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_FOLDING_RANGE)      { folding.folding_range(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_COMPLETION)         { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_HIGHLIGHT) { language.document_highlight(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_SIGNATURE_HELP)     { signature.signature_help(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
