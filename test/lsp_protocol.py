@@ -4052,6 +4052,162 @@ def run_completion_type_position_and_imported_members(server: Path, timeout: flo
                 session.abort()
 
 
+def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
+    """Completion after a `.` on a receiver whose type is reached through a `fwd`
+    re-export, while the buffer is ahead of the snapshot (#332, #334).
+
+    A `fwds` file re-exports another module's type (`use pkg.types; fwd
+    types.Rectangle;`). The isolated receiver resolver found the re-exporting
+    module by the buffer's `use` and stopped there, but that module only
+    forwards the type, it does not declare it, so the members were empty. The
+    resolver now follows the `fwd` to the declaring module, through as many hops
+    as the language allows.
+
+    Two receiver shapes are covered. A value of a `rec` or `uni` type offers its
+    fields or cases (#332). A `tag` type named directly as the receiver offers
+    its case selectors (#334), which is a distinct receiver kind: a tag's cases
+    are reached through the type (`Color.red`), not through a value. Both are
+    asserted same-file, imported and fwd-reached, behind (the isolated
+    `isIncomplete` path) and once caught up.
+    """
+    if os.name != "posix":
+        print("  completion fwd re-export members: skipped (rebuild gate needs flock)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-compl-fwd-") as directory:
+        root = Path(directory).resolve()
+        project = root / "fwd"
+        source = project / "src"
+        source.mkdir(parents=True)
+        (project / "mach.toml").write_text(
+            '[project]\nid = "fwd"\nversion = "0.1.0"\nsrc = "src"\n'
+            'out = "out/{target.name}/{profile.name}"\n\n'
+            '[target.linux-x86_64]\nisa = "x86_64"\nos = "linux"\nabi = "sysv64"\n\n'
+            '[profile.debug]\nopt = 0\ndebug = true\nsimd = "scalarize"\n'
+            'vectorize = true\nfloat_reassoc = false\n\n'
+            '[artifact.app]\nkind = "bin"\nentry = "main.mach"\nout = "bin/app"\n'
+            'targets = ["*"]\nlink = []\nneed = []\n',
+            encoding="utf-8")
+        (source / "types.mach").write_text(
+            "pub rec Rectangle { x: f32; y: f32; }\n"
+            "pub uni Shape { Circle: i32; Square: i32; }\n"
+            "pub tag Color: u8 { red; green; blue; }\n", encoding="utf-8")
+        # a fwds file: one hop from the declaring module
+        (source / "re.mach").write_text(
+            "use fwd.types;\nfwd types.Rectangle;\nfwd types.Shape;\nfwd types.Color;\n",
+            encoding="utf-8")
+        # a second fwds file: re-exports the re-export, so a value reached here is two hops away
+        (source / "re2.mach").write_text(
+            "use fwd.re;\nfwd re.Rectangle;\n", encoding="utf-8")
+        base = ("use one: fwd.re;\nuse two: fwd.re2;\n\n"
+                "pub fun main() i32 {\n    ret 0;\n}\n")
+        main = source / "main.mach"
+        main.write_text(base, encoding="utf-8")
+
+        gate = RebuildGate(project)
+        gate.hold()
+        session = LspSession(server, project, timeout, env_extra=gate.env)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": project.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": base}})
+            session.diagnostics(main.as_uri(), 1)
+
+            base_lines = base.splitlines()
+            version = [1]
+
+            # a value receiver: declare a local of the type, then a `.` on it
+            def value_probe(decl: str) -> tuple[str, int, int]:
+                edited = base_lines + ["", "fun probe() i32 {",
+                                       f"    var v: {decl};", "    v.", "    ret 0;", "}"]
+                line = next(i for i, val in enumerate(edited) if val.strip() == "v.")
+                return "\n".join(edited) + "\n", line, len("    v.")
+
+            # a type-name receiver: a `.` on the type itself, with optional
+            # top-level prelude (a same-file decl or an extra `use`)
+            def type_probe(recv: str, prelude: list[str]) -> tuple[str, int, int]:
+                edited = base_lines + prelude + ["", "fun probe() i32 {",
+                                                 f"    {recv}.", "    ret 0;", "}"]
+                line = next(i for i, val in enumerate(edited) if val.strip() == f"{recv}.")
+                return "\n".join(edited) + "\n", line, len(f"    {recv}.")
+
+            def behind(probe: tuple[str, int, int], label: str) -> list[str]:
+                body, line, col = probe
+                notifications = []
+                for _ in range(32):
+                    version[0] += 1
+                    notifications.append((
+                        "textDocument/didChange",
+                        {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                         "contentChanges": [{"text": body}]}))
+                answer = session.request_after_notifications(
+                    notifications, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": col}})
+                result = answer.get("result")
+                require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                        f"fwd completion for `{label}` was not answered while behind: {answer!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            def caught_up(probe: tuple[str, int, int], label: str) -> list[str]:
+                gate.release()
+                body, line, col = probe
+                version[0] += 1
+                session.notify("textDocument/didChange", {"textDocument": {
+                    "uri": main.as_uri(), "version": version[0]}, "contentChanges": [{"text": body}]})
+                session.diagnostics(main.as_uri(), version[0])
+                result = settled_result(
+                    session, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": col}},
+                    lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                    f"project-backed fwd completion for `{label}`")
+                return [item.get("label") for item in result.get("items", [])]
+
+            same_file_tag = ["pub tag Local: u8 { red; green; blue; }"]
+            import_tag = ["use fwd.types.Color;"]
+
+            # #332: a value whose type is reached through a fwd re-export
+            # a rec re-exported one hop offers its fields
+            require(behind(value_probe("one.Rectangle"), "one.Rectangle") == ["x", "y"],
+                    "a rec re-exported through a fwds file offered no fields while behind")
+            # a uni re-exported one hop offers its cases
+            require(behind(value_probe("one.Shape"), "one.Shape") == ["Circle", "Square"],
+                    "a uni re-exported through a fwds file offered no cases while behind")
+            # a rec re-exported through a re-export offers its fields: the follow is not one hop
+            require(behind(value_probe("two.Rectangle"), "two.Rectangle") == ["x", "y"],
+                    "a rec re-exported through two fwds files offered no fields while behind")
+
+            # #334: a tag type named directly as the receiver offers its cases
+            # same-file
+            require(behind(type_probe("Local", same_file_tag), "Local") == ["red", "green", "blue"],
+                    "a same-file tag type offered no cases while behind")
+            # imported directly from the declaring module
+            require(behind(type_probe("Color", import_tag), "Color") == ["red", "green", "blue"],
+                    "an imported tag type offered no cases while behind")
+            # reached through a fwd re-export (module alias `one`)
+            require(behind(type_probe("one.Color", []), "one.Color") == ["red", "green", "blue"],
+                    "a fwd-reached tag type offered no cases while behind")
+
+            # caught up, each receiver still resolves through the loaded snapshot
+            require(caught_up(value_probe("one.Rectangle"), "one.Rectangle") == ["x", "y"],
+                    "a rec re-exported through a fwds file offered no fields caught up")
+            require(caught_up(type_probe("Local", same_file_tag), "Local") == ["red", "green", "blue"],
+                    "a same-file tag type offered no cases caught up")
+            require(caught_up(type_probe("Color", import_tag), "Color") == ["red", "green", "blue"],
+                    "an imported tag type offered no cases caught up")
+            require(caught_up(type_probe("one.Color", []), "one.Color") == ["red", "green", "blue"],
+                    "a fwd-reached tag type offered no cases caught up")
+
+            session.finish()
+            finished = True
+        finally:
+            gate.close()
+            if not finished:
+                session.abort()
+
+
 def run_document_highlight(server: Path, timeout: float) -> None:
     """Occurrences in the active file, classified read or write."""
     with tempfile.TemporaryDirectory(prefix="mls-hl-") as directory:
@@ -5839,6 +5995,7 @@ def main() -> int:
         run_completion_alias_while_behind(server, args.timeout)
         run_completion_dependency_alias_while_behind(server, args.timeout)
         run_completion_type_position_and_imported_members(server, args.timeout)
+        run_completion_fwd_reexport_members(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)

@@ -1964,6 +1964,7 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         if (dot > 0 && file.text[dot - 1] == '.') {
             if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1))                   { ret; }
             if (emit_module_alias_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
+            if (emit_tag_type_cases(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false))       { ret; }
             reply_empty_completion(alloc, id_raw, false);
             ret;
         }
@@ -1984,6 +1985,7 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
             or {
                 if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
             }
+            if (emit_tag_type_cases(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
             reply_empty_completion(alloc, id_raw, false);
             ret;
         }
@@ -2000,6 +2002,7 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         val root: *project.Root = project.root_for_loaded(ws, uri);
         if (emit_module_alias_members(ws, root, an, alloc, id_raw, prefix, dot - 1, true)) { ret; }
         if (emit_imported_field_members(ws, root, an, alloc, id_raw, prefix, dot - 1))     { ret; }
+        if (emit_tag_type_cases(ws, root, an, alloc, id_raw, prefix, dot - 1, true))       { ret; }
         reply_empty_completion(alloc, id_raw, true);
         ret;
     }
@@ -2821,6 +2824,9 @@ val HIGHLIGHT_WRITE: i64 = 3;
 # LSP CompletionItemKind for a record or union field
 val LSP_COMPLETION_FIELD: i64 = 5;
 
+# LSP CompletionItemKind for a tag's case selector
+val LSP_COMPLETION_ENUM_MEMBER: i64 = 20;
+
 # LSP SymbolKind values used for declaration members
 val LSP_SYMBOL_ENUM_MEMBER:    i64 = 22;
 val LSP_SYMBOL_FIELD:          i64 = 8;
@@ -3071,6 +3077,140 @@ fun record_in_module_owned(ws: *project.Workspace, root: *project.Root, alloc: *
     strutil.str_free(alloc, module_fqn);
     strutil.str_free(alloc, type_name);
     ret rso;
+}
+
+# offer a tag type's case selectors after `T.`, the type-name receiver kind (#334)
+#
+# A tag's cases are named through the type (`T.c`), so the receiver a user types
+# is the type name, not a value. This is the fourth receiver kind, alongside the
+# same-file field, the module alias, and the imported value. Same-file the tag is
+# found in the buffer's own analysis; otherwise its path is resolved against the
+# snapshot through the buffer's `use` declarations, exactly as an imported
+# value's type is, and a `fwd` re-export is followed to the module that declares
+# the tag. `dot` is the offset of the `.`; `incomplete` reports which analysis
+# answered, as in the sibling bridges.
+fun emit_tag_type_cases(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize, incomplete: bool) bool {
+    if (dot == 0) { ret false; }
+    val leaf: token.Span = ident_prefix_before(an.text.file, dot);
+    if (leaf.len == 0) { ret false; }
+
+    # widen to a `qual.leaf` receiver when the identifier is dotted onto a name
+    var recv: token.Span = leaf;
+    if (leaf.offset > 0 && an.text.file.text[leaf.offset - 1] == '.') {
+        val q: token.Span = ident_prefix_before(an.text.file, leaf.offset - 1);
+        if (q.len > 0) {
+            recv.offset = q.offset;
+            recv.len    = (leaf.offset + leaf.len) - q.offset;
+        }
+    }
+
+    # a tag declared in the buffer, when the receiver is a bare name
+    if (recv.offset == leaf.offset) {
+        val sf: *decl.Decl = same_file_tag_decl(an, leaf);
+        if (sf != nil) { ret emit_tag_cases_from_decl(an, alloc, id_raw, prefix, an.a, an.text, sf, incomplete); }
+    }
+
+    # otherwise resolve the type path against the snapshot through the `use`s
+    val tso: opt[project.TypeSite] = type_site_for_type_path(ws, root, an, alloc, recv);
+    if (sel tso.none) { ret false; }
+    val ts: project.TypeSite = tso.some;
+    if (ts.kind != decl.DECL_KIND_TAG) { ret false; }
+    val d_opt: opt[*decl.Decl] = ast.get_decl(ts.a, ts.decl);
+    if (sel d_opt.none) { ret false; }
+    ret emit_tag_cases_from_decl(an, alloc, id_raw, prefix, ts.a, ts.text, d_opt.some, incomplete);
+}
+
+# the buffer's own `tag` declaration named by `name`, or nil
+fun same_file_tag_decl(an: analysis.Analyzed, name: token.Span) *decl.Decl {
+    var i: usize = 0;
+    for (i < an.a.decl_len) {
+        val d: *decl.Decl = ?an.a.decls[i];
+        i = i + 1;
+        if (d.kind != decl.DECL_KIND_TAG)                                                  { cnt; }
+        if (features.span_bytes_equal(an.text.file, d.data.tag_.name, an.text.file, name)) { ret d; }
+    }
+    ret nil;
+}
+
+# resolve the type-name path `name` against `root`'s snapshot to the type it
+# names, through the buffer's `use` declarations, following `fwd` re-exports.
+# the `TypeSite` twin of `record_for_type_path`, so a tag resolves (#334)
+fun type_site_for_type_path(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, name: token.Span) opt[project.TypeSite] {
+    val srctext: str        = an.text.file.text;
+    val leaf:    token.Span = np.leaf(srctext, name);
+    val qual:    token.Span = np.prefix(srctext, name);
+    if (leaf.len == 0) { ret opt[project.TypeSite].none{}; }
+
+    var i: usize = 0;
+    for (i < an.a.decl_len) {
+        val d: *decl.Decl = ?an.a.decls[i];
+        i = i + 1;
+        if (d.kind != decl.DECL_KIND_USE) { cnt; }
+        val u:     *decl.DeclUse = ?d.data.use_;
+        var bound: token.Span    = u.alias;
+        if (bound.len == 0) { bound = np.leaf(srctext, u.path); }
+
+        if (qual.len > 0) {
+            if (!features.span_bytes_equal(an.text.file, bound, an.text.file, qual)) { cnt; }
+            ret type_in_module_owned(ws, root, alloc,
+                positions.span_text(an.text, u.path, alloc),
+                positions.span_text(an.text, leaf, alloc));
+        }
+        or {
+            if (!features.span_bytes_equal(an.text.file, bound, an.text.file, leaf)) { cnt; }
+            ret type_in_module_owned(ws, root, alloc,
+                positions.span_text(an.text, np.prefix(srctext, u.path), alloc),
+                positions.span_text(an.text, np.leaf(srctext, u.path), alloc));
+        }
+    }
+    ret opt[project.TypeSite].none{};
+}
+
+# look up a type by module FQN and name, freeing the two owned name strings, the
+# `TypeSite` twin of `record_in_module_owned`
+fun type_in_module_owned(ws: *project.Workspace, root: *project.Root, alloc: *Allocator,
+    module_fqn: str, type_name: str) opt[project.TypeSite] {
+    if (module_fqn == nil || type_name == nil) {
+        if (module_fqn != nil) { strutil.str_free(alloc, module_fqn); }
+        if (type_name != nil)  { strutil.str_free(alloc, type_name); }
+        ret opt[project.TypeSite].none{};
+    }
+    val tso: opt[project.TypeSite] = project.type_in_module(ws, root, module_fqn, type_name);
+    strutil.str_free(alloc, module_fqn);
+    strutil.str_free(alloc, type_name);
+    ret tso;
+}
+
+# emit a tag's case selectors as completion items, from the tag declaration `d`
+# in `a` (backed by `text`), filtered by the buffer prefix already typed
+fun emit_tag_cases_from_decl(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+    prefix: token.Span, a: *ast.Ast, text: positions.Text, d: *decl.Decl, incomplete: bool) bool {
+    if (d.kind != decl.DECL_KIND_TAG) { ret false; }
+    val start: u32 = d.data.tag_.cases_start;
+    val len:   u32 = d.data.tag_.cases_len;
+
+    var b: json.Buf = json.buf_init(alloc);
+    push_completion_head(?b, id_raw, incomplete);
+    var emitted: usize = 0;
+    var c:       u32   = 0;
+    for (c < len) {
+        if (a.tag_cases != nil) {
+            val tc:    *decl.TagCase = ?a.tag_cases[(start + c)::usize];
+            val cname: str           = positions.span_text(text, tc.name, alloc);
+            if (cname != nil) {
+                if (span_is_prefix_of(an.text.file, prefix, cname)) {
+                    push_completion_item(?b, cname, LSP_COMPLETION_ENUM_MEMBER, "case", nil, emitted > 0);
+                    emitted = emitted + 1;
+                }
+                json.free_str(cname, alloc);
+            }
+        }
+        c = c + 1;
+    }
+    push_completion_tail(?b, alloc, id_raw);
+    ret true;
 }
 
 # the last segment of a `use` path, the name a `use a.b.c;` binds
