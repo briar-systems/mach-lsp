@@ -27,9 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - chore(#343): **the linked mach moves from v5.8.0 to v5.9.0** (128-bit
   integers in the compiler, three codegen fixes, no editor API change). std
   stays at v4.0.0, as mach 5.9.0 itself pins it, and is now selected by the
-  version range `^4.0` rather than the exact tag. CI fetches each submodule's
-  release tag before the build, since the shallow checkout carries none and a
-  range dependency verifies against it.
+  version range `^4.0` rather than the exact tag. The family CI workflow
+  fetches each submodule's release tag before the build, since the shallow
+  checkout carries none and a range dependency verifies against it.
 
 ### Fixed
 - fix(#345): the analysis thread and the rebuild worker, the two threads that
