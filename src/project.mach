@@ -1421,7 +1421,7 @@ fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[i
 # allocation or normalization rejects the new Project and preserves the last
 # successful path/fingerprint set for disk-change retry detection.
 fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, pr: *driver.Project, o: *BuildOutput) res[bool, str] {
-    val n: u32 = pr.module_len;
+    val n: u32 = driver.module_count(pr);
     if (n == 0) { ret res[bool, str].ok{true}; }
     val arr_r: res[*str, allocator.Error] = allocate[str](alloc, n::usize);
     if (sel arr_r.err) { ret res[bool, str].err{outcome.alloc_text(arr_r.err)}; }
@@ -1438,7 +1438,7 @@ fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, pr: *driver.Project
         paths[i]              = nil;
         fingerprints[i].mtime = 0;
         fingerprints[i].size  = 0;
-        val fo: opt[*src.SourceFile] = src.get(?sn.sources, (?pr.modules[i]).file_id);
+        val fo: opt[*src.SourceFile] = src.get(?sn.sources, driver.module_at(pr, i).file_id);
         if (sel fo.none) {
             free_path_snapshot(alloc, paths, fingerprints, n, i);
             ret res[bool, str].err{"project: loaded module source is unavailable"};
@@ -1896,16 +1896,16 @@ pub fun file_text(w: *Workspace, root: *Root, fid: src.FileId) positions.Text {
 fun module_for_file(root: *Root, file: src.FileId) opt[sess.ModuleId] {
     if (root == nil || !root.loaded) { ret opt[sess.ModuleId].none{}; }
     var i: u32 = 0;
-    for (i < root.p.module_len) {
-        if (root.p.modules[i].file_id == file) { ret opt[sess.ModuleId].some{i::sess.ModuleId}; }
+    for (i < driver.module_count(?root.p)) {
+        if (driver.module_at(?root.p, i).file_id == file) { ret opt[sess.ModuleId].some{i::sess.ModuleId}; }
         i = i + 1;
     }
     ret opt[sess.ModuleId].none{};
 }
 
 fun module_entry(root: *Root, mid: sess.ModuleId) *driver.ModuleEntry {
-    if (root == nil || !root.loaded || mid::u32 >= root.p.module_len) { ret nil; }
-    ret ?root.p.modules[mid::u32];
+    if (root == nil || !root.loaded || mid::u32 >= driver.module_count(?root.p)) { ret nil; }
+    ret driver.module_at(?root.p, mid::u32);
 }
 
 # release a Site's URI when it owns one
@@ -2071,7 +2071,7 @@ fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[Docum
 # ret:  the loaded module count
 pub fun module_count(root: *Root) u32 {
     if (root == nil || !root.loaded) { ret 0; }
-    ret root.p.module_len;
+    ret driver.module_count(?root.p);
 }
 
 # a borrowed view of loaded module `mid` in `root` for the use-site
@@ -2115,7 +2115,7 @@ fun module_windows(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.So
     val live: *src.SourceFile = documents.live_file(w.docs, d);
     if (live == nil) { ret nil; }
     if (root.wins == nil) {
-        val n:  u32                                     = root.p.module_len;
+        val n:  u32                                     = driver.module_count(?root.p);
         val wr: res[*textdiff.Windows, allocator.Error] = allocate[textdiff.Windows](w.alloc, n::usize);
         if (sel wr.err) { ret nil; }
         val rr: res[*u64, allocator.Error] = allocate[u64](w.alloc, n::usize);
@@ -2573,8 +2573,8 @@ pub fun module_fqn(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
 pub fun module_by_fqn(w: *Workspace, root: *Root, fqn: str) opt[sess.ModuleId] {
     if (root == nil || !root.loaded || fqn == nil) { ret opt[sess.ModuleId].none{}; }
     var i: u32 = 0;
-    for (i < root.p.module_len) {
-        val o: opt[str] = intern.lookup(?root.s.interner, root.p.modules[i].fqn);
+    for (i < driver.module_count(?root.p)) {
+        val o: opt[str] = intern.lookup(?root.s.interner, driver.module_at(?root.p, i).fqn);
         if (sel o.some) {
             if (str_equals(o.some, fqn)) { ret opt[sess.ModuleId].some{i::sess.ModuleId}; }
         }
