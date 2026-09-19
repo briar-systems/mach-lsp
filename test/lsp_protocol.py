@@ -3929,6 +3929,16 @@ isa = "x86_64"
 os = "linux"
 abi = "sysv64"
 
+[target.linux-arm64]
+isa = "aarch64"
+os = "linux"
+abi = "aapcs64"
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os = "darwin"
+abi = "sysv64"
+
 [target.darwin-aarch64]
 isa = "aarch64"
 os = "darwin"
