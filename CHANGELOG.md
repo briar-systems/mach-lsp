@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- feat(#235): completion while the buffer is ahead of the snapshot answers
+  from the snapshot, read against the buffer through the text mapping (#251),
+  as every other feature already did. The editor session answered that case
+  from its own analysis of the buffer, which the compiler serves by loading the
+  project's closure into the server's session again on every keystroke: 65s
+  and 475MB for the first answer against this repository, over a second for
+  each later one, on the analysis thread, and empty for a local whose type is
+  imported. It is 11ms and no extra memory now, and the answer is the members
+  of the local's type. The receiver walk (#336) runs against the snapshot with
+  the live buffer contributing only bytes: a receiver the snapshot typed is
+  answered by the resolver's own semantics whatever its shape, a binding typed
+  inside the edit is found by name where the edit begins, and one declared
+  inside the edit is read from the parse of the buffer. The answer stays
+  `isIncomplete` until the rebuild lands, and a local shadowed in a block that
+  closed is the one shape the by-name lookup answers approximately until then.
+  The editor session now serves only documents outside any project.
 - chore(#343): **the linked mach moves from v5.8.0 to v5.9.0** (128-bit
   integers in the compiler, three codegen fixes, no editor API change). std
   stays at v4.0.0, as mach 5.9.0 itself pins it, and is now selected by the

@@ -1320,6 +1320,71 @@ def run_stale_hover(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_stale_fast_features(server: Path, timeout: float) -> None:
+    """Every positional feature but the strict ones answers behind the snapshot (#235).
+
+    A request queued behind a keystroke burst is answered from the snapshot the
+    root already holds, read through the edit window, and never waits for the
+    rebuild that keystroke started. `run_stale_hover` proves the mapping for
+    hover; this proves each other fast feature takes the same path, with the
+    build log confirming no rebuild landed before the answer. Rename and
+    references are the strict ones, held instead: `run_stale_strict_requests`.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-stale-fast-") as directory:
+        root = Path(directory).resolve()
+        main, text, ret_line = stale_fixture(root, "fast", "    val called: i32 = f2_0(1, 2);\n")
+        text = "use fast.m2.f2_0;\n" + text
+        main.write_text(text, encoding="utf-8")
+        ret_line += 1
+        uri = main.as_uri()
+        session, builds = open_stale_session(server, root, timeout, main, text)
+        finished = False
+        try:
+            lines = text.splitlines()
+            call_line = next(i for i, value in enumerate(lines) if "f2_0(" in value)
+            column = lines[ret_line].index("base3 ")
+            above = "# a line the snapshot never saw\n" + text
+            version = 1
+
+            def behind(method: str, params: dict[str, Any], what: str) -> Any:
+                nonlocal version
+                version += 1
+                response = stale_request(session, builds, change(uri, version, above), method, params)
+                require("error" not in response, f"{what} was refused while behind: {response!r}")
+                require("result" in response, f"{what} was not answered while behind: {response!r}")
+                builds.settle(version - 1, f"the rebuild after {what}")
+                return response["result"]
+
+            definition = behind("textDocument/definition", at(uri, ret_line + 1, column + 2), "definition")
+            require(isinstance(definition, dict) and definition.get("uri", "").endswith("/m3.mach"),
+                    f"definition behind the snapshot did not reach the declaring module: {definition!r}")
+            type_definition = behind("textDocument/typeDefinition", at(uri, ret_line + 1, column + 2), "typeDefinition")
+            require(type_definition is None or isinstance(type_definition, (dict, list)),
+                    f"typeDefinition behind the snapshot answered nonsense: {type_definition!r}")
+            signature = behind("textDocument/signatureHelp",
+                               at(uri, call_line + 1, lines[call_line].index("1, 2")), "signatureHelp")
+            require(isinstance(signature, dict) and signature.get("signatures"),
+                    f"signatureHelp behind the snapshot offered no signature: {signature!r}")
+            hints = behind("textDocument/inlayHint",
+                           {"textDocument": {"uri": uri},
+                            "range": {"start": {"line": call_line + 1, "character": 0},
+                                      "end": {"line": call_line + 2, "character": 0}}}, "inlayHint")
+            require(isinstance(hints, list) and hints,
+                    f"inlayHint behind the snapshot offered no parameter hint: {hints!r}")
+            highlights = behind("textDocument/documentHighlight", at(uri, ret_line + 1, column + 2), "documentHighlight")
+            require(isinstance(highlights, list) and highlights,
+                    f"documentHighlight behind the snapshot found nothing: {highlights!r}")
+            tokens = behind("textDocument/semanticTokens/full", {"textDocument": {"uri": uri}}, "semanticTokens")
+            require(isinstance(tokens, dict) and tokens.get("data"),
+                    f"semanticTokens behind the snapshot carried no tokens: {tokens!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_stale_strict_requests(server: Path, timeout: float) -> None:
     """A rename or reference list waits for the snapshot that covers its edit.
 
@@ -4073,6 +4138,151 @@ def run_completion_type_position_and_imported_members(server: Path, timeout: flo
                 session.abort()
 
 
+def run_completion_behind_from_snapshot(server: Path, timeout: float) -> None:
+    """Completion while the buffer is ahead answers from the snapshot (#235).
+
+    The editor session used to answer this case from its own analysis of the
+    buffer, which the compiler answers by loading the project's closure into
+    the server's session again, on every keystroke: 65s and 475MB for the
+    first answer against this repository, then over a second each, for an
+    answer that was empty for a local whose type is imported. The snapshot the
+    root already holds answers instead, read against the buffer through the
+    text mapping (#251), with the live buffer contributing only bytes.
+
+    Each probe here is a shape of receiver and where the snapshot stands to
+    it: a local the snapshot declared, typed after on a new line; a chain
+    through it; a receiver the snapshot itself typed as an expression, which
+    the resolver's own semantics answer; a local declared inside the edit,
+    which only the parse of the live buffer knows; and a local shadowed in a
+    block that closed, where the by-name lookup picks the nearest declaration
+    and is wrong. That last answer is asserted as it is: the approximation is
+    the documented cost of answering before the rebuild, and the rebuild
+    replaces it, which the caught-up assertion shows.
+    """
+    if os.name != "posix":
+        print("  completion behind from snapshot: skipped (rebuild gate needs flock)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-compl-snap-") as directory:
+        root = Path(directory).resolve()
+        main, defs, _ = write_project(root, "snap", 1)
+        defs.write_text("pub rec Inner { a: i32; b: i32; }\n"
+                        "pub rec Outer { inner: Inner; n: i32; }\n", encoding="utf-8")
+        base = ["use pt: snap.defs;",
+                "",
+                "pub fun main() i32 {",
+                "    var o: pt.Outer;",
+                "    o.n = 1;",
+                "    val q: i32 = o.n;",
+                "    val r: i32 = o.inner.a;",
+                "    var s: pt.Outer;",
+                "    if (s.n == 1) {",
+                "        var s: pt.Inner;",
+                "        s.a = 2;",
+                "    }",
+                "    ret q + r;",
+                "}"]
+        text = "\n".join(base) + "\n"
+        main.write_text(text, encoding="utf-8")
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            assert_diagnostics(session.diagnostics(main.as_uri(), 1), False, 1)
+            version = [1]
+
+            def edited(insert_after: str, new_lines: list[str], replace: bool = False) -> tuple[str, list[str]]:
+                at = base.index(insert_after)
+                if replace:
+                    lines = base[:at] + new_lines + base[at + 1:]
+                else:
+                    lines = base[:at + 1] + new_lines + base[at + 1:]
+                return "\n".join(lines) + "\n", lines
+
+            def behind(body: str, lines: list[str], needle: str) -> list[str]:
+                gate.hold()
+                line = lines.index(needle)
+                notifications = []
+                for _ in range(32):
+                    version[0] += 1
+                    notifications.append((
+                        "textDocument/didChange",
+                        {"textDocument": {"uri": main.as_uri(), "version": version[0]},
+                         "contentChanges": [{"text": body}]}))
+                answer = session.request_after_notifications(
+                    notifications, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": len(needle)}})
+                result = answer.get("result")
+                require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                        f"completion for {needle!r} was not answered while behind, so this proves nothing: {answer!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            def caught_up(body: str, lines: list[str], needle: str) -> list[str]:
+                gate.release()
+                line = lines.index(needle)
+                version[0] += 1
+                session.notify("textDocument/didChange", {"textDocument": {
+                    "uri": main.as_uri(), "version": version[0]}, "contentChanges": [{"text": body}]})
+                session.diagnostics(main.as_uri(), version[0])
+                result = settled_result(
+                    session, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": len(needle)}},
+                    lambda r: isinstance(r, dict) and r.get("isIncomplete") is False,
+                    f"project-backed completion for {needle!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            # a local whose type is imported, the dot typed on a line the
+            # snapshot has not seen: the binding is found by name where the edit
+            # begins and its annotation resolves through the snapshot's own
+            # resolution
+            body, lines = edited("    var o: pt.Outer;", ["    o."])
+            require(behind(body, lines, "    o.") == ["inner", "n"],
+                    "a local of an imported type offered no fields while behind")
+            # a chain through that local
+            body, lines = edited("    var o: pt.Outer;", ["    o.inner."])
+            require(behind(body, lines, "    o.inner.") == ["a", "b"],
+                    "a chain through a local offered no fields while behind")
+
+            # a receiver the snapshot typed as an expression: the bytes before
+            # the edit map, and the resolver's own type answers
+            body, lines = edited("    val q: i32 = o.n;", ["    val q: i32 = o."], replace=True)
+            require(behind(body, lines, "    val q: i32 = o.") == ["inner", "n"],
+                    "a receiver the snapshot typed offered no fields while behind")
+            body, lines = edited("    val r: i32 = o.inner.a;", ["    val r: i32 = o.inner."], replace=True)
+            require(behind(body, lines, "    val r: i32 = o.inner.") == ["a", "b"],
+                    "a chained receiver the snapshot typed offered no fields while behind")
+
+            # a local declared inside the edit: the snapshot has no binding, so
+            # the parse of the live buffer names its type as text
+            body, lines = edited("    var o: pt.Outer;", ["    var fresh: pt.Inner;", "    fresh."])
+            require(behind(body, lines, "    fresh.") == ["a", "b"],
+                    "a local declared inside the edit offered no fields while behind")
+
+            # the documented approximation: `s` after the block is the Outer,
+            # but the nearest preceding declaration named `s` is the Inner
+            # shadowing it inside the closed block, and that is what the
+            # by-name lookup picks. the answer is marked incomplete, and the
+            # rebuild's answer replaces it
+            body, lines = edited("    }", ["    s."])
+            require(behind(body, lines, "    s.") == ["a", "b"],
+                    "the shadowed-local approximation did not answer as documented while behind")
+            require(caught_up(body, lines, "    s.") == ["inner", "n"],
+                    "the rebuild did not replace the shadowed-local approximation")
+
+            session.finish()
+            finished = True
+        finally:
+            gate.close()
+            if not finished:
+                session.abort()
+
+
 def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
     """Completion after a `.` on a receiver whose type is reached through a `fwd`
     re-export, while the buffer is ahead of the snapshot (#332, #334).
@@ -6030,6 +6240,7 @@ def main() -> int:
         run_rename_validation(server, args.timeout)
         run_rebuild_concurrency(server, args.timeout)
         run_stale_hover(server, args.timeout)
+        run_stale_fast_features(server, args.timeout)
         run_stale_strict_requests(server, args.timeout)
         run_stale_held_release(server, args.timeout)
         run_stale_refresh(server, args.timeout)
@@ -6050,6 +6261,7 @@ def main() -> int:
         run_completion_dependency_alias_while_behind(server, args.timeout)
         run_completion_type_position_and_imported_members(server, args.timeout)
         run_completion_fwd_reexport_members(server, args.timeout)
+        run_completion_behind_from_snapshot(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
