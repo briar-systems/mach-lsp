@@ -27,6 +27,8 @@ use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
 
+use mls.frontend;
+
 # the work itself, run on the worker thread
 #
 # Takes ownership of the submitted input and returns an owned result, or nil
@@ -141,7 +143,10 @@ pub fun init(b: *Builder, f: RunFn, wake: WakeFn, ctx: ptr) {
 pub fun start(b: *Builder) bool {
     if (b.live || b.f == nil) { ret false; }
     BOUND = b;
-    thread.spawn_with(worker_main, (b)::*u8, ?b.th);
+    var c: thread.Config;
+    thread.config_default(?c);
+    c.stack_reserve = frontend.STACK_RESERVE;
+    thread.spawn_with_config(worker_main, (b)::*u8, ?c, ?b.th);
     if (b.th.tid < 0) { ret false; }
     b.live = true;
     ret true;
