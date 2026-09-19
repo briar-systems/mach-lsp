@@ -3919,6 +3919,7 @@ need = []
             # root exists the answer is an empty isolated one, so the members
             # check stays guarded on the isolated ahead-path's isIncomplete
             # signature, on which the aliased module's members must be offered.
+            # #330: guarded because the initial std load may not have finished here. A project-load barrier would let this be unconditional.
             if result.get("isIncomplete") is True:
                 labels = [item.get("label") for item in result.get("items", [])]
                 require("println" in labels and "print" in labels,
