@@ -34,6 +34,8 @@ use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
 
+use mls.frontend;
+
 # what the worker does with one dequeued body
 #
 # ctx is the opaque pointer handed to `start`; body is owned by the callback
@@ -162,7 +164,10 @@ pub fun start(q: *Queue, f: JobFn, sf: SignalFn, fx: ptr) bool {
     BOUND.f  = f;
     BOUND.sf = sf;
     BOUND.fx = fx;
-    thread.spawn_with(worker_main, (?BOUND)::*u8, ?q.th);
+    var c: thread.Config;
+    thread.config_default(?c);
+    c.stack_reserve = frontend.STACK_RESERVE;
+    thread.spawn_with_config(worker_main, (?BOUND)::*u8, ?c, ?q.th);
     if (q.th.tid < 0) { ret false; }
     q.live = true;
     ret true;
@@ -339,6 +344,7 @@ use std.allocator.page;
 use std.types.string.str_equals;
 
 use std.allocator;
+
 # the queue's contract is that every accepted body reaches the callback exactly
 # once and in push order, so the tests assert the sequence rather than a count
 

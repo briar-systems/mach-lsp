@@ -1,0 +1,16 @@
+# what the linked compiler frontend needs from the thread it runs on
+#
+# mls compiles the compiler's own frontend into itself and runs it on the
+# analysis thread and the rebuild worker. The compiler sizes the stack that
+# frontend runs on in its manifest: the parser descends MAX_NEST_DEPTH levels
+# before it refuses, 8.2 MiB of win64 frames, and the compiler reserves twice
+# that (dep/mach/mach.toml, mach#3325). A thread spawned with std's 2 MiB
+# default runs the same recursion on a quarter of that, and the first input
+# deep enough kills the process with nothing on stderr (#345). A reserve is
+# address space, not memory, so holding the compiler's bound costs nothing
+# until the frontend actually uses it.
+
+use std.types.size.usize;
+
+# the stack reserve of every thread that runs the linked frontend, in bytes
+pub val STACK_RESERVE: usize = 0x1000000;

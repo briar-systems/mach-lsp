@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- fix(#345): the analysis thread and the rebuild worker, the two threads that
+  run the linked compiler frontend, are spawned with the stack reserve the
+  compiler holds for that frontend (16 MiB, `dep/mach/mach.toml`) instead of
+  std's 2 MiB thread default. A project load deep enough to pass 2 MiB of
+  frames killed the worker with nothing on stderr, seen on windows-x86_64
+  loading a 768-module fixture once mach v5.9.0's larger comptime frames were
+  linked (#343).
+
 ## [1.2.2] - 2026-09-19
 
 One completion fix on the 1.2 surface, the third of @Angluca's reports about a
