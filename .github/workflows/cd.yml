@@ -90,6 +90,26 @@ jobs:
         with:
           submodules: true
 
+      # a shallow submodule carries no tags, and a dependency selected by
+      # version verifies against the release tag on its pinned commit, so the
+      # release build fetches that one tag for every submodule (as mach-lib.yml
+      # does for CI)
+      - name: submodule tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dep in dep/*/; do
+            sha="$(git -C "$dep" rev-parse HEAD)"
+            tag="$(git -C "$dep" ls-remote --tags origin \
+              | awk -v sha="$sha" '$1 == sha && $2 ~ /\^\{\}$/ && !found { sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2; found = 1 }')"
+            if [ -n "$tag" ]; then
+              git -C "$dep" fetch --depth=1 --no-tags origin tag "$tag"
+              echo "submodule $dep is release $tag"
+            else
+              echo "submodule $dep carries no release tag"
+            fi
+          done
+
       - name: the darwin lane landed on real silicon
         if: runner.os == 'macOS'
         env:
