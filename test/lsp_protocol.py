@@ -4063,12 +4063,17 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
     resolver now follows the `fwd` to the declaring module, through as many hops
     as the language allows.
 
-    Two receiver shapes are covered. A value of a `rec` or `uni` type offers its
-    fields or cases (#332). A `tag` type named directly as the receiver offers
-    its case selectors (#334), which is a distinct receiver kind: a tag's cases
-    are reached through the type (`Color.red`), not through a value. Both are
-    asserted same-file, imported and fwd-reached, behind (the isolated
-    `isIncomplete` path) and once caught up.
+    Three receiver shapes are covered, all resolved by the one receiver walk.
+    A value of a `rec` or `uni` type offers its fields or cases (#332). A `tag`
+    type named directly as the receiver offers its case selectors (#334): a
+    tag's cases are reached through the type (`Color.red`), not through a
+    value. And a chained receiver, `value.field.field.`, offers the members of
+    the last field's type however many hops it has (#336): each field's declared
+    type is resolved to the next record, whether that field is declared in the
+    buffer or in a loaded module. The chain asserted here crosses all three
+    kinds in one receiver: a same-file record whose field is a fwd-reached
+    record whose field is an imported record. All are asserted behind (the
+    isolated `isIncomplete` path) and once caught up.
     """
     if os.name != "posix":
         print("  completion fwd re-export members: skipped (rebuild gate needs flock)")
@@ -4090,10 +4095,14 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
         (source / "types.mach").write_text(
             "pub rec Rectangle { x: f32; y: f32; }\n"
             "pub uni Shape { Circle: i32; Square: i32; }\n"
-            "pub tag Color: u8 { red; green; blue; }\n", encoding="utf-8")
+            "pub tag Color: u8 { red; green; blue; }\n"
+            "pub rec Inner { a: i32; b: i32; }\n"
+            "pub rec Mid { deep: Inner; }\n"
+            "pub rec Outer { inner: Inner; shape: Shape; }\n", encoding="utf-8")
         # a fwds file: one hop from the declaring module
         (source / "re.mach").write_text(
-            "use fwd.types;\nfwd types.Rectangle;\nfwd types.Shape;\nfwd types.Color;\n",
+            "use fwd.types;\nfwd types.Rectangle;\nfwd types.Shape;\nfwd types.Color;\n"
+            "fwd types.Mid;\nfwd types.Outer;\n",
             encoding="utf-8")
         # a second fwds file: re-exports the re-export, so a value reached here is two hops away
         (source / "re2.mach").write_text(
@@ -4123,6 +4132,14 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
                                        f"    var v: {decl};", "    v.", "    ret 0;", "}"]
                 line = next(i for i, val in enumerate(edited) if val.strip() == "v.")
                 return "\n".join(edited) + "\n", line, len("    v.")
+
+            # a chained receiver: a local of the type, then `.field...` on it, with
+            # optional top-level prelude (a same-file decl the chain starts from)
+            def chain_probe(decl: str, chain: str, prelude: list[str]) -> tuple[str, int, int]:
+                edited = base_lines + prelude + ["", "fun probe() i32 {",
+                                                 f"    var v: {decl};", f"    v.{chain}.", "    ret 0;", "}"]
+                line = next(i for i, val in enumerate(edited) if val.strip() == f"v.{chain}.")
+                return "\n".join(edited) + "\n", line, len(f"    v.{chain}.")
 
             # a type-name receiver: a `.` on the type itself, with optional
             # top-level prelude (a same-file decl or an extra `use`)
@@ -4190,6 +4207,18 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
             require(behind(type_probe("one.Color", []), "one.Color") == ["red", "green", "blue"],
                     "a fwd-reached tag type offered no cases while behind")
 
+            # #336: a chained receiver resolves past the first hop
+            # the report's shape: an imported record whose field is a record
+            require(behind(chain_probe("one.Outer", "inner", []), "one.Outer.inner") == ["a", "b"],
+                    "a chained receiver into an imported record offered nothing while behind")
+            # a uni-typed field offers its cases
+            require(behind(chain_probe("one.Outer", "shape", []), "one.Outer.shape") == ["Circle", "Square"],
+                    "a chained receiver into a uni-typed field offered nothing while behind")
+            # three hops across all kinds: same-file Local -> fwd-reached Mid -> imported Inner
+            same_file_chain = ["pub rec Local { via: one.Mid; }"]
+            require(behind(chain_probe("Local", "via.deep", same_file_chain), "Local.via.deep") == ["a", "b"],
+                    "a three-hop chain across same-file, fwd and imported records offered nothing while behind")
+
             # caught up, each receiver still resolves through the loaded snapshot
             require(caught_up(value_probe("one.Rectangle"), "one.Rectangle") == ["x", "y"],
                     "a rec re-exported through a fwds file offered no fields caught up")
@@ -4199,6 +4228,10 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
                     "an imported tag type offered no cases caught up")
             require(caught_up(type_probe("one.Color", []), "one.Color") == ["red", "green", "blue"],
                     "a fwd-reached tag type offered no cases caught up")
+            require(caught_up(chain_probe("one.Outer", "inner", []), "one.Outer.inner") == ["a", "b"],
+                    "a chained receiver into an imported record offered nothing caught up")
+            require(caught_up(chain_probe("Local", "via.deep", same_file_chain), "Local.via.deep") == ["a", "b"],
+                    "a three-hop chain across same-file, fwd and imported records offered nothing caught up")
 
             session.finish()
             finished = True
