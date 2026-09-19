@@ -61,8 +61,8 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v4.0.0"
+version = "^4.0"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v5.8.0"
+ref = "tag/v5.9.0"
