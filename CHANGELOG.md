@@ -32,6 +32,13 @@ same asset set, CLI and options as 1.1.1.
   accessors. No behaviour change, and v5.7.0's backend-refusal reshaping
   (mach#3656) does not reach this frontend.
 
+### Test
+- test(#325): the completion tests that assert the isolated answer while the
+  buffer is ahead of the snapshot now hold the off-thread rebuild through a
+  lock-file turnstile the harness releases, so that state is controlled rather
+  than raced. The `MLS_TEST_REBUILD_GATE` environment variable driving it exists
+  for the protocol harness only and is inert when unset.
+
 ## [1.1.1] - 2026-09-19
 
 A completion fix on a 1.1 surface. No contract change: same asset set, CLI,

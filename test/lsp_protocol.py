@@ -21,6 +21,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
+try:
+    import fcntl
+except ImportError:  # windows has no flock, so the rebuild-gate tests skip there
+    fcntl = None
+
 HEADER_MAX = 8 * 1024
 BODY_MAX = 16 * 1024 * 1024
 ANY_VERSION = object()
@@ -418,6 +423,51 @@ def assert_diagnostics(message: dict[str, Any], nonempty: bool, version: int | N
         require(type(severity) is int and 1 <= severity <= 4, f"{label}.severity is invalid")
         require(diagnostic.get("source") == "mach", f"{label}.source is invalid")
         require(bool(diagnostic.get("message")), f"{label}.message is empty")
+
+
+class RebuildGate:
+    """A turnstile the worker's finished off-thread rebuilds pass through, so a
+    test can hold the snapshot behind the buffer while it asserts the isolated
+    answer instead of racing the scheduler.
+
+    The worker takes a shared lock on this file after each rebuild and drops it,
+    blocking only while this gate holds the file's exclusive lock. Held, no
+    rebuild is published and the buffer stays ahead of the snapshot, so
+    completion is answered from the isolated path (`isIncomplete`). Released,
+    held and future rebuilds flow and the snapshot catches up. `hold` and
+    `release` are idempotent, so a test toggles per phase. The path is handed to
+    the server through the `MLS_TEST_REBUILD_GATE` environment variable, which
+    the supervisor passes to the worker it spawns.
+
+    POSIX only: this drives the worker's flock turnstile with an exclusive lock,
+    and Windows Python has no flock, so the tests using it skip there.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.path = (Path(directory) / "rebuild.gate").resolve()
+        self.path.write_bytes(b"")
+        self.fd = os.open(self.path, os.O_RDWR)
+        self.held = False
+
+    @property
+    def env(self) -> dict[str, str]:
+        return {"MLS_TEST_REBUILD_GATE": str(self.path)}
+
+    def hold(self) -> None:
+        """Keep finished rebuilds from being published until release()."""
+        if not self.held:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            self.held = True
+
+    def release(self) -> None:
+        """Let held and future rebuilds through, so the snapshot catches up."""
+        if self.held:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.held = False
+
+    def close(self) -> None:
+        self.release()
+        os.close(self.fd)
 
 
 def write_project(parent: Path, project_id: str, value: int) -> tuple[Path, Path, str]:
@@ -3593,10 +3643,15 @@ def run_completion_context(server: Path, timeout: float) -> None:
 
 def run_completion_freshness(server: Path, timeout: float) -> None:
     """Queued completion uses current text without consuming stale semantics."""
+    if os.name != "posix":
+        print("  completion freshness: skipped (rebuild gate needs flock)")
+        return
     with tempfile.TemporaryDirectory(prefix="mls-compl-fresh-") as directory:
         root = Path(directory).resolve()
         main, _, text = write_project(root, "complfresh", 5)
-        session = LspSession(server, root, timeout)
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
@@ -3646,6 +3701,7 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
             require(session.timings[-1][1] < 1.0,
                     f"isolated completion blocked for {session.timings[-1][1]:.3f}s")
 
+            gate.release()
             session.diagnostics(main.as_uri(), version)
             rebuilt = settled_result(
                 session, "textDocument/completion",
@@ -3662,6 +3718,7 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
             session.finish()
             finished = True
         finally:
+            gate.close()
             if not finished:
                 session.abort()
 
@@ -3679,10 +3736,15 @@ def run_completion_alias_while_behind(server: Path, timeout: float) -> None:
     seen yet, one whose file was written after the load, offers nothing until
     the rebuild lands, which is stated here rather than left implied.
     """
+    if os.name != "posix":
+        print("  completion alias while behind: skipped (rebuild gate needs flock)")
+        return
     with tempfile.TemporaryDirectory(prefix="mls-compl-alias-") as directory:
         root = Path(directory).resolve()
         main, _, text = write_project(root, "complalias", 5)
-        session = LspSession(server, root, timeout)
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
@@ -3734,9 +3796,11 @@ def run_completion_alias_while_behind(server: Path, timeout: float) -> None:
             require(behind("later.").get("items") == [],
                     "a use the snapshot has not seen offered names from somewhere")
 
+            gate.release()
             session.finish()
             finished = True
         finally:
+            gate.close()
             if not finished:
                 session.abort()
 
@@ -3753,6 +3817,9 @@ def run_completion_dependency_alias_while_behind(server: Path, timeout: float) -
     resident. The worker surviving with an `isIncomplete` answer that carries
     the module's members is the whole point of this case.
     """
+    if os.name != "posix":
+        print("  completion dependency alias while behind: skipped (rebuild gate needs flock)")
+        return
     repo = Path(__file__).resolve().parent.parent
     std = repo / "dep" / "std"
     require((std / "mach.toml").is_file(),
@@ -3808,7 +3875,9 @@ need = []
                 '}\n')
         main = source / "main.mach"
         main.write_text(base, encoding="utf-8")
-        session = LspSession(server, root, timeout)
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
@@ -3843,20 +3912,22 @@ need = []
                     f"a dependency-module alias completion crashed or errored while behind: {answer!r}")
             # a worker fault on this path returns an error response, which the
             # request helper raises, so reaching here means the worker survived
-            # loading the dependency's sources - the regression this guards.
-            # Whether the buffer is still ahead at completion time is a timing
-            # question: a fast rebuild can catch up and answer from the loaded
-            # view instead. When the isolated ahead-path was taken (its
-            # isIncomplete signature), the aliased module's members must be
-            # offered, which is the whole point of that path.
-            if result.get("isIncomplete") is True:
-                labels = [item.get("label") for item in result.get("items", [])]
-                require("println" in labels and "print" in labels,
-                        f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
+            # loading the dependency's sources - the regression this guards. The
+            # gate holds the rebuild, so the buffer is ahead at completion time
+            # and the isolated ahead-path is the one taken: its `isIncomplete`
+            # signature is asserted, and on it the aliased module's members must
+            # be offered, which is the whole point of that path.
+            require(result.get("isIncomplete") is True,
+                    f"the buffer did not stay ahead of the snapshot while gated: {answer!r}")
+            labels = [item.get("label") for item in result.get("items", [])]
+            require("println" in labels and "print" in labels,
+                    f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
 
+            gate.release()
             session.finish()
             finished = True
         finally:
+            gate.close()
             if not finished:
                 session.abort()
 
@@ -3878,13 +3949,18 @@ def run_completion_type_position_and_imported_members(server: Path, timeout: flo
     accident. The type-position alias is also checked once caught up, since its
     cause - the expression-only receiver pivot - was not behind-only.
     """
+    if os.name != "posix":
+        print("  completion receiver resolution: skipped (rebuild gate needs flock)")
+        return
     with tempfile.TemporaryDirectory(prefix="mls-compl-recv-") as directory:
         root = Path(directory).resolve()
         main, defs, text = write_project(root, "recv", 5)
         # a public union in the snapshot, so an imported `uni` value can be probed
         defs.write_text(defs.read_text(encoding="utf-8")
                         + "\npub uni Tag { A: i32; B: i32; }\n", encoding="utf-8")
-        session = LspSession(server, root, timeout)
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
@@ -3901,6 +3977,7 @@ def run_completion_type_position_and_imported_members(server: Path, timeout: flo
                 return "\n".join(edited) + "\n", edited
 
             def behind(extra: list[str], needle: str) -> list[str]:
+                gate.hold()
                 body, edited = typed_text(extra)
                 line = next(i for i, v in enumerate(edited) if v == needle)
                 notifications = []
@@ -3920,6 +3997,7 @@ def run_completion_type_position_and_imported_members(server: Path, timeout: flo
                 return [item.get("label") for item in result.get("items", [])]
 
             def caught_up(extra: list[str], needle: str) -> list[str]:
+                gate.release()
                 body, edited = typed_text(extra)
                 line = next(i for i, v in enumerate(edited) if v == needle)
                 version[0] += 1
@@ -3963,9 +4041,11 @@ def run_completion_type_position_and_imported_members(server: Path, timeout: flo
             require("main" not in uni_members,
                     f"an imported union value fell back to the file list: {uni_members!r}")
 
+            gate.release()
             session.finish()
             finished = True
         finally:
+            gate.close()
             if not finished:
                 session.abort()
 

@@ -20,6 +20,7 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.size.usize;
 
 use std.sync.atomic;
 use std.sync.mutex;
@@ -75,6 +76,44 @@ pub rec Builder {
 # `thread.spawn_with` hands the entry one opaque pointer and std has no
 # thread-local storage. One server runs one builder.
 var BOUND: *Builder = nil;
+
+# test-only rebuild turnstile
+#
+# The "while behind the snapshot" protocol tests need the buffer to stay ahead
+# of the last completed rebuild at the moment they ask for a completion: that
+# lag is the state whose isolated answer they assert. With nothing to hold it,
+# the off-thread rebuild can land first and the assertion races the scheduler.
+# When the environment variable `MLS_TEST_REBUILD_GATE` names a file, every
+# finished off-thread rebuild passes through this turnstile before its result is
+# published, taking a shared lock on that file and dropping it again. The harness
+# holds an exclusive lock across the window in which the buffer must stay ahead,
+# so the acquire blocks for exactly that window and is instant otherwise: the
+# harness decides when a finished rebuild becomes visible, with no wait on its
+# side and no timeout on ours. The variable is unset in normal operation, the
+# lock file is never opened, and nothing else changes. It exists only for the
+# protocol harness and is not product surface.
+val GATE_CAP:     usize = 4096;
+var GATE_CHECKED: bool  = false;
+var GATE_FD:      usize = 0;
+var GATE_PATH:    [GATE_CAP]u8;
+
+# pass one finished off-thread result through the turnstile. Only the worker
+# thread ever runs this, so its state needs no lock. The shared-lock acquire is
+# the wait: it returns at once unless the harness holds the file's exclusive
+# lock, and it is a lock handoff, not a poll.
+fun gate_pass() {
+    if (!GATE_CHECKED) {
+        GATE_CHECKED = true;
+        GATE_FD      = os.INVALID_HANDLE;
+        if (os.getenv("MLS_TEST_REBUILD_GATE", ?GATE_PATH[0], GATE_CAP) > 0) {
+            var h: usize = os.INVALID_HANDLE;
+            if (os.open(os.working_dir(), ?GATE_PATH[0], os.O_RDONLY, 0, ?h) == 0) { GATE_FD = h; }
+        }
+    }
+    if (GATE_FD == os.INVALID_HANDLE) { ret; }
+    os.lock_fd(GATE_FD, os.LOCK_SH);
+    os.lock_fd(GATE_FD, os.LOCK_UN);
+}
 
 # construct an idle builder
 # ---
@@ -204,6 +243,7 @@ fun worker_main(arg: *u8) {
 
         if (input != nil) {
             val out: ptr = b.f(input);
+            gate_pass();
             mutex.lock(?b.lock);
             b.result = out;
             # a run that produced nothing still frees the slot, or the caller
