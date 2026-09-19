@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-19
+
+Two completion fixes on the 1.2 surface, both reported by @Angluca and both
+about a `.` on a receiver the resolver could not reach while the buffer is ahead
+of the snapshot. No contract change: same asset set, CLI and options as 1.2.0.
+
+**The linked mach is unchanged at v5.8.0**, and std at v4.0.0.
+
+### Fixed
+- fix(#332): completion after a `.` no longer comes back empty when the
+  receiver's type is reached through a `fwd` re-export. While the buffer is
+  ahead of the snapshot the receiver's type is resolved against the snapshot
+  through the file's `use` and `fwd` text, and the resolver stopped at the
+  re-exporting module, which forwards the type without declaring it, so the
+  members were empty. It now follows the re-export to the declaring module,
+  through as many `fwd` hops as the language allows, for both a rec and a uni.
+  Reported by @Angluca.
+- fix(#334): completion after a tag type name's `.` now offers the tag's case
+  selectors. A tag's cases are named through the type (`T.c`), so `T.` is a
+  type-name receiver, a kind the resolver did not have, and it offered nothing
+  same-file or imported. It is now the fourth receiver kind, resolved same-file
+  from the buffer and otherwise against the snapshot through the file's `use`
+  declarations, following `fwd` re-exports like the imported-value kind. The
+  other half of @Angluca's #332 report.
+
 ## [1.2.0] - 2026-09-19
 
 The server negotiates the LSP position encoding, and the linked mach moves to
