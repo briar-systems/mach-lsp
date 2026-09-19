@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-19
+
+One completion fix on the 1.2 surface, the third of @Angluca's reports about a
+`.` on a receiver the resolver could not reach while the buffer is ahead of the
+snapshot. No contract change: same asset set, CLI and options as 1.2.0.
+
+**The linked mach is unchanged at v5.8.0**, and std at v4.0.0.
+
 ### Fixed
 - fix(#336): completion after a `.` on a chained receiver (`value.field.`) now
   offers the members of the last field's type however many hops it has, while
