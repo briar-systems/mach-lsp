@@ -2303,75 +2303,16 @@ pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: 
     ret record_decl(w, root, tid);
 }
 
-# the public rec / uni named `type_name` in the module whose FQN is `module_fqn`,
-# read from `root`'s snapshot
+# the TypeSite a module's public type name resolves to, following a `fwd`
+# re-export to the declaring module (#332, #334)
 #
 # The text bridge for member completion while the buffer is ahead of the
-# snapshot: the isolated editor session cannot resolve an imported type, so the
-# type's module and name are recovered from the buffer as text - its `use` and
-# the written annotation - and looked up here, against the snapshot, the one
-# identity that may cross sessions. The declaring module's own Ast and text back
-# the returned site, exactly as `record_decl` does for a sema-resolved nominal.
-# none when the module is not loaded or has no public rec / uni of that name.
-# ---
-# w:          the workspace
-# root:       the loaded root, or nil
-# module_fqn: the declaring module's fully-qualified name
-# type_name:  the rec / uni name to find among the module's public symbols
-# ret:        some(RecordSite), or none
-pub fun record_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: str) opt[RecordSite] {
-    if (root == nil || module_fqn == nil || type_name == nil) { ret opt[RecordSite].none{}; }
-    val mo: opt[sess.ModuleId] = module_by_fqn(w, root, module_fqn);
-    if (sel mo.none) { ret opt[RecordSite].none{}; }
-    val mvo: opt[ModuleView] = module_view(w, root, mo.some);
-    if (sel mvo.none) { ret opt[RecordSite].none{}; }
-    val mv: ModuleView = mvo.some;
-    if (mv.rr == nil) { ret opt[RecordSite].none{}; }
-    var i: u32 = 0;
-    for (i < mv.rr.pub_count) {
-        val sym: *rslv.Symbol = ?mv.rr.symbols[i];
-        val no:  opt[str]     = intern.lookup(?root.s.interner, sym.name);
-        if (sel no.some) {
-            if (str_equals(no.some, type_name)) {
-                val site: opt[RecordSite] = record_site_for_symbol(w, root, mo.some, mv, sym);
-                if (sel site.some) { ret site; }
-            }
-        }
-        i = i + 1;
-    }
-    ret opt[RecordSite].none{};
-}
-
-# the record / union site a module's public symbol names, following a `fwd`
-# re-export to the module that declares the type (#332)
-#
-# A symbol that carries its own declaration is a rec / uni declared right here.
-# A `fwd raylib.Rectangle;` binding carries the target's kind but no DeclId of
-# its own: it names its definition by canonical name, kind and origin module,
-# and `defining_symbol_in` walks that to the declaration-bearing symbol in the
-# module that declares it. The origin is flattened by the compiler, so a chain
-# of re-exports resolves in one step to its ultimate declaration, however many
-# `fwd` hops the language put between them. The site is then built from the
-# declaring module's own view, so its fields read from where the type lives.
-fun record_site_for_symbol(w: *Workspace, root: *Root, mid: sess.ModuleId, mv: ModuleView, sym: *rslv.Symbol) opt[RecordSite] {
-    if (sym.decl != id.DECL_NIL) {
-        ret record_site_from(mid, sym.decl, mv.file_id, sym.name, mv.a, mv.text);
-    }
-    val def: *rslv.Symbol = defining_symbol_in(root, sym);
-    if (def == nil || def.decl == id.DECL_NIL) { ret opt[RecordSite].none{}; }
-    val dmvo: opt[ModuleView] = module_view(w, root, def.origin);
-    if (sel dmvo.none) { ret opt[RecordSite].none{}; }
-    val dmv: ModuleView = dmvo.some;
-    ret record_site_from(def.origin, def.decl, dmv.file_id, def.name, dmv.a, dmv.text);
-}
-
-# the TypeSite a module's public type name resolves to, following a `fwd`
-# re-export to the declaring module (#334)
-#
-# Like `record_in_module`, but admits any type-declaring kind, so a `tag` (whose
-# members are named through the type) resolves as well as a rec / uni. This is
-# the type-name receiver kind's bridge into the snapshot, the way
-# `record_in_module` is the imported-value kind's.
+# snapshot: the buffer names a module and a type as bytes, and this is where
+# those bytes cross into the snapshot's identity. It admits any type-declaring
+# kind, so a `tag` (whose members are named through the type) resolves as well
+# as a rec / uni. A public symbol that carries its own DeclId is a local
+# declaration; one that does not is a `fwd` re-export, followed to the module
+# that declares it, however many hops sit between them.
 pub fun type_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: str) opt[TypeSite] {
     if (root == nil || module_fqn == nil || type_name == nil) { ret opt[TypeSite].none{}; }
     val mo: opt[sess.ModuleId] = module_by_fqn(w, root, module_fqn);
@@ -2396,7 +2337,9 @@ pub fun type_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: s
 }
 
 # the TypeSite a module's public symbol names, following a `fwd` re-export to the
-# declaring module, the `TypeSite` twin of `record_site_for_symbol` (#334)
+# declaring module. `defining_symbol_in` walks the re-export to the
+# declaration-bearing symbol, and the compiler flattens the origin, so a chain
+# of re-exports resolves in one step (#332)
 fun type_site_for_symbol(w: *Workspace, root: *Root, mid: sess.ModuleId, mv: ModuleView, sym: *rslv.Symbol) opt[TypeSite] {
     if (sym.decl != id.DECL_NIL) {
         ret type_site_from(mid, sym.decl, mv.file_id, mv.a, mv.text);
@@ -2505,7 +2448,7 @@ pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: sr
 # build a TypeSite for the decl `decl` in `a` (backed by `file`), or
 # none when the decl is absent or declares no type name. the one place a new
 # type-declaring kind is admitted
-fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, text: positions.Text) opt[TypeSite] {
+pub fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, text: positions.Text) opt[TypeSite] {
     val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
     if (sel d_opt.none) { ret opt[TypeSite].none{}; }
     val d: *adecl.Decl = d_opt.some;

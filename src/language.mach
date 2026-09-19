@@ -356,10 +356,15 @@ fun field_index(rs: project.RecordSite, query_file: *src.SourceFile, query: toke
 # carries no type node. the declaring module's file backs the span, so a
 # cross-module field's type renders
 fun field_type_text(rs: project.RecordSite, tn: *decl.TypedName, alloc: *Allocator) str {
+    ret typed_name_type_text(rs.a, rs.text, tn, alloc);
+}
+
+# the written type of `tn` in `a`, as source text, or nil when it has none
+fun typed_name_type_text(a: *ast.Ast, text: positions.Text, tn: *decl.TypedName, alloc: *Allocator) str {
     if (tn.ty == id.TYPE_NIL) { ret nil; }
-    val to: opt[*atype.Type] = ast.get_type(rs.a, tn.ty);
+    val to: opt[*atype.Type] = ast.get_type(a, tn.ty);
     if (sel to.none) { ret nil; }
-    ret positions.span_text(rs.text, to.some.span, alloc);
+    ret positions.span_text(text, to.some.span, alloc);
 }
 
 # render a single doc-component description span as prose,
@@ -1959,12 +1964,12 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         an.a        = view.a;
         an.rr       = view.rr;
         an.own      = view.module;
+        an.own_fid  = view.file_id;
         an.root     = view.root;
 
         if (dot > 0 && file.text[dot - 1] == '.') {
-            if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1))                   { ret; }
-            if (emit_module_alias_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
-            if (emit_tag_type_cases(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false))       { ret; }
+            if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1))               { ret; }
+            if (emit_receiver_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
             reply_empty_completion(alloc, id_raw, false);
             ret;
         }
@@ -1979,13 +1984,12 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
         }
         if (dot > 0 && file.text[dot - 1] == '.') {
             if (an.root != nil) {
-                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1))                   { ret; }
-                if (emit_module_alias_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
+                if (emit_member_completions(ws, an, alloc, id_raw, prefix, dot - 1)) { ret; }
             }
             or {
                 if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
             }
-            if (emit_tag_type_cases(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
+            if (emit_receiver_members(ws, an.root, an, alloc, id_raw, prefix, dot - 1, false)) { ret; }
             reply_empty_completion(alloc, id_raw, false);
             ret;
         }
@@ -2000,9 +2004,7 @@ pub fun completion(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Al
     if (dot > 0 && file.text[dot - 1] == '.') {
         if (emit_editor_member_completions(es, an, alloc, id_raw, prefix, dot - 1)) { ret; }
         val root: *project.Root = project.root_for_loaded(ws, uri);
-        if (emit_module_alias_members(ws, root, an, alloc, id_raw, prefix, dot - 1, true)) { ret; }
-        if (emit_imported_field_members(ws, root, an, alloc, id_raw, prefix, dot - 1))     { ret; }
-        if (emit_tag_type_cases(ws, root, an, alloc, id_raw, prefix, dot - 1, true))       { ret; }
+        if (emit_receiver_members(ws, root, an, alloc, id_raw, prefix, dot - 1, true)) { ret; }
         reply_empty_completion(alloc, id_raw, true);
         ret;
     }
@@ -2937,205 +2939,272 @@ fun emit_module_members(ws: *project.Workspace, root: *project.Root, file: *src.
     ret true;
 }
 
-# offer a module's public symbols after an alias resolved through `root`'s
-# snapshot rather than the requesting analysis (#297, #321)
+# the longest receiver chain the walk follows, `a.b.c...`
+val RECEIVER_MAX_HOPS: usize = 16;
+
+# offer the members of the receiver before a `.`, resolving it through `root`'s
+# snapshot however many hops it has (#297, #321, #332, #334, #336)
 #
-# The alias before the dot is matched by the bytes it is spelled with, not by an
-# Ast node, so it resolves the same whether the alias is used as a value
-# (`vector.`) or as a type qualifier (`var v: vector.`) - the AST distinguishes
-# the two, the text does not, and completion should answer in both (#321). This
-# is the one bridge that may read the snapshot for a buffer request: while the
-# buffer is ahead, the isolated session cannot resolve a `use`, but the `use`
-# still names its module as text, and that name is found in the snapshot. Caught
-# up, the same match runs against the loaded root, which is why `incomplete` is a
-# parameter: it reports which analysis answered. A `use` the snapshot has not
-# seen yet offers nothing until the rebuild lands.
+# While the buffer is ahead of the snapshot, the isolated session cannot type a
+# value whose type comes from another module, so a receiver's members are found
+# by resolving it as text against the snapshot. Every receiver is a chain of
+# identifiers, `a.b.c`, and this is one walk over that chain rather than a case
+# per receiver shape: the head is resolved to a type site (or a module) by what
+# it names, and each further segment is a field of the site so far, whose
+# declared type is resolved to the next site. The head kinds are a module alias
+# (bound by a `use`, whose next segment names a type in that module), a value
+# binding (whose written type annotation names its type), or a type name itself
+# (a tag, whose cases are reached through the type). A field declared in the
+# buffer resolves its type by text through the buffer's `use`s, one declared in
+# a loaded module through that module's own resolution, and a `fwd` re-export is
+# followed to the declaring module at every hop. Caught up, the same walk runs
+# against the loaded root, which is why `incomplete` is a parameter: it reports
+# which analysis answered. A name the snapshot has not seen yet offers nothing
+# until the rebuild lands.
 # ---
-# root:       the loaded root the alias is resolved against, or nil
+# root:       the loaded root the chain is resolved against, or nil
 # an:         the analysis whose buffer and `use` decls are read
 # dot:        offset of the `.`
-# incomplete: whether the snapshot the names come from is behind the buffer
-fun emit_module_alias_members(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+# incomplete: whether the snapshot the members come from is behind the buffer
+fun emit_receiver_members(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
     alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize, incomplete: bool) bool {
     if (root == nil || dot == 0) { ret false; }
-    val receiver: token.Span = ident_prefix_before(an.text.file, dot);
-    if (receiver.len == 0) { ret false; }
+    var segs: [RECEIVER_MAX_HOPS]token.Span;
+    val n:    usize = receiver_chain(an.text.file, dot, ?segs[0]);
+    if (n == 0) { ret false; }
 
-    var i: usize = 0;
-    for (i < an.a.decl_len) {
-        val d: *decl.Decl = ?an.a.decls[i];
-        i = i + 1;
-        if (d.kind != decl.DECL_KIND_USE) { cnt; }
-        val u:     *decl.DeclUse = ?d.data.use_;
-        var alias: token.Span    = u.alias;
-        if (alias.len == 0)                                                          { alias = path_leaf(an.text, u.path); }
-        if (!features.span_bytes_equal(an.text.file, alias, an.text.file, receiver)) { cnt; }
-        val fqn: str = positions.span_text(an.text, u.path, alloc);
-        if (fqn == nil) { ret false; }
-        val mo: opt[sess.ModuleId] = project.module_by_fqn(ws, root, fqn);
-        strutil.str_free(alloc, fqn);
-        if (sel mo.none) { ret false; }
-        ret emit_module_members(ws, root, an.text.file, alloc, id_raw, prefix, mo.some, incomplete);
+    var cur: opt[project.TypeSite] = opt[project.TypeSite].none{};
+    var i:   usize                 = 1;
+
+    # a module alias alone offers the module's names; followed by a segment,
+    # that segment names a type in the module
+    val mo: opt[sess.ModuleId] = module_alias_of(ws, root, an, alloc, segs[0]);
+    if (sel mo.some) {
+        if (n == 1) { ret emit_module_members(ws, root, an.text.file, alloc, id_raw, prefix, mo.some, incomplete); }
+        var path: token.Span;
+        path.offset = segs[0].offset;
+        path.len    = (segs[1].offset + segs[1].len) - segs[0].offset;
+        cur         = type_site_for_written(ws, root, an, alloc, path);
+        i           = 2;
     }
-    ret false;
+    or {
+        val bound: opt[project.TypeSite] = binding_type_site(ws, root, an, alloc, segs[0]);
+        if (sel bound.some) { cur = bound; }
+        or                  { cur = type_site_for_written(ws, root, an, alloc, segs[0]); }
+    }
+    if (sel cur.none) { ret false; }
+
+    var site: project.TypeSite = cur.some;
+    for (i < n) {
+        val next: opt[project.TypeSite] = field_type_site(ws, root, an, alloc, site, segs[i]);
+        if (sel next.none) { ret false; }
+        site = next.some;
+        i    = i + 1;
+    }
+    ret emit_type_site_members(an, alloc, id_raw, prefix, site, incomplete);
 }
 
-# offer the fields of a value whose record / union type is declared in another
-# module, read from `root`'s snapshot, while the buffer is ahead of it (#321)
-#
-# The isolated session types a value by its own file alone, so a value of an
-# imported type (`var v: vector.Vector[u8]; v.`) has no resolvable type there and
-# `emit_editor_member_completions` - which only lists a same-file record's fields
-# - answers nothing. The value still resolves to its own binding, whose written
-# type annotation names the type as text; that name is resolved against the
-# snapshot the same way an alias is, and the record's fields are listed from
-# there. This is the third receiver kind after a same-file field and a module
-# alias, and like the alias bridge it only reaches the snapshot by text.
-# ---
-# root: the loaded root the type is resolved against, or nil
-# an:   the isolated editor analysis of the buffer
-# dot:  offset of the `.`
-fun emit_imported_field_members(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
-    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize) bool {
-    if (root == nil || dot == 0) { ret false; }
-    val eid: id.ExprId = ast.offset_to_expr(an.a, dot - 1);
-    if (eid == id.EXPR_NIL)                                                         { ret false; }
-    if (an.rr == nil || an.rr.expr_resolved == nil || eid::u32 >= an.rr.expr_count) { ret false; }
-    val sid: rslv.SymbolId = an.rr.expr_resolved[eid];
-    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret false; }
-    val sym: *rslv.Symbol = ?an.rr.symbols[sid];
-    if (sym.decl == id.DECL_NIL) { ret false; }
-
-    val do_: opt[*decl.Decl] = ast.get_decl(an.a, sym.decl);
-    if (sel do_.none) { ret false; }
-    val d: *decl.Decl = do_.some;
-    if (d.kind != decl.DECL_KIND_VAR && d.kind != decl.DECL_KIND_VAL) { ret false; }
-    val ty: id.TypeId = d.data.bind.ty;
-    if (ty == id.TYPE_NIL) { ret false; }
-    val to_: opt[*atype.Type] = ast.get_type(an.a, ty);
-    if (sel to_.none) { ret false; }
-    val t: *atype.Type = to_.some;
-    if (t.kind != atype.TYPE_KIND_NAMED) { ret false; }
-
-    val rso: opt[project.RecordSite] = record_for_type_path(ws, root, an, alloc, t.data.named.name);
-    if (sel rso.none) { ret false; }
-    ret emit_record_fields(an, alloc, id_raw, prefix, rso.some, true);
+# the identifier chain ending at `dot`, `a.b.c` as its segments in source
+# order, or 0 when no identifier ends there. capped at RECEIVER_MAX_HOPS
+fun receiver_chain(file: *src.SourceFile, dot: usize, out: *token.Span) usize {
+    var n:   usize = 0;
+    var end: usize = dot;
+    for (n < RECEIVER_MAX_HOPS) {
+        val seg: token.Span = ident_prefix_before(file, end);
+        if (seg.len == 0) { brk; }
+        out[n] = seg;
+        n      = n + 1;
+        if (seg.offset == 0 || file.text[seg.offset - 1] != '.') { brk; }
+        end = seg.offset - 1;
+    }
+    # collected last-first; put the segments in source order
+    var lo: usize = 0;
+    for (n > 0 && lo < n - 1 - lo) {
+        val tmp: token.Span = out[lo];
+        out[lo]         = out[n - 1 - lo];
+        out[n - 1 - lo] = tmp;
+        lo              = lo + 1;
+    }
+    ret n;
 }
 
-# resolve the written type path `name` against `root`'s snapshot to the rec / uni
-# it names, through the buffer's `use` declarations (#321)
-#
-# `name` is a type annotation as written (`vector.Vector`, or a bare `res`). A
-# qualified path's head is a module alias, so the whole `use` path is the module
-# and the path's leaf is the type. A bare name is a symbol import, so the module
-# is the `use` path without its leaf and the type is that leaf. Either way the
-# module and type names are bytes handed to the snapshot, which owns the one
-# identity a buffer request may cross into.
-fun record_for_type_path(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
-    alloc: *Allocator, name: token.Span) opt[project.RecordSite] {
-    val srctext: str        = an.text.file.text;
-    val leaf:    token.Span = np.leaf(srctext, name);
-    val qual:    token.Span = np.prefix(srctext, name);
-    if (leaf.len == 0) { ret opt[project.RecordSite].none{}; }
-
-    var i: usize = 0;
+# the module a `use` in the buffer binds `name` to, or none when `name` is not
+# a module alias. the head is matched by the bytes it is spelled with, so it
+# resolves the same whether it is used as a value or as a type qualifier (#321)
+fun module_alias_of(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, name: token.Span) opt[sess.ModuleId] {
+    val srctext: str   = an.text.file.text;
+    var i:       usize = 0;
     for (i < an.a.decl_len) {
         val d: *decl.Decl = ?an.a.decls[i];
         i = i + 1;
         if (d.kind != decl.DECL_KIND_USE) { cnt; }
         val u:     *decl.DeclUse = ?d.data.use_;
         var bound: token.Span    = u.alias;
-        if (bound.len == 0) { bound = np.leaf(srctext, u.path); }
-
-        if (qual.len > 0) {
-            if (!features.span_bytes_equal(an.text.file, bound, an.text.file, qual)) { cnt; }
-            ret record_in_module_owned(ws, root, alloc,
-                positions.span_text(an.text, u.path, alloc),
-                positions.span_text(an.text, leaf, alloc));
-        }
-        or {
-            if (!features.span_bytes_equal(an.text.file, bound, an.text.file, leaf)) { cnt; }
-            ret record_in_module_owned(ws, root, alloc,
-                positions.span_text(an.text, np.prefix(srctext, u.path), alloc),
-                positions.span_text(an.text, np.leaf(srctext, u.path), alloc));
-        }
+        if (bound.len == 0)                                                      { bound = np.leaf(srctext, u.path); }
+        if (!features.span_bytes_equal(an.text.file, bound, an.text.file, name)) { cnt; }
+        val fqn: str = positions.span_text(an.text, u.path, alloc);
+        if (fqn == nil) { ret opt[sess.ModuleId].none{}; }
+        val mo: opt[sess.ModuleId] = project.module_by_fqn(ws, root, fqn);
+        strutil.str_free(alloc, fqn);
+        ret mo;
     }
-    ret opt[project.RecordSite].none{};
+    ret opt[sess.ModuleId].none{};
 }
 
-# look up a record by module FQN and type name, freeing the two owned name
-# strings afterward. the ownership seam between `record_for_type_path`, which
-# reads them from the buffer, and `project.record_in_module`, which only borrows
-fun record_in_module_owned(ws: *project.Workspace, root: *project.Root, alloc: *Allocator,
-    module_fqn: str, type_name: str) opt[project.RecordSite] {
-    if (module_fqn == nil || type_name == nil) {
-        if (module_fqn != nil) { strutil.str_free(alloc, module_fqn); }
-        if (type_name != nil)  { strutil.str_free(alloc, type_name); }
-        ret opt[project.RecordSite].none{};
-    }
-    val rso: opt[project.RecordSite] = project.record_in_module(ws, root, module_fqn, type_name);
-    strutil.str_free(alloc, module_fqn);
-    strutil.str_free(alloc, type_name);
-    ret rso;
+# the type site of the value binding `head` names in the buffer, from its
+# written type annotation. the isolated session resolves a value to its own
+# binding even when it cannot type it, and the annotation names the type as text
+fun binding_type_site(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, head: token.Span) opt[project.TypeSite] {
+    if (head.len == 0) { ret opt[project.TypeSite].none{}; }
+    val eid: id.ExprId = ast.offset_to_expr(an.a, head.offset + head.len - 1);
+    if (eid == id.EXPR_NIL)                                                         { ret opt[project.TypeSite].none{}; }
+    if (an.rr == nil || an.rr.expr_resolved == nil || eid::u32 >= an.rr.expr_count) { ret opt[project.TypeSite].none{}; }
+    val sid: rslv.SymbolId = an.rr.expr_resolved[eid];
+    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret opt[project.TypeSite].none{}; }
+    val sym: *rslv.Symbol = ?an.rr.symbols[sid];
+    if (sym.decl == id.DECL_NIL) { ret opt[project.TypeSite].none{}; }
+    val do_: opt[*decl.Decl] = ast.get_decl(an.a, sym.decl);
+    if (sel do_.none) { ret opt[project.TypeSite].none{}; }
+    val d: *decl.Decl = do_.some;
+    if (d.kind != decl.DECL_KIND_VAR && d.kind != decl.DECL_KIND_VAL) { ret opt[project.TypeSite].none{}; }
+    ret buffer_type_site(ws, root, an, alloc, d.data.bind.ty);
 }
 
-# offer a tag type's case selectors after `T.`, the type-name receiver kind (#334)
-#
-# A tag's cases are named through the type (`T.c`), so the receiver a user types
-# is the type name, not a value. This is the fourth receiver kind, alongside the
-# same-file field, the module alias, and the imported value. Same-file the tag is
-# found in the buffer's own analysis; otherwise its path is resolved against the
-# snapshot through the buffer's `use` declarations, exactly as an imported
-# value's type is, and a `fwd` re-export is followed to the module that declares
-# the tag. `dot` is the offset of the `.`; `incomplete` reports which analysis
-# answered, as in the sibling bridges.
-fun emit_tag_type_cases(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
-    alloc: *Allocator, id_raw: str, prefix: token.Span, dot: usize, incomplete: bool) bool {
-    if (dot == 0) { ret false; }
-    val leaf: token.Span = ident_prefix_before(an.text.file, dot);
-    if (leaf.len == 0) { ret false; }
-
-    # widen to a `qual.leaf` receiver when the identifier is dotted onto a name
-    var recv: token.Span = leaf;
-    if (leaf.offset > 0 && an.text.file.text[leaf.offset - 1] == '.') {
-        val q: token.Span = ident_prefix_before(an.text.file, leaf.offset - 1);
-        if (q.len > 0) {
-            recv.offset = q.offset;
-            recv.len    = (leaf.offset + leaf.len) - q.offset;
-        }
-    }
-
-    # a tag declared in the buffer, when the receiver is a bare name
-    if (recv.offset == leaf.offset) {
-        val sf: *decl.Decl = same_file_tag_decl(an, leaf);
-        if (sf != nil) { ret emit_tag_cases_from_decl(an, alloc, id_raw, prefix, an.a, an.text, sf, incomplete); }
-    }
-
-    # otherwise resolve the type path against the snapshot through the `use`s
-    val tso: opt[project.TypeSite] = type_site_for_type_path(ws, root, an, alloc, recv);
-    if (sel tso.none) { ret false; }
-    val ts: project.TypeSite = tso.some;
-    if (ts.kind != decl.DECL_KIND_TAG) { ret false; }
+# the type site of the field `field` of the rec / uni at `ts`, one hop of the
+# receiver walk. the field's declared type resolves in the module that declares
+# it: by text through the buffer's `use`s when `ts` is in the buffer, otherwise
+# through that loaded module's own resolution
+fun field_type_site(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, ts: project.TypeSite, field: token.Span) opt[project.TypeSite] {
     val d_opt: opt[*decl.Decl] = ast.get_decl(ts.a, ts.decl);
-    if (sel d_opt.none) { ret false; }
-    ret emit_tag_cases_from_decl(an, alloc, id_raw, prefix, ts.a, ts.text, d_opt.some, incomplete);
+    if (sel d_opt.none) { ret opt[project.TypeSite].none{}; }
+    val d:     *decl.Decl = d_opt.some;
+    var start: u32;
+    var len:   u32;
+    if (d.kind == decl.DECL_KIND_REC) {
+        start = d.data.rec_.fields_start;
+        len   = d.data.rec_.fields_len;
+    }
+    or (d.kind == decl.DECL_KIND_UNI) {
+        start = d.data.uni_.fields_start;
+        len   = d.data.uni_.fields_len;
+    }
+    or { ret opt[project.TypeSite].none{}; }
+
+    var i: u32 = 0;
+    for (i < len) {
+        val tn: *decl.TypedName = ?ts.a.typed_names[start + i];
+        i = i + 1;
+        if (!features.span_bytes_equal(ts.text.file, tn.name, an.text.file, field)) { cnt; }
+        if (ts.a == an.a)                                                           { ret buffer_type_site(ws, root, an, alloc, tn.ty); }
+        ret module_type_site(ws, root, ts.origin, ts.a, tn.ty);
+    }
+    ret opt[project.TypeSite].none{};
 }
 
-# the buffer's own `tag` declaration named by `name`, or nil
-fun same_file_tag_decl(an: analysis.Analyzed, name: token.Span) *decl.Decl {
+# the type site a type written in the buffer names. a pointer is peeled to its
+# pointee; the named path then resolves through the buffer's own declarations
+# and `use`s
+fun buffer_type_site(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, ty: id.TypeId) opt[project.TypeSite] {
+    val to: opt[*atype.Type] = named_type_in(an.a, ty);
+    if (sel to.none) { ret opt[project.TypeSite].none{}; }
+    ret type_site_for_written(ws, root, an, alloc, to.some.data.named.name);
+}
+
+# the type site a type written in loaded module `mid` names, through that
+# module's own resolution: the named type already resolves to the declaring
+# symbol there, and a `fwd` re-export is followed to the declaring module
+fun module_type_site(ws: *project.Workspace, root: *project.Root, mid: sess.ModuleId,
+    a: *ast.Ast, ty: id.TypeId) opt[project.TypeSite] {
+    var tid: id.TypeId = ty;
+    if (tid == id.TYPE_NIL) { ret opt[project.TypeSite].none{}; }
+    val po: opt[*atype.Type] = ast.get_type(a, tid);
+    if (sel po.none)                         { ret opt[project.TypeSite].none{}; }
+    if (po.some.kind == atype.TYPE_KIND_PTR) { tid = po.some.data.ptr.pointee; }
+
+    val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
+    if (sel mvo.none) { ret opt[project.TypeSite].none{}; }
+    val rr: *rslv.ResolveResult = mvo.some.rr;
+    if (rr == nil || rr.type_resolved == nil || tid::u32 >= rr.type_count) { ret opt[project.TypeSite].none{}; }
+    val sid: rslv.SymbolId = rr.type_resolved[tid];
+    if (sid == rslv.SYMBOL_NIL || sid >= rr.symbol_count) { ret opt[project.TypeSite].none{}; }
+    val def: *rslv.Symbol = project.defining_symbol_in(root, ?rr.symbols[sid]);
+    if (def == nil || def.decl == id.DECL_NIL) { ret opt[project.TypeSite].none{}; }
+    val dmvo: opt[project.ModuleView] = project.module_view(ws, root, def.origin);
+    if (sel dmvo.none) { ret opt[project.TypeSite].none{}; }
+    val dmv: project.ModuleView = dmvo.some;
+    ret project.type_site_from(def.origin, def.decl, dmv.file_id, dmv.a, dmv.text);
+}
+
+# the named type node `ty` in `a` denotes, peeling one pointer, or none when it
+# is not a name
+fun named_type_in(a: *ast.Ast, ty: id.TypeId) opt[*atype.Type] {
+    if (ty == id.TYPE_NIL) { ret opt[*atype.Type].none{}; }
+    val first: opt[*atype.Type] = ast.get_type(a, ty);
+    if (sel first.none) { ret first; }
+    var tid: id.TypeId = ty;
+    if (first.some.kind == atype.TYPE_KIND_PTR) { tid = first.some.data.ptr.pointee; }
+    val to: opt[*atype.Type] = ast.get_type(a, tid);
+    if (sel to.none)                           { ret to; }
+    if (to.some.kind != atype.TYPE_KIND_NAMED) { ret opt[*atype.Type].none{}; }
+    ret to;
+}
+
+# the type site the type path `name`, written in the buffer, names: a
+# declaration in the buffer itself when the path is a bare name, otherwise
+# through the buffer's `use` declarations against the snapshot
+fun type_site_for_written(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
+    alloc: *Allocator, name: token.Span) opt[project.TypeSite] {
+    val srctext: str = an.text.file.text;
+    if (np.prefix(srctext, name).len == 0) {
+        val own: opt[id.DeclId] = same_file_type_decl(an, np.leaf(srctext, name));
+        if (sel own.some) { ret project.type_site_from(an.own, own.some, an.own_fid, an.a, an.text); }
+    }
+    ret type_site_for_type_path(ws, root, an, alloc, name);
+}
+
+# the buffer's own rec / uni / tag declaration named `name`, as its DeclId
+fun same_file_type_decl(an: analysis.Analyzed, name: token.Span) opt[id.DeclId] {
     var i: usize = 0;
     for (i < an.a.decl_len) {
-        val d: *decl.Decl = ?an.a.decls[i];
+        val di: usize      = i;
+        val d:  *decl.Decl = ?an.a.decls[di];
         i = i + 1;
-        if (d.kind != decl.DECL_KIND_TAG)                                                  { cnt; }
-        if (features.span_bytes_equal(an.text.file, d.data.tag_.name, an.text.file, name)) { ret d; }
+        var dn: token.Span;
+        if (d.kind == decl.DECL_KIND_REC)                                    { dn = d.data.rec_.name; }
+        or (d.kind == decl.DECL_KIND_UNI)                                    { dn = d.data.uni_.name; }
+        or (d.kind == decl.DECL_KIND_TAG)                                    { dn = d.data.tag_.name; }
+        or                                                                   { cnt; }
+        if (features.span_bytes_equal(an.text.file, dn, an.text.file, name)) { ret opt[id.DeclId].some{di::id.DeclId}; }
     }
-    ret nil;
+    ret opt[id.DeclId].none{};
+}
+
+# offer the members of the type at `ts`: a rec's or uni's fields, or a tag's
+# case selectors
+fun emit_type_site_members(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
+    prefix: token.Span, ts: project.TypeSite, incomplete: bool) bool {
+    val d_opt: opt[*decl.Decl] = ast.get_decl(ts.a, ts.decl);
+    if (sel d_opt.none) { ret false; }
+    val d: *decl.Decl = d_opt.some;
+    if (d.kind == decl.DECL_KIND_REC) {
+        ret emit_fields_of(an, alloc, id_raw, prefix, ts.a, ts.text, d.data.rec_.fields_start, d.data.rec_.fields_len, incomplete);
+    }
+    if (d.kind == decl.DECL_KIND_UNI) {
+        ret emit_fields_of(an, alloc, id_raw, prefix, ts.a, ts.text, d.data.uni_.fields_start, d.data.uni_.fields_len, incomplete);
+    }
+    if (d.kind == decl.DECL_KIND_TAG) {
+        ret emit_tag_cases_from_decl(an, alloc, id_raw, prefix, ts.a, ts.text, d, incomplete);
+    }
+    ret false;
 }
 
 # resolve the type-name path `name` against `root`'s snapshot to the type it
 # names, through the buffer's `use` declarations, following `fwd` re-exports.
-# the `TypeSite` twin of `record_for_type_path`, so a tag resolves (#334)
+# the one text-to-snapshot bridge a buffer request crosses (#321, #334)
 fun type_site_for_type_path(ws: *project.Workspace, root: *project.Root, an: analysis.Analyzed,
     alloc: *Allocator, name: token.Span) opt[project.TypeSite] {
     val srctext: str        = an.text.file.text;
@@ -3168,8 +3237,7 @@ fun type_site_for_type_path(ws: *project.Workspace, root: *project.Root, an: ana
     ret opt[project.TypeSite].none{};
 }
 
-# look up a type by module FQN and name, freeing the two owned name strings, the
-# `TypeSite` twin of `record_in_module_owned`
+# look up a type by module FQN and name, freeing the two owned name strings
 fun type_in_module_owned(ws: *project.Workspace, root: *project.Root, alloc: *Allocator,
     module_fqn: str, type_name: str) opt[project.TypeSite] {
     if (module_fqn == nil || type_name == nil) {
@@ -3213,18 +3281,6 @@ fun emit_tag_cases_from_decl(an: analysis.Analyzed, alloc: *Allocator, id_raw: s
     ret true;
 }
 
-# the last segment of a `use` path, the name a `use a.b.c;` binds
-fun path_leaf(t: positions.Text, path: token.Span) token.Span {
-    var start: usize = path.offset;
-    var i:     usize = path.offset;
-    val end:   usize = path.offset + path.len;
-    for (i < end && i < t.len) {
-        if (t.file.text[i] == '.') { start = i + 1; }
-        i = i + 1;
-    }
-    ret token.Span{offset: start, len: end - start};
-}
-
 # offer fields resolved entirely inside the isolated editor session
 fun emit_editor_member_completions(es: *editor.EditorSession, an: analysis.Analyzed,
     alloc: *Allocator, id_raw: str,
@@ -3259,17 +3315,25 @@ fun emit_field_completions(ws: *project.Workspace, an: analysis.Analyzed, alloc:
 # emit one record or union's fields with the requested completeness marker
 fun emit_record_fields(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
     prefix: token.Span, rs: project.RecordSite, incomplete: bool) bool {
+    ret emit_fields_of(an, alloc, id_raw, prefix, rs.a, rs.text, rs.fields_start, rs.fields_len, incomplete);
+}
+
+# offer the fields in `a.typed_names[start .. start + len]`, backed by `text`,
+# filtered by the buffer prefix already typed. the one field emitter, whether
+# the fields were reached through a typed RecordSite or the receiver walk
+fun emit_fields_of(an: analysis.Analyzed, alloc: *Allocator, id_raw: str, prefix: token.Span,
+    a: *ast.Ast, text: positions.Text, start: u32, len: u32, incomplete: bool) bool {
     var b: json.Buf = json.buf_init(alloc);
     push_completion_head(?b, id_raw, incomplete);
 
     var emitted: usize = 0;
     var i:       u32   = 0;
-    for (i < rs.fields_len) {
-        val tn:    *decl.TypedName = ?rs.a.typed_names[rs.fields_start + i];
-        val fname: str             = positions.span_text(rs.text, tn.name, alloc);
+    for (i < len) {
+        val tn:    *decl.TypedName = ?a.typed_names[start + i];
+        val fname: str             = positions.span_text(text, tn.name, alloc);
         if (fname != nil) {
             if (span_is_prefix_of(an.text.file, prefix, fname)) {
-                val ftype: str = field_type_text(rs, tn, alloc);
+                val ftype: str = typed_name_type_text(a, text, tn, alloc);
                 push_completion_item(?b, fname, LSP_COMPLETION_FIELD, "field", ftype, emitted > 0);
                 if (ftype != nil) { json.free_str(ftype, alloc); }
                 emitted = emitted + 1;

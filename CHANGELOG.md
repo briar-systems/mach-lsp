@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-19
+
+One completion fix on the 1.2 surface, the third of @Angluca's reports about a
+`.` on a receiver the resolver could not reach while the buffer is ahead of the
+snapshot. No contract change: same asset set, CLI and options as 1.2.0.
+
+**The linked mach is unchanged at v5.8.0**, and std at v4.0.0.
+
+### Fixed
+- fix(#336): completion after a `.` on a chained receiver (`value.field.`) now
+  offers the members of the last field's type however many hops it has, while
+  the buffer is ahead of the snapshot. The isolated resolver handled one hop at
+  a time with a case per receiver shape, and none walked from a record to a
+  field's declared type, so a chain into an imported record came back empty
+  past the first hop. Every receiver is now resolved by one walk over its
+  chain: the head by what it names (a module alias, a value's written type, or
+  a tag type name) and each further segment as a field whose declared type
+  resolves to the next record, union or tag, through the buffer's `use`s or the
+  declaring module's own resolution, following `fwd` re-exports at every hop.
+  The former receiver cases are the first hop of that walk rather than siblings
+  of it. The third of @Angluca's completion reports (#332, #334, #336).
+
 ## [1.2.1] - 2026-09-19
 
 Two completion fixes on the 1.2 surface, both reported by @Angluca and both
