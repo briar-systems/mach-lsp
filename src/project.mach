@@ -1486,9 +1486,9 @@ fun free_mod_paths(w: *Workspace, r: *Root) {
 # and `refresh_inputs` is what decides whether the rebuild it implies can go
 # off-thread.
 fun maybe_reload(w: *Workspace, r: *Root) {
-    val clock: chrono.Clock = chrono.monotonic();
-    if (sel clock.err) { ret; }
-    val now: i64 = chrono.time_unix_nsec(clock.ok);
+    val now: i64 = trace.now_ns();
+    if (now == 0) { ret; }
+
     if (!r.dirty && r.last_disk_scan_ns != 0 && now - r.last_disk_scan_ns < 250000000) { ret; }
     r.last_disk_scan_ns = now;
     var man:  i64 = 0;

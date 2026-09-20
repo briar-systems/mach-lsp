@@ -34,6 +34,7 @@ use mls.actions;
 use mls.callhierarchy;
 use mls.diagnostics;
 use mls.documents;
+use mls.folding;
 use mls.hints;
 use mls.jobs;
 use mls.json;
@@ -43,6 +44,7 @@ use mls.positions;
 use mls.progress;
 use mls.project;
 use mls.render;
+use mls.selection;
 use mls.settings;
 use mls.sideband;
 use mls.signature;
@@ -80,6 +82,10 @@ val FEATURE_TYPE_DEFINITION:    u8 = 12;
 val FEATURE_CALL_PREPARE:       u8 = 13;
 val FEATURE_CALL_INCOMING:      u8 = 14;
 val FEATURE_CALL_OUTGOING:      u8 = 15;
+val FEATURE_FOLDING_RANGE:      u8 = 16;
+val FEATURE_SELECTION_RANGE:    u8 = 17;
+val FEATURE_SEMANTIC_RANGE:     u8 = 18;
+val FEATURE_SEMANTIC_DELTA:     u8 = 19;
 
 # LSP RequestCancelled
 val REQUEST_CANCELLED: i64 = -32800;
@@ -126,6 +132,7 @@ pub rec Server {
     s:              sess.Session;
     es:             editor.EditorSession;
     docs:           documents.Store;
+    token_memo:     tokens.Memo;
     ws:             project.Workspace;
     rd:             json.Reader;
     q:              jobs.Queue;
@@ -170,9 +177,10 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     if (sel sr.err) { ret false; }
     srv.s = sr.ok;
 
-    srv.es   = editor.init(?srv.s);
-    srv.docs = documents.init(?srv.es, alloc);
-    srv.ws   = project.init(?srv.s, alloc);
+    srv.es         = editor.init(?srv.s);
+    srv.docs       = documents.init(?srv.es, alloc);
+    srv.token_memo = tokens.memo_init(alloc);
+    srv.ws         = project.init(?srv.s, alloc);
     project.attach_documents(?srv.ws, ?srv.docs);
     if (!json.reader_init(?srv.rd, alloc)) { ret false; }
     srv.stop           = 0;
@@ -194,6 +202,7 @@ pub fun dnit(srv: *Server) {
     json.reader_dnit(?srv.rd_client);
     json.reader_dnit(?srv.rd);
     documents.dnit(?srv.docs);
+    tokens.memo_dnit(?srv.token_memo);
     project.dnit(?srv.ws);
     editor.dnit(?srv.es);
     sess.dnit(?srv.s);
@@ -634,6 +643,16 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
         handle_feature(srv, root, params, FEATURE_COMPLETION);
         ret;
     }
+    if (str_equals(method, "textDocument/foldingRange")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_FOLDING_RANGE);
+        ret;
+    }
+    if (str_equals(method, "textDocument/selectionRange")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_SELECTION_RANGE);
+        ret;
+    }
     if (str_equals(method, "textDocument/documentHighlight")) {
         json.free_str(method, a);
         handle_feature(srv, root, params, FEATURE_DOCUMENT_HIGHLIGHT);
@@ -652,6 +671,16 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
     if (str_equals(method, "textDocument/semanticTokens/full")) {
         json.free_str(method, a);
         handle_feature(srv, root, params, FEATURE_SEMANTIC_TOKENS);
+        ret;
+    }
+    if (str_equals(method, "textDocument/semanticTokens/range")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_SEMANTIC_RANGE);
+        ret;
+    }
+    if (str_equals(method, "textDocument/semanticTokens/full/delta")) {
+        json.free_str(method, a);
+        handle_feature(srv, root, params, FEATURE_SEMANTIC_DELTA);
         ret;
     }
     if (str_equals(method, "textDocument/codeAction")) {
@@ -739,7 +768,7 @@ fun handle_initialize(srv: *Server, root: *sj.Value, params: *sj.Value) {
     json.buf_push(?b, tokens.TOKEN_TYPES);
     json.buf_push(?b, "],\"tokenModifiers\":[");
     json.buf_push(?b, tokens.TOKEN_MODIFIERS);
-    json.buf_push(?b, "]},\"full\":true},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":");
+    json.buf_push(?b, "]},\"range\":true,\"full\":{\"delta\":true}},\"textDocumentSync\":2,\"hoverProvider\":true,\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"callHierarchyProvider\":true,\"referencesProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"documentSymbolProvider\":true,\"foldingRangeProvider\":true,\"selectionRangeProvider\":true,\"documentHighlightProvider\":true,\"workspaceSymbolProvider\":true,\"inlayHintProvider\":true,\"codeActionProvider\":{\"codeActionKinds\":[\"quickfix\"]},\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"],\"retriggerCharacters\":[\",\"]},\"completionProvider\":{\"triggerCharacters\":[\".\"]}},\"serverInfo\":{\"name\":\"mach-lsp\",\"version\":");
     json.buf_push_quoted(?b, version.VERSION);
     json.buf_push(?b, ",\"mach\":");
     json.buf_push_quoted(?b, version.MACH);
@@ -910,6 +939,7 @@ fun handle_did_close(srv: *Server, params: *sj.Value) {
     val doc: *documents.Document = documents.closing(?srv.docs, uri);
     if (doc != nil) { project.document_closed(?srv.ws, doc); }
     documents.close(?srv.docs, uri);
+    tokens.forget(?srv.token_memo, uri);
     diagnostics.clear(srv.alloc, uri);
     republish_all(srv);
     json.free_str(uri, srv.alloc);
@@ -990,11 +1020,15 @@ fun handle_feature(srv: *Server, root: *sj.Value, params: *sj.Value, which: u8) 
     or (which == FEATURE_RENAME)             { language.rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_PREPARE_RENAME)     { language.prepare_rename(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_SYMBOL)    { language.document_symbol(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_FOLDING_RANGE)      { folding.folding_range(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SELECTION_RANGE)    { selection.selection_range(?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_COMPLETION)         { language.completion(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_DOCUMENT_HIGHLIGHT) { language.document_highlight(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_SIGNATURE_HELP)     { signature.signature_help(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_INLAY_HINT)         { hints.inlay_hints(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
-    or (which == FEATURE_SEMANTIC_TOKENS)    { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SEMANTIC_TOKENS)    { tokens.semantic_tokens(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, ?srv.token_memo, id, params, uri); }
+    or (which == FEATURE_SEMANTIC_RANGE)     { tokens.semantic_tokens_range(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
+    or (which == FEATURE_SEMANTIC_DELTA)     { tokens.semantic_tokens_delta(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, ?srv.token_memo, id, params, uri); }
     or (which == FEATURE_CODE_ACTION)        { actions.code_actions(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_CALL_PREPARE)       { callhierarchy.prepare(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params, uri); }
     or (which == FEATURE_CALL_INCOMING)      { callhierarchy.incoming(?srv.ws, ?srv.es, srv.alloc, ?srv.docs, id, params); }

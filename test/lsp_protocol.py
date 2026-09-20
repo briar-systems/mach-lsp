@@ -3263,6 +3263,248 @@ def run_document_symbol_kinds(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+FOLD_BUFFER = """use std.types.bool.bool;
+use std.types.size.usize;
+fwd std.types.string.str;
+
+# a record with two fields
+# and a doc block above it
+pub rec R {
+    a: i32;
+    b: i32;
+}
+
+pub uni U { a: i32; b: f32; }
+
+pub tag T: u8 {
+    one;
+    two: i32;
+}
+
+pub val V: i32 = 1;
+
+# one doc line hides nothing
+pub fun f(
+    n: i32,
+) i32 {
+    if (n > 0) {
+        ret n;
+    }
+    ret 0;
+}
+
+use std.types.string.str_len;
+"""
+
+
+def run_folding_range(server: Path, timeout: float) -> None:
+    """foldingRange folds decl bodies, import runs and doc blocks, and nothing else.
+
+    A body folds from the line that opens its brace to the line that closes it,
+    with `endCharacter` at the closing brace. A function folds its body
+    statement, not its signature, so a signature spread over lines stays in
+    view. A run of adjacent `use` / `fwd` lines is one `imports` range and a doc
+    block one `comment` range. A range that would hide no line is not reported:
+    the one-line union, the one-line doc comment and the lone trailing `use`
+    all fold nothing.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-fold-") as directory:
+        root = Path(directory).resolve()
+        buffer = root / "fold.mach"
+        buffer.write_text(FOLD_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}})["result"]["capabilities"]
+            require(capabilities.get("foldingRangeProvider") is True,
+                    f"foldingRangeProvider is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": buffer.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": FOLD_BUFFER}},
+            )
+            session.diagnostics(buffer.as_uri(), 1)
+            ranges = session.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": buffer.as_uri()}},
+            )["result"]
+            expected = [
+                {"startLine": 0, "endLine": 2, "kind": "imports"},
+                {"startLine": 4, "endLine": 5, "kind": "comment"},
+                {"startLine": 6, "endLine": 9, "endCharacter": 0},
+                {"startLine": 13, "endLine": 16, "endCharacter": 0},
+                {"startLine": 23, "endLine": 28, "endCharacter": 0},
+            ]
+            require(ranges == expected,
+                    f"folding ranges differ from the buffer's shape:\n"
+                    f"  got      {ranges!r}\n  expected {expected!r}")
+
+            # an edit is reflected through the buffer's own parse: indenting the
+            # closing brace moves `endCharacter`, and joining the doc block onto
+            # one line removes its range
+            edited = FOLD_BUFFER.replace("    b: i32;\n}", "    b: i32;\n    }").replace(
+                "# a record with two fields\n# and a doc block above it", "# a record with two fields")
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": buffer.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            session.diagnostics(buffer.as_uri(), 2)
+            ranges = session.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": buffer.as_uri()}},
+            )["result"]
+            expected = [
+                {"startLine": 0, "endLine": 2, "kind": "imports"},
+                {"startLine": 5, "endLine": 8, "endCharacter": 4},
+                {"startLine": 12, "endLine": 15, "endCharacter": 0},
+                {"startLine": 22, "endLine": 27, "endCharacter": 0},
+            ]
+            require(ranges == expected,
+                    f"folding ranges did not follow the edit:\n"
+                    f"  got      {ranges!r}\n  expected {expected!r}")
+
+            # a document the server does not hold answers an empty list, not an error
+            missing = session.request(
+                "textDocument/foldingRange",
+                {"textDocument": {"uri": (root / "absent.mach").as_uri()}},
+            )
+            require(missing.get("result") == [],
+                    f"an unopened document did not answer []: {missing!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
+SELECTION_BUFFER = """use std.types.size.usize;
+
+pub rec P {
+    x: i32;
+    y: i32;
+}
+
+pub fun area(p: P, scale: i32) i32 {
+    var total: i32 = 0;
+    if (scale > 0) {
+        total = (p.x + p.y) * scale;
+    }
+    ret total;
+}
+"""
+
+
+def selection_texts(chain: dict[str, Any] | None, text: str) -> list[str]:
+    """The source under each step of a SelectionRange chain, innermost first."""
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line.encode("utf-8")))
+    data = text.encode("utf-8")
+    steps: list[str] = []
+    while chain is not None:
+        start, end = chain["range"]["start"], chain["range"]["end"]
+        lo = offsets[start["line"]] + start["character"]
+        hi = offsets[end["line"]] + end["character"]
+        steps.append(data[lo:hi].decode("utf-8"))
+        chain = chain.get("parent")
+    return steps
+
+
+def run_selection_range(server: Path, timeout: float) -> None:
+    """selectionRange expands a cursor one syntax level at a time.
+
+    Each step strictly contains the one before it, a cursor inside a nested
+    expression walks out through every enclosing expression and statement to
+    the declaration, a cursor at the end of a word still selects the word, and
+    a position nothing holds answers an empty range at the cursor with no
+    parent, so the reply keeps one entry per position.
+    """
+    with tempfile.TemporaryDirectory(prefix="mls-selrange-") as directory:
+        root = Path(directory).resolve()
+        buffer = root / "sel.mach"
+        buffer.write_text(SELECTION_BUFFER, encoding="utf-8")
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            capabilities = session.request(
+                "initialize", {"rootUri": root.as_uri(), "capabilities": {}})["result"]["capabilities"]
+            require(capabilities.get("selectionRangeProvider") is True,
+                    f"selectionRangeProvider is not advertised: {capabilities!r}")
+            session.notify("initialized", {})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": buffer.as_uri(), "languageId": "mach",
+                                  "version": 1, "text": SELECTION_BUFFER}},
+            )
+            session.diagnostics(buffer.as_uri(), 1)
+            lines = SELECTION_BUFFER.splitlines()
+            assign = next(i for i, value in enumerate(lines) if "total = (" in value)
+            rec_field = next(i for i, value in enumerate(lines) if value.startswith("    x:"))
+            positions = [
+                {"line": assign, "character": lines[assign].index("p.x") + 2},
+                {"line": assign, "character": lines[assign].index("p.x") + 3},
+                {"line": rec_field, "character": 4},
+                {"line": 0, "character": lines[0].index("size")},
+                {"line": 1, "character": 0},
+                {"line": 99, "character": 0},
+            ]
+            chains = session.request(
+                "textDocument/selectionRange",
+                {"textDocument": {"uri": buffer.as_uri()}, "positions": positions},
+            )["result"]
+            require(isinstance(chains, list) and len(chains) == len(positions),
+                    f"selectionRange did not answer one chain per position: {chains!r}")
+
+            # every step strictly contains the one before it
+            for position, chain in zip(positions, chains):
+                previous = None
+                node = chain
+                while node is not None:
+                    current = node["range"]
+                    if previous is not None:
+                        key = lambda p: (p["line"], p["character"])
+                        require(key(current["start"]) <= key(previous["start"])
+                                and key(current["end"]) >= key(previous["end"])
+                                and current != previous,
+                                f"a step at {position} does not strictly contain the one "
+                                f"before it: {previous!r} then {current!r}")
+                    previous = current
+                    node = node.get("parent")
+
+            # a cursor on `x` in `p.x` walks out one level at a time
+            steps = selection_texts(chains[0], SELECTION_BUFFER)
+            require(steps[:3] == ["x", "p.x", "p.x + p.y"] and steps[-1].startswith("pub fun area")
+                    and "total = (p.x + p.y) * scale;" in steps
+                    and "if (scale > 0) {" in steps[-3],
+                    f"the cursor in a nested expression did not walk out level by level: {steps!r}")
+            # a cursor just after `x` still starts from the word it follows
+            require(selection_texts(chains[1], SELECTION_BUFFER)[:2] == ["x", "p.x"],
+                    f"a cursor at the end of a word did not select the word: "
+                    f"{selection_texts(chains[1], SELECTION_BUFFER)!r}")
+            # a field name, then its record
+            require(selection_texts(chains[2], SELECTION_BUFFER) == ["x", "pub rec P {\n    x: i32;\n    y: i32;\n}"],
+                    f"a field did not expand to its record: {selection_texts(chains[2], SELECTION_BUFFER)!r}")
+            # an import path, then its use
+            require(selection_texts(chains[3], SELECTION_BUFFER)
+                    == ["std.types.size.usize", "use std.types.size.usize;"],
+                    f"an import path did not expand to its use: {selection_texts(chains[3], SELECTION_BUFFER)!r}")
+            # nothing holds a blank line or a line past the end
+            for index, expected in ((4, {"line": 1, "character": 0}), (5, {"line": 99, "character": 0})):
+                require(chains[index] == {"range": {"start": expected, "end": expected}},
+                        f"a position nothing holds did not answer an empty range: {chains[index]!r}")
+
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
     """A record's fields and a function's parameters belong in the outline.
 
@@ -3389,11 +3631,9 @@ class SyntaxOnlyFeature(NamedTuple):
     valid: Callable[[Any], bool]
 
 
-# every handler that reaches `analysis.standalone` at `editor.PHASE_PARSE`, which
-# today is `document_symbol` by way of `analysis.syntax_tree`. a syntax-only
-# handler answers from the buffer and must never touch the project, so each one
-# is held to the same latency contract; #221 foldingRange and #222 selectionRange
-# join the table when they land.
+# every handler that answers from `analysis.syntax_of`, the PHASE_PARSE view of
+# the open buffer alone. a syntax-only handler answers from the buffer and must
+# never touch the project, so each one is held to the same latency contract.
 SYNTAX_ONLY_FEATURES = (
     SyntaxOnlyFeature(
         name="documentSymbol",
@@ -3401,7 +3641,28 @@ SYNTAX_ONLY_FEATURES = (
         params=lambda uri, text: {"textDocument": {"uri": uri}},
         valid=lambda result: isinstance(result, list) and bool(result),
     ),
+    SyntaxOnlyFeature(
+        name="foldingRange",
+        method="textDocument/foldingRange",
+        params=lambda uri, text: {"textDocument": {"uri": uri}},
+        valid=lambda result: isinstance(result, list) and bool(result),
+    ),
+    SyntaxOnlyFeature(
+        name="selectionRange",
+        method="textDocument/selectionRange",
+        params=lambda uri, text: {"textDocument": {"uri": uri},
+                                  "positions": [syntax_only_cursor(text)]},
+        valid=lambda result: isinstance(result, list) and len(result) == 1
+        and "parent" in result[0],
+    ),
 )
+
+
+def syntax_only_cursor(text: str) -> dict[str, int]:
+    """A position inside the fixture's function body, where a chain has depth."""
+    lines = text.splitlines()
+    line = next(i for i, value in enumerate(lines) if value.strip().startswith("ret "))
+    return {"line": line, "character": lines[line].index("ret ") + 4}
 
 # the first requests against a healthy project pay a cold project load, once
 # per manifest restore, so the contract is about steady state and these samples
@@ -3895,13 +4156,20 @@ def run_completion_dependency_alias_while_behind(server: Path, timeout: float) -
     """Completion after a dependency-module alias's `.` while the buffer is ahead.
 
     The reporter's exact shape: `use prt: std.print;` then `prt.` typed on a
-    line the snapshot has not seen yet. The isolated editor analysis resolving
-    that buffer loads the dependency's own sources, which grows the session's
-    source map and moves its backing array; a stale SourceFile pointer read
-    afterwards faulted the worker on macOS, where the freed page is unmapped
-    (#297). A local module never triggered it because its source is already
-    resident. The worker surviving with an `isIncomplete` answer that carries
-    the module's members is the whole point of this case.
+    line the snapshot has not seen yet. The members are resolved from the loaded
+    snapshot read through the edit window (#235); the path that used to answer
+    this loaded the dependency's own sources into the editor session, growing
+    its source map and moving the backing array under a stale SourceFile pointer,
+    which faulted the worker on macOS (#297). A local module never triggered it
+    because its source is already resident.
+
+    The members assertion is unconditional because a load barrier runs first
+    (#330): the `.` in `prt.println` is a caught-up receiver only a loaded root
+    answers project-backed, so waiting for that settles exactly when the initial
+    inline load has finished, on every leg and with no wall-clock wait. Without
+    it, a leg where the load had not finished answered from the not-loaded path
+    with empty members, and the assertion had to be skipped there - a check that
+    could pass without checking.
     """
     if os.name != "posix":
         print("  completion dependency alias while behind: skipped (rebuild gate needs flock)")
@@ -3983,13 +4251,33 @@ need = []
             session.diagnostics(main.as_uri(), 1)
 
             lines = base.splitlines()
-            insert_at = next(i for i, v in enumerate(lines) if "prt.println" in v) + 1
+            probe_line = next(i for i, v in enumerate(lines) if "prt.println" in v)
+            probe_col = lines[probe_line].index("prt.") + len("prt.")
+
+            # the project-load barrier (#330): the initial dependency load runs
+            # inline on didOpen and is not gated by the turnstile, but whether it
+            # has finished when the burst arrives is a timing question the gate
+            # does not touch. The `.` in `prt.println` is a caught-up receiver;
+            # only a loaded root answers it project-backed (isIncomplete false)
+            # with the module's members, so this settles exactly when the root is
+            # loaded. It never waits on wall-clock and never on a rebuild.
+            settled_result(
+                session, "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": probe_line, "character": probe_col}},
+                lambda r: (isinstance(r, dict) and r.get("isIncomplete") is False
+                           and "println" in [i.get("label") for i in r.get("items", [])]),
+                "the dependency root to load")
+
+            insert_at = probe_line + 1
             ahead = lines[:insert_at] + ["    prt."] + lines[insert_at:]
             version = 1
             notifications = []
             # each keystroke carries distinct text so a completed rebuild is always
-            # for an older revision: the buffer stays ahead and the completion is
-            # answered from the isolated editor analysis, which is the crashing path
+            # for an older revision: the buffer stays ahead of the loaded snapshot,
+            # so completion is answered from that snapshot read through the edit
+            # window (#235), the path that used to reload the dependency into the
+            # editor session (#297)
             for keystroke in range(32):
                 version += 1
                 typed = "\n".join(ahead) + f"\n# keystroke {keystroke}\n"
@@ -4004,22 +4292,15 @@ need = []
                 {"textDocument": {"uri": main.as_uri()},
                  "position": {"line": insert_at, "character": len("    prt.")}})
             result = answer.get("result")
-            require(isinstance(result, dict) and isinstance(result.get("items"), list),
-                    f"a dependency-module alias completion crashed or errored while behind: {answer!r}")
-            # a worker fault on this path returns an error response, which the
-            # request helper raises, so reaching here means the worker survived
-            # loading the dependency's sources - the regression this guards. The
-            # gate holds the off-thread rebuild, so the snapshot cannot catch up
-            # to the buffer. Whether the initial dependency load has finished is
-            # a separate timing question the gate does not touch: until a loaded
-            # root exists the answer is an empty isolated one, so the members
-            # check stays guarded on the isolated ahead-path's isIncomplete
-            # signature, on which the aliased module's members must be offered.
-            # #330: guarded because the initial std load may not have finished here. A project-load barrier would let this be unconditional.
-            if result.get("isIncomplete") is True:
-                labels = [item.get("label") for item in result.get("items", [])]
-                require("println" in labels and "print" in labels,
-                        f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
+            # the root is loaded (barrier above) and the buffer is held ahead of
+            # it, so the answer is the loaded-but-behind one: incomplete, with the
+            # aliased module's members resolved through the snapshot. no guard -
+            # the barrier makes this the state on every leg (#330)
+            require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                    f"a dependency-module alias was not answered from the loaded snapshot while behind: {answer!r}")
+            labels = [item.get("label") for item in result.get("items", [])]
+            require("println" in labels and "print" in labels,
+                    f"a dependency-module alias offered nothing while the buffer was ahead: {labels!r}")
 
             gate.release()
             session.finish()
@@ -4752,6 +5033,23 @@ def run_inlay_hints(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def decode_semantic_tokens(data: list[int]) -> list[tuple[int, int, int, int, int]]:
+    """Absolute (line, character, length, type, modifiers) for each delta-encoded group."""
+    require(len(data) % 5 == 0, f"token data is not a multiple of five: {len(data)}")
+    tokens: list[tuple[int, int, int, int, int]] = []
+    line = 0
+    char = 0
+    for index in range(0, len(data), 5):
+        d_line, d_char, length, kind, mods = data[index:index + 5]
+        if d_line == 0:
+            char += d_char
+        else:
+            line += d_line
+            char = d_char
+        tokens.append((line, char, length, kind, mods))
+    return tokens
+
+
 def run_semantic_tokens(server: Path, timeout: float) -> None:
     """Classification from the resolved tables, in a wire format that decodes.
 
@@ -4769,6 +5067,8 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
                 "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
             provider = result.get("capabilities", {}).get("semanticTokensProvider")
             require(isinstance(provider, dict), f"semanticTokensProvider missing: {provider!r}")
+            require(provider.get("full") == {"delta": True} and provider.get("range") is True,
+                    f"semanticTokensProvider does not offer full with delta, and range: {provider!r}")
             legend = provider.get("legend", {})
             types = legend.get("tokenTypes")
             require(isinstance(types, list) and types, f"no token legend: {legend!r}")
@@ -4788,6 +5088,9 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
             require(isinstance(payload, dict), f"semanticTokens is not an object: {payload!r}")
             data = payload.get("data")
             require(isinstance(data, list) and data, f"no token data: {payload!r}")
+            first_id = payload.get("resultId")
+            require(isinstance(first_id, str) and first_id,
+                    f"a full answer carried no resultId: {payload!r}")
             require(len(data) % 5 == 0,
                     f"token data is not a multiple of five: {len(data)}")
 
@@ -4817,6 +5120,117 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
             # the point of the feature: kinds a syntax highlighter cannot infer
             require("type" in seen_types, f"no type tokens: {sorted(seen_types)}")
             require("function" in seen_types, f"no function tokens: {sorted(seen_types)}")
+
+            # range answers exactly the tokens of full that touch the range (#225):
+            # same classifications, a straddling token kept whole, nothing else
+            full = decode_semantic_tokens(data)
+            # the range starts one character into `head` and ends one character
+            # before the end of `tail`, so both are straddled; neither is on the
+            # file's first or last token line, so the range is a proper subset
+            wide = [tok for tok in full if tok[2] >= 2 and full[0][0] < tok[0] < full[-1][0]]
+            require(len(wide) >= 2, f"the fixture has too few multi-character tokens: {wide!r}")
+            head, tail = wide[0], wide[-1]
+            viewport = {"start": {"line": head[0], "character": head[1] + 1},
+                        "end": {"line": tail[0], "character": tail[1] + tail[2] - 1}}
+            ranged = session.request(
+                "textDocument/semanticTokens/range",
+                {"textDocument": {"uri": main.as_uri()}, "range": viewport})["result"]
+            require(isinstance(ranged, dict) and isinstance(ranged.get("data"), list),
+                    f"semanticTokens/range is not a token payload: {ranged!r}")
+            got = decode_semantic_tokens(ranged["data"])
+
+            def touches(tok: tuple[int, int, int, int, int]) -> bool:
+                line, char, length, _kind, _mods = tok
+                start = (line, char)
+                end = (line, char + length)
+                lo = (viewport["start"]["line"], viewport["start"]["character"])
+                hi = (viewport["end"]["line"], viewport["end"]["character"])
+                return start < hi and end > lo
+
+            expected = [tok for tok in full if touches(tok)]
+            require(got == expected,
+                    f"semanticTokens/range differs from the touching tokens of full:\n"
+                    f"  got      {got!r}\n  expected {expected!r}")
+            require(0 < len(got) < len(full),
+                    f"range returned {len(got)} of {len(full)} tokens, not a proper subset")
+            require(got[0] == head and got[-1] == tail,
+                    f"a token straddling the range edge was not kept whole: {got[0]!r} .. {got[-1]!r}")
+
+            # a range holding no token answers an empty payload, and a request
+            # without a range answers nothing rather than the whole file
+            blank = next(i for i, value in enumerate(lines) if not value.strip())
+            empty = session.request(
+                "textDocument/semanticTokens/range",
+                {"textDocument": {"uri": main.as_uri()},
+                 "range": {"start": {"line": blank, "character": 0}, "end": {"line": blank, "character": 0}}})
+            require(empty.get("result") == {"data": []},
+                    f"an empty range did not answer no tokens: {empty!r}")
+            missing = session.request(
+                "textDocument/semanticTokens/range", {"textDocument": {"uri": main.as_uri()}})
+            require(missing.get("result") == {"data": []},
+                    f"a range request without a range did not answer no tokens: {missing!r}")
+
+            # full/delta against the id just issued (#359): nothing changed, so
+            # no edits, and a new id to continue from
+            def delta(previous: str) -> dict:
+                reply = session.request(
+                    "textDocument/semanticTokens/full/delta",
+                    {"textDocument": {"uri": main.as_uri()}, "previousResultId": previous})
+                result = reply.get("result")
+                require(isinstance(result, dict) and isinstance(result.get("resultId"), str),
+                        f"full/delta did not answer a result with an id: {reply!r}")
+                return result
+
+            def apply(base: list[int], edits: list[dict]) -> list[int]:
+                out = list(base)
+                for edit in sorted(edits, key=lambda e: e["start"], reverse=True):
+                    out[edit["start"]:edit["start"] + edit["deleteCount"]] = edit.get("data", [])
+                return out
+
+            unchanged = delta(first_id)
+            require(unchanged.get("edits") == [] and "data" not in unchanged,
+                    f"an unchanged document did not answer empty edits: {unchanged!r}")
+            require(unchanged["resultId"] != first_id, "a delta reused the previous resultId")
+
+            # an inserted line shifts every token after it by one line, which
+            # the delta expresses as edits that rebuild what full now answers
+            body_lines = text.splitlines(keepends=True)
+            cut = len(body_lines) // 2
+            edited = "".join(body_lines[:cut]) + "# an inserted line\n" + "".join(body_lines[cut:])
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            session.diagnostics(main.as_uri(), 2)
+            moved = delta(unchanged["resultId"])
+            require(isinstance(moved.get("edits"), list) and moved["edits"] and "data" not in moved,
+                    f"an edit did not answer token edits: {moved!r}")
+            fresh = session.request(
+                "textDocument/semanticTokens/full", {"textDocument": {"uri": main.as_uri()}})["result"]
+            require(fresh["data"] != data, "the inserted line did not move any token")
+            require(apply(data, moved["edits"]) == fresh["data"],
+                    f"applying the delta does not rebuild full:\n"
+                    f"  edits {moved['edits']!r}\n  full  {fresh['data']!r}")
+            sent = sum(len(e.get("data", [])) for e in moved["edits"])
+            require(sent < len(fresh["data"]),
+                    f"the delta sent {sent} integers against a full of {len(fresh['data'])}")
+
+            # an id the server no longer holds, and an id from before a close,
+            # both fall back to a full answer
+            stale = delta(first_id)
+            require(stale.get("data") == fresh["data"] and "edits" not in stale,
+                    f"a stale resultId did not fall back to a full answer: {sorted(stale)!r}")
+            session.notify("textDocument/didClose", {"textDocument": {"uri": main.as_uri()}})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 3, "text": edited}},
+            )
+            session.diagnostics(main.as_uri(), 3)
+            reopened = delta(stale["resultId"])
+            require(reopened.get("data") == fresh["data"] and "edits" not in reopened,
+                    f"a resultId from before a close was still honoured: {sorted(reopened)!r}")
 
             session.finish()
             finished = True
@@ -6262,6 +6676,8 @@ def main() -> int:
         run_import_navigation(server, args.timeout)
         run_document_symbol_hierarchy(server, args.timeout)
         run_document_symbol_kinds(server, args.timeout)
+        run_folding_range(server, args.timeout)
+        run_selection_range(server, args.timeout)
         run_type_definition(server, args.timeout)
         run_call_hierarchy(server, args.timeout)
         syntax_only = run_syntax_only_latency(server, args.timeout)
@@ -6306,6 +6722,8 @@ def main() -> int:
     print("  use / fwd import paths navigate to their declarations")
     print("  documentSymbol nests members, and reflects edits through its cached parse")
     print("  one SymbolKind table: every feature that names a declaration agrees")
+    print("  foldingRange folds decl bodies, import runs and doc blocks from the buffer's parse")
+    print("  selectionRange expands a cursor one syntax level at a time")
     print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
     print("  call hierarchy resolves items across modules, and reports calls through fun values")
     print("  a syntax-only request answers from the buffer without reloading the project")
@@ -6315,7 +6733,7 @@ def main() -> int:
     print("  workspace/symbol searches loaded roots, best matches first")
     print("  signatureHelp tracks the active argument through incomplete calls")
     print("  inlayHint names literal arguments at multi-parameter calls")
-    print("  semanticTokens decode in order, within the legend and the file")
+    print("  semanticTokens decode in order, within the legend and the file, and range answers only its viewport")
     print("  a withdrawn request is answered RequestCancelled")
     print("  incremental sync patches ranges, ordered, in UTF-16 columns")
     print("  codeAction offers the compiler's own fixes as applicable edits")

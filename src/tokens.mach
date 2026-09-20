@@ -12,6 +12,11 @@
 # sorted by position, and they must not overlap. Both are enforced here after
 # collection rather than assumed of the walks, because the walks visit decls,
 # expressions, types, and import paths independently and in no particular order.
+#
+# A `full` answer is kept per open document so the next request can be a
+# `full/delta`: the same array is computed again and only the span that changed
+# is sent (#359). The retained state is released when the document closes, when
+# a fresh `full` replaces it, or when an answer carries no result id.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -25,7 +30,9 @@ use std.types.string.str_len;
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
+use std.allocator.reallocate;
 use std.collections.sort;
+use std.types.string.str_equals;
 
 use mach.lang.editor;
 use mach.lang.fe.ast;
@@ -33,8 +40,9 @@ use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
 use rslv: mach.lang.fe.resolve;
 use mach.lang.fe.token;
-use src: mach.lang.source;
-use sj:  std.data.json;
+use src:     mach.lang.source;
+use sj:      std.data.json;
+use strutil: std.text.string;
 
 use mls.analysis;
 use mls.documents;
@@ -73,48 +81,332 @@ rec Tok {
     mods:   i64;
 }
 
-# answer textDocument/semanticTokens/full
+# the part of the document a request asks about, in analysis offsets
+#
+# `full` asks about all of it. `range` asks about the client's viewport, which
+# arrives in the client's buffer and is carried to the analysis through
+# `analysis.request_range`, widening across an edit in flight so the viewport
+# still covers what the snapshot can say on either side of it (#225). A token
+# that straddles a bound is kept whole: a classification is a property of the
+# token, and a viewport edge is not a reason to split one.
+# ---
+# lo: first offset of interest
+# hi: one past the last
+rec Window {
+    lo: usize;
+    hi: usize;
+}
+
+# how a request wants its answer shaped
+val MODE_FULL:  u8 = 0;
+val MODE_RANGE: u8 = 1;
+val MODE_DELTA: u8 = 2;
+
+# the previous full answer for one open document, the array a delta is
+# expressed against
+# ---
+# uri:    owned copy of the document URI
+# id:     the result id the client was told for it
+# data:   the flat integer array of that answer, owned
+# len:    integers in `data`
+# cap:    integers allocated for `data`
+# in_use: whether the slot holds an answer
+rec Prior {
+    uri:    str;
+    id:     usize;
+    data:   *i64;
+    len:    usize;
+    cap:    usize;
+    in_use: bool;
+}
+
+# every retained prior answer, at most one per open document
+# ---
+# alloc:   allocator for the slot array, URIs and integer arrays
+# entries: slot array
+# len:     slots in `entries`
+# next_id: the next result id to hand out; ids are never reused in a session,
+#          so a client holding an old one is told so by a full answer
+pub rec Memo {
+    alloc:   *Allocator;
+    entries: *Prior;
+    len:     usize;
+    next_id: usize;
+}
+
+# an empty memo over `alloc`
+pub fun memo_init(alloc: *Allocator) Memo {
+    var m: Memo;
+    m.alloc   = alloc;
+    m.entries = nil;
+    m.len     = 0;
+    m.next_id = 1;
+    ret m;
+}
+
+# release every retained answer and the slot array
+pub fun memo_dnit(m: *Memo) {
+    if (m.entries != nil && m.len > 0) {
+        var i: usize = 0;
+        for (i < m.len) {
+            release(m, ?m.entries[i]);
+            i = i + 1;
+        }
+        deallocate[Prior](m.alloc, m.entries, m.len);
+    }
+    m.entries = nil;
+    m.len     = 0;
+}
+
+# drop the retained answer for `uri`, if any. called when the document closes
+pub fun forget(m: *Memo, uri: str) {
+    val p: *Prior = find_prior(m, uri);
+    if (p != nil) { release(m, p); }
+}
+
+# answer textDocument/semanticTokens/full, and remember the answer under the
+# result id it carries
 pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+    docs: *documents.Store, memo: *Memo, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    answer(ws, es, alloc, docs, memo, req_id, params, uri, MODE_FULL);
+}
+
+# answer textDocument/semanticTokens/range: the tokens of `full` that touch the
+# requested range, and no others. a range answer is never remembered
+pub fun semantic_tokens_range(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
     docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    answer(ws, es, alloc, docs, nil, req_id, params, uri, MODE_RANGE);
+}
+
+# answer textDocument/semanticTokens/full/delta: the edits that turn the answer
+# `previousResultId` names into the current one, or a full answer when that id
+# is not the one held for the document
+pub fun semantic_tokens_delta(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+    docs: *documents.Store, memo: *Memo, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    answer(ws, es, alloc, docs, memo, req_id, params, uri, MODE_DELTA);
+}
+
+# classify the document, or the requested range of it, and reply
+#
+# A `range` request whose range is absent or does not map answers nothing
+# rather than everything: the client asked for a viewport, and a whole-file
+# answer to that is the payload it was trying to avoid.
+#
+# A `full` or `delta` answer that cannot be computed is sent without a result
+# id, and the document's retained answer goes with it, so what the server holds
+# never says more than what the client was told.
+fun answer(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+    docs: *documents.Store, memo: *Memo, req_id: *sj.Value, params: *sj.Value, uri: str, mode: u8) {
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: analysis.Analyzed;
     if (!analysis.analyze(ws, es, docs, uri, ?an)) {
-        reply_empty(alloc, id_raw);
+        reply_empty(alloc, id_raw, memo, uri);
+        ret;
+    }
+
+    var w: Window;
+    w.lo = 0;
+    w.hi = an.text.len;
+    if (mode == MODE_RANGE && !analysis.request_range(params, an.text, ?w.lo, ?w.hi)) {
+        reply_empty(alloc, id_raw, memo, uri);
         ret;
     }
 
     val ta: res[*Tok, allocator.Error] = allocate[Tok](alloc, MAX_TOKENS);
     if (sel ta.err) {
-        reply_empty(alloc, id_raw);
+        reply_empty(alloc, id_raw, memo, uri);
         ret;
     }
     val toks: *Tok = ta.ok;
 
-    var n: usize = collect(an, toks, MAX_TOKENS);
+    var n: usize = collect(an, w, toks, MAX_TOKENS);
     if (n > 1) {
-        sort.sort[Tok](toks, n, by_offset);
+        sort.sort_by[Tok](toks, n, by_offset);
         n = drop_overlaps(toks, n);
     }
 
+    # the wire array, five integers a token at most
+    var cap: usize = n * 5;
+    if (cap == 0) { cap = 1; }
+    val ia: res[*i64, allocator.Error] = allocate[i64](alloc, cap);
+    if (sel ia.err) {
+        deallocate[Tok](alloc, toks, MAX_TOKENS);
+        reply_empty(alloc, id_raw, memo, uri);
+        ret;
+    }
+    val ints: *i64  = ia.ok;
+    val len:  usize = encode(an.text, toks, n, ints);
+    deallocate[Tok](alloc, toks, MAX_TOKENS);
+
     var b: json.Buf = json.buf_init(alloc);
     render.result_begin(?b, id_raw);
-    json.buf_push(?b, "{\"data\":[");
-    encode(?b, an.text, toks, n);
-    json.buf_push(?b, "]}");
+    if (mode == MODE_RANGE) {
+        json.buf_push(?b, "{\"data\":[");
+        push_ints(?b, ints, 0, len);
+        json.buf_push(?b, "]}");
+        render.send(?b, alloc, id_raw);
+        deallocate[i64](alloc, ints, cap);
+        ret;
+    }
+
+    val rid: usize = memo.next_id;
+    memo.next_id = rid + 1;
+    json.buf_push(?b, "{\"resultId\":\"");
+    json.buf_push_usize(?b, rid);
+    val prior: *Prior = find_prior(memo, uri);
+    if (mode == MODE_DELTA && prior != nil && names(json.member(params, "previousResultId"), prior.id, alloc)) {
+        json.buf_push(?b, "\",\"edits\":[");
+        push_edits(?b, prior.data, prior.len, ints, len);
+        json.buf_push(?b, "]}");
+    }
+    or {
+        json.buf_push(?b, "\",\"data\":[");
+        push_ints(?b, ints, 0, len);
+        json.buf_push(?b, "]}");
+    }
     render.send(?b, alloc, id_raw);
 
-    deallocate[Tok](alloc, toks, MAX_TOKENS);
+    # the answer just sent is what the next delta is against. `ints` is owned
+    # by the memo from here, or freed with the entry when it cannot be kept
+    remember(memo, prior, uri, rid, ints, len, cap);
 }
 
-# gather every classifiable span in the buffer
+# whether a previousResultId value spells `id`
+fun names(v: *sj.Value, id: usize, alloc: *Allocator) bool {
+    val want: str = json.format_usize(id, alloc);
+    if (want == nil) { ret false; }
+    val eq: bool = json.text_equals(v, want, alloc);
+    json.free_str(want, alloc);
+    ret eq;
+}
+
+# the one edit that turns `old` into `new`: the changed span between the
+# longest common prefix and the longest common suffix, or nothing when the two
+# arrays are the same. one edit is what an edit in one place produces, and a
+# client applies a single splice as cheaply as it applies several
+fun push_edits(b: *json.Buf, old: *i64, old_len: usize, new: *i64, new_len: usize) {
+    var p: usize = 0;
+    for (p < old_len && p < new_len && old[p] == new[p]) { p = p + 1; }
+    if (p == old_len && p == new_len) { ret; }
+    var sfx: usize = 0;
+    for (sfx < old_len - p && sfx < new_len - p && old[old_len - 1 - sfx] == new[new_len - 1 - sfx]) { sfx = sfx + 1; }
+
+    json.buf_push(b, "{\"start\":");
+    json.buf_push_usize(b, p);
+    json.buf_push(b, ",\"deleteCount\":");
+    json.buf_push_usize(b, old_len - p - sfx);
+    json.buf_push(b, ",\"data\":[");
+    push_ints(b, new, p, new_len - sfx);
+    json.buf_push(b, "]}");
+}
+
+# append `ints[from, to)` as a comma-separated run
+fun push_ints(b: *json.Buf, ints: *i64, from: usize, to: usize) {
+    var i: usize = from;
+    for (i < to) {
+        if (i > from) { json.buf_push_byte(b, ','); }
+        json.buf_push_i64(b, ints[i]);
+        i = i + 1;
+    }
+}
+
+# the retained answer for `uri`, or nil
+fun find_prior(m: *Memo, uri: str) *Prior {
+    if (m == nil || m.entries == nil) { ret nil; }
+    var i: usize = 0;
+    for (i < m.len) {
+        val p: *Prior = ?m.entries[i];
+        if (p.in_use && p.uri != nil && str_equals(p.uri, uri)) { ret p; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# make `ints` the retained answer for `uri`, replacing `prior` when it is the
+# document's existing entry. when no slot can be had the array is freed and the
+# document keeps no answer, which the next delta request meets as a full reply
+fun remember(m: *Memo, prior: *Prior, uri: str, id: usize, ints: *i64, len: usize, cap: usize) {
+    var p: *Prior = prior;
+    if (p == nil) {
+        p = free_slot(m);
+        if (p == nil) {
+            deallocate[i64](m.alloc, ints, cap);
+            ret;
+        }
+        val du: res[str, allocator.Error] = strutil.str_dup(m.alloc, uri);
+        if (sel du.err) {
+            deallocate[i64](m.alloc, ints, cap);
+            ret;
+        }
+        p.uri    = du.ok;
+        p.in_use = true;
+    }
+    or (p.data != nil) {
+        deallocate[i64](m.alloc, p.data, p.cap);
+    }
+    p.id   = id;
+    p.data = ints;
+    p.len  = len;
+    p.cap  = cap;
+}
+
+# an unused slot, growing the array when every slot is taken
+fun free_slot(m: *Memo) *Prior {
+    var i: usize = 0;
+    for (i < m.len) {
+        if (!m.entries[i].in_use) { ret ?m.entries[i]; }
+        i = i + 1;
+    }
+    var new_len: usize = m.len * 2;
+    if (new_len == 0) { new_len = 8; }
+    if (m.entries == nil) {
+        val r: res[*Prior, allocator.Error] = allocate[Prior](m.alloc, new_len);
+        if (sel r.err) { ret nil; }
+        m.entries = r.ok;
+    }
+    or {
+        val r: res[*Prior, allocator.Error] = reallocate[Prior](m.alloc, m.entries, m.len, new_len);
+        if (sel r.err) { ret nil; }
+        m.entries = r.ok;
+    }
+    var z: usize = m.len;
+    for (z < new_len) {
+        val e: *Prior = ?m.entries[z];
+        e.uri    = nil;
+        e.id     = 0;
+        e.data   = nil;
+        e.len    = 0;
+        e.cap    = 0;
+        e.in_use = false;
+        z        = z + 1;
+    }
+    val slot: *Prior = ?m.entries[m.len];
+    m.len = new_len;
+    ret slot;
+}
+
+# free what a slot owns and retire it
+fun release(m: *Memo, p: *Prior) {
+    if (p.uri != nil)  { strutil.str_free(m.alloc, p.uri); }
+    if (p.data != nil) { deallocate[i64](m.alloc, p.data, p.cap); }
+    p.uri    = nil;
+    p.data   = nil;
+    p.len    = 0;
+    p.cap    = 0;
+    p.id     = 0;
+    p.in_use = false;
+}
+
+# gather every classifiable span in the window
 #
 # The four walks are independent: a declaration's own name comes from the decl
 # table, a reference from the expression or type side tables, and an import leaf
 # from the declaration's path. Nothing orders them, which is why the caller
-# sorts.
-fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
+# sorts. The window is applied where every walk converges, in `push`, so no walk
+# can forget it.
+fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     var n: usize = 0;
 
     var di: usize = 0;
@@ -124,10 +416,10 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
             val d:   *decl.Decl      = d_opt.some;
             val nso: opt[token.Span] = features.decl_name_span(d);
             if (sel nso.some) {
-                n = push(out, n, cap, nso.some,
+                n = push(out, n, cap, w, nso.some,
                     decl_token_type(d.kind), M_DECLARATION);
             }
-            n = collect_members(an, d, out, n, cap);
+            n = collect_members(an, d, w, out, n, cap);
         }
         di = di + 1;
     }
@@ -139,7 +431,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
             val sid: rslv.SymbolId   = so.some;
             val spo: opt[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
             if (sel spo.some) {
-                n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
+                n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ei = ei + 1;
@@ -152,7 +444,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
             val sid: rslv.SymbolId   = so.some;
             val spo: opt[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
             if (sel spo.some) {
-                n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
+                n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ti = ti + 1;
@@ -163,7 +455,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
 
 # a declaration's own members: record fields, union variants, parameters, and
 # generic parameters, which no side table records as references
-fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usize, cap: usize) usize {
+fun collect_members(an: analysis.Analyzed, d: *decl.Decl, w: Window, out: *Tok, count: usize, cap: usize) usize {
     var n:            usize = count;
     var fields_start: u32   = 0;
     var fields_len:   u32   = 0;
@@ -195,7 +487,7 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usiz
     var g: u32 = 0;
     for (g < gen_len && n < cap) {
         if (an.a.generic_names != nil) {
-            n = push(out, n, cap, an.a.generic_names[(gen_start + g)::usize],
+            n = push(out, n, cap, w, an.a.generic_names[(gen_start + g)::usize],
                 T_TYPE_PARAMETER, M_DECLARATION);
         }
         g = g + 1;
@@ -204,7 +496,7 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usiz
     for (f < fields_len && n < cap) {
         if (an.a.typed_names != nil) {
             val tn: *decl.TypedName = ?an.a.typed_names[(fields_start + f)::usize];
-            n = push(out, n, cap, tn.name, member_type, M_DECLARATION);
+            n = push(out, n, cap, w, tn.name, member_type, M_DECLARATION);
         }
         f = f + 1;
     }
@@ -257,8 +549,9 @@ fun decl_token_type(kind: decl.DeclKind) i64 {
     ret T_VARIABLE;
 }
 
-fun push(out: *Tok, count: usize, cap: usize, span: token.Span, kind: i64, mods: i64) usize {
+fun push(out: *Tok, count: usize, cap: usize, w: Window, span: token.Span, kind: i64, mods: i64) usize {
     if (count >= cap || span.len == 0) { ret count; }
+    if (!touches(w, span))             { ret count; }
     out[count].offset = span.offset;
     out[count].len    = span.len;
     out[count].kind   = kind;
@@ -266,9 +559,20 @@ fun push(out: *Tok, count: usize, cap: usize, span: token.Span, kind: i64, mods:
     ret count + 1;
 }
 
+# whether a token has any byte inside the window
+fun touches(w: Window, span: token.Span) bool {
+    if (span.offset >= w.hi)            { ret false; }
+    if (span.offset + span.len <= w.lo) { ret false; }
+    ret true;
+}
+
+# by start, and at one start the longer token first, so the outer one is the
+# one drop_overlaps keeps
 fun by_offset(a: *Tok, b: *Tok) i64 {
     if (a.offset < b.offset) { ret -1; }
     if (a.offset > b.offset) { ret 1; }
+    if (a.len > b.len)       { ret -1; }
+    if (a.len < b.len)       { ret 1; }
     ret 0;
 }
 
@@ -300,7 +604,7 @@ fun drop_overlaps(toks: *Tok, n: usize) usize {
 # one whose text the client has since changed is dropped, since its class
 # describes bytes that are gone. Mapping keeps offsets in order, so the deltas
 # stay non-negative.
-fun encode(b: *json.Buf, t: positions.Text, toks: *Tok, n: usize) {
+fun encode(t: positions.Text, toks: *Tok, n: usize, out: *i64) usize {
     var prev_line: usize = 0;
     var prev_char: usize = 0;
     var written:   usize = 0;
@@ -324,25 +628,24 @@ fun encode(b: *json.Buf, t: positions.Text, toks: *Tok, n: usize) {
         # a token the conversion split across lines cannot be expressed as a
         # single length, so it is dropped rather than encoded wrong
         if (r.end_line == r.start_line) {
-            if (written > 0) { json.buf_push_byte(b, ','); }
-            json.buf_push_usize(b, r.start_line - prev_line);
-            json.buf_push_byte(b, ',');
-            if (r.start_line == prev_line) { json.buf_push_usize(b, r.start_char - prev_char); }
-            or                             { json.buf_push_usize(b, r.start_char); }
-            json.buf_push_byte(b, ',');
-            json.buf_push_usize(b, r.end_char - r.start_char);
-            json.buf_push_byte(b, ',');
-            json.buf_push_i64(b, toks[i].kind);
-            json.buf_push_byte(b, ',');
-            json.buf_push_i64(b, toks[i].mods);
-            prev_line = r.start_line;
-            prev_char = r.start_char;
-            written   = written + 1;
+            out[written] = (r.start_line - prev_line)::i64;
+            if (r.start_line == prev_line) { out[written + 1] = (r.start_char - prev_char)::i64; }
+            or                             { out[written + 1] = r.start_char::i64; }
+            out[written + 2] = (r.end_char - r.start_char)::i64;
+            out[written + 3] = toks[i].kind;
+            out[written + 4] = toks[i].mods;
+            prev_line        = r.start_line;
+            prev_char        = r.start_char;
+            written          = written + 5;
         }
         i = i + 1;
     }
+    ret written;
 }
 
-fun reply_empty(alloc: *Allocator, id_raw: str) {
+# nothing, without a result id. a memo entry for the document is dropped with
+# it: the client has no id to send back, so there is nothing to diff against
+fun reply_empty(alloc: *Allocator, id_raw: str, memo: *Memo, uri: str) {
+    if (memo != nil) { forget(memo, uri); }
     render.reply_literal(alloc, id_raw, "{\"data\":[]}");
 }

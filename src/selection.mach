@@ -1,0 +1,266 @@
+# selection ranges: expanding a cursor outward through the syntax around it
+#
+# Syntax-only, like documentSymbol and foldingRange: the chain a cursor expands
+# through is a fact about the buffer's parse alone (#222). The parse is a tree,
+# so every node span that holds the cursor is nested in every longer one, and
+# the chain is those spans ordered from the longest down. Nothing has to walk
+# parent links: the node tables are scanned once each for spans holding the
+# cursor, the hits are sorted by length, and equal spans (a statement made of
+# one expression) collapse to one step. The chain is then held to strict
+# nesting on the way out, so a client never sees a step that does not contain
+# the one before it.
+#
+# The steps are the names first (an identifier, a member or field name, a
+# declared name), then expressions and types, statements, and the declaration.
+# A cursor at the end of a word still selects the word: containment here is
+# inclusive of a span's end, where the cursor sits after the last character.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.collections.sort;
+
+use mach.lang.editor;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.token;
+use sj: std.data.json;
+
+use mls.analysis;
+use mls.documents;
+use mls.features;
+use mls.json;
+use mls.positions;
+use mls.render;
+
+use std.allocator;
+
+# answer textDocument/selectionRange: one chain per requested position, in
+# the order the positions were given
+# ---
+# es:     the standalone editor session
+# alloc:  request allocator
+# docs:   the open-document registry
+# id:     the request id
+# params: the request params, holding `textDocument` and `positions`
+# uri:    the requested document
+pub fun selection_range(es: *editor.EditorSession, alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
+    if (id_raw == nil) { ret; }
+
+    val d:  *documents.Document = documents.find(docs, uri);
+    var an: analysis.Analyzed;
+    if (d == nil || !analysis.syntax_of(es, d, ?an)) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+
+    val positions_v: *sj.Value = json.member(params, "positions");
+    val n:           usize     = json.count(positions_v);
+
+    var b: json.Buf = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    var i: usize = 0;
+    for (i < n) {
+        if (i > 0) { json.buf_push_byte(?b, ','); }
+        push_chain(?b, an, json.element(positions_v, i), alloc);
+        i = i + 1;
+    }
+    json.buf_push_byte(?b, ']');
+    render.send(?b, alloc, id_raw);
+}
+
+# append the SelectionRange chain for one position
+#
+# A position outside the buffer, or one no node holds, answers an empty range
+# at the cursor with no parent: the protocol wants one entry per position, and
+# a client expands nothing from it.
+fun push_chain(b: *json.Buf, an: analysis.Analyzed, pos: *sj.Value, alloc: *Allocator) {
+    val line: i64        = json.number(json.member(pos, "line"), -1);
+    val ch:   i64        = json.number(json.member(pos, "character"), -1);
+    var oo:   opt[usize] = opt[usize].none{};
+    if (line >= 0 && ch >= 0) { oo = positions.offset_at(an.text, line::usize, ch::usize); }
+    if (sel oo.none) {
+        push_cursor(b, line, ch);
+        ret;
+    }
+    val offset: usize = oo.some;
+
+    val count: usize = collect(an.a, offset, nil, 0);
+    if (count == 0) {
+        push_cursor(b, line, ch);
+        ret;
+    }
+    val sa: res[*token.Span, allocator.Error] = allocate[token.Span](alloc, count);
+    if (sel sa.err) {
+        push_cursor(b, line, ch);
+        ret;
+    }
+    val spans: *token.Span = sa.ok;
+    val n:     usize       = collect(an.a, offset, spans, count);
+    sort.sort_by[token.Span](spans, n, outer_first);
+    val depth: usize = nest(spans, n);
+
+    # the innermost step is the value; each outer step is its `parent`
+    var open: usize = 0;
+    var k:    usize = depth;
+    for (k > 0) {
+        k = k - 1;
+        json.buf_push(b, "{\"range\":");
+        if (!render.span_range(b, an.text, spans[k])) { json.buf_push(b, "null"); }
+        open = open + 1;
+        if (k > 0) { json.buf_push(b, ",\"parent\":"); }
+    }
+    for (open > 0) {
+        json.buf_push_byte(b, '}');
+        open = open - 1;
+    }
+    deallocate[token.Span](alloc, spans, count);
+}
+
+# an empty SelectionRange at the requested position
+fun push_cursor(b: *json.Buf, line: i64, ch: i64) {
+    var r: positions.LspRange;
+    r.start_line = 0;
+    r.start_char = 0;
+    if (line > 0) { r.start_line = line::usize; }
+    if (ch > 0)   { r.start_char = ch::usize; }
+    r.end_line = r.start_line;
+    r.end_char = r.start_char;
+    json.buf_push(b, "{\"range\":");
+    render.range(b, r);
+    json.buf_push_byte(b, '}');
+}
+
+# every node span that holds `offset`, from each of the parse's tables
+#
+# Called twice: once with `out` nil to count, once to fill. The tables are
+# independent and unordered, which is why the caller sorts.
+# ---
+# a:      the buffer's parse
+# offset: the cursor's byte offset
+# out:    where to write spans, or nil to count
+# cap:    how many `out` holds
+# ret:    the number of spans holding the cursor
+fun collect(a: *ast.Ast, offset: usize, out: *token.Span, cap: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < a.decl_len) {
+        val d: *decl.Decl = ?a.decls[i];
+        n = push(out, n, cap, d.span, offset);
+        val nso: opt[token.Span] = features.decl_name_span(d);
+        if (sel nso.some) { n = push(out, n, cap, nso.some, offset); }
+        if (d.kind == decl.DECL_KIND_USE) {
+            n = push(out, n, cap, d.data.use_.alias, offset);
+            n = push(out, n, cap, d.data.use_.path, offset);
+        }
+        if (d.kind == decl.DECL_KIND_FWD) {
+            n = push(out, n, cap, d.data.fwd_.alias, offset);
+            n = push(out, n, cap, d.data.fwd_.path, offset);
+        }
+        if (d.kind == decl.DECL_KIND_TEST) { n = push(out, n, cap, d.data.test_.label, offset); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.stmt_len) {
+        n = push(out, n, cap, a.stmts[i].span, offset);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.expr_len) {
+        val e: *expr.Expr = ?a.exprs[i];
+        n = push(out, n, cap, e.span, offset);
+        if (e.kind == expr.EXPR_KIND_MEMBER) { n = push(out, n, cap, e.data.member.name, offset); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.type_len) {
+        n = push(out, n, cap, a.types[i].span, offset);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.typed_name_len) {
+        n = push(out, n, cap, a.typed_names[i].name, offset);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.tag_case_len) {
+        n = push(out, n, cap, a.tag_cases[i].name, offset);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.field_init_len) {
+        n = push(out, n, cap, a.field_inits[i].name, offset);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.generic_name_len) {
+        n = push(out, n, cap, a.generic_names[i], offset);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < a.decorator_len) {
+        n = push(out, n, cap, a.decorators[i].name, offset);
+        i = i + 1;
+    }
+    ret n;
+}
+
+# record `span` when it holds `offset`, counting past `cap`
+fun push(out: *token.Span, n: usize, cap: usize, span: token.Span, offset: usize) usize {
+    if (!holds(span, offset))  { ret n; }
+    if (n < cap && out != nil) { out[n] = span; }
+    ret n + 1;
+}
+
+# whether `span` holds a cursor at `offset`, its end included
+fun holds(span: token.Span, offset: usize) bool {
+    if (span.len == 0)        { ret false; }
+    if (offset < span.offset) { ret false; }
+    ret offset <= span.offset + span.len;
+}
+
+# longest first; among equal lengths the earlier start, so equal spans are adjacent
+fun outer_first(x: *token.Span, y: *token.Span) i64 {
+    if (x.len > y.len)       { ret -1; }
+    if (x.len < y.len)       { ret 1; }
+    if (x.offset < y.offset) { ret -1; }
+    if (x.offset > y.offset) { ret 1; }
+    ret 0;
+}
+
+# compact a sorted list to a strictly nested chain, outermost first
+#
+# A span equal to the one before it is the same step; one not inside the one
+# before it is a node the parse laid beside rather than within its neighbour,
+# and cannot be a step a client expands to.
+# ---
+# spans: sorted longest first
+# n:     how many
+# ret:   the chain's length; the chain occupies `spans[0 .. ret)`
+fun nest(spans: *token.Span, n: usize) usize {
+    if (n == 0) { ret 0; }
+    var w: usize = 1;
+    var i: usize = 1;
+    for (i < n) {
+        val outer: token.Span = spans[w - 1];
+        val inner: token.Span = spans[i];
+        i = i + 1;
+        if (inner.offset == outer.offset && inner.len == outer.len) { cnt; }
+        if (inner.offset < outer.offset)                            { cnt; }
+        if (inner.offset + inner.len > outer.offset + outer.len)    { cnt; }
+        spans[w] = inner;
+        w        = w + 1;
+    }
+    ret w;
+}

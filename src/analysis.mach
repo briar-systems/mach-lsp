@@ -206,6 +206,37 @@ pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.As
     ret an.a;
 }
 
+# the syntax-only view of an open document: its parse and its text, nothing
+# semantic
+#
+# A feature that needs only the shape of the buffer (documentSymbol, folding)
+# answers from the buffer's own parse and never waits on, or pays for, a
+# project snapshot. That is what makes it answer while a project's manifest
+# cannot load, and in milliseconds while the snapshot is behind. `rr` and `sr`
+# are nil by construction, and `text` is the buffer itself, so nothing maps.
+# ---
+# es:  the standalone editor session
+# doc: the open document
+# out: receives the view on success
+# ret: true when the document parsed
+pub fun syntax_of(es: *editor.EditorSession, doc: *documents.Document, out: *Analyzed) bool {
+    val tree: *ast.Ast = syntax_tree(es, doc);
+    if (tree == nil) { ret false; }
+    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (sel fo.none) { ret false; }
+    out.interner = nil;
+    out.text     = positions.text_of(fo.some);
+    out.sr       = nil;
+    out.a        = tree;
+    out.rr       = nil;
+    out.own      = sess.MODULE_NIL;
+    out.own_fid  = doc.file_id;
+    out.root     = nil;
+    out.stale    = false;
+    out.current  = true;
+    ret true;
+}
+
 # analyze the requested document and convert its cursor position to a byte
 # offset, or none when the document is unknown, unanalyzable, or the position
 # falls outside it
@@ -247,4 +278,36 @@ pub fun offset_of(params: *sj.Value, t: positions.Text) opt[usize] {
     val ch:   i64       = json.number(json.member(pos, "character"), -1);
     if (line < 0 || ch < 0) { ret opt[usize].none{}; }
     ret positions.offset_at(t, line::usize, ch::usize);
+}
+
+# the byte offsets denoted by a request's `range`, a filter over the document
+# rather than a cursor: a bound inside an edit window widens to the window's
+# edge (`positions.bound_at`), so a visible range that spans an edit still
+# covers what the analysis can say on either side of it. `lo` and `hi` are
+# left as the caller set them when the range is absent or does not map
+# ---
+# params: the request's params object
+# t:      the file the range indexes, paired with its length
+# lo:     receives the start offset
+# hi:     receives the end offset, never below `lo`
+# ret:    whether a range was read
+pub fun request_range(params: *sj.Value, t: positions.Text, lo: *usize, hi: *usize) bool {
+    val rng: *sj.Value = json.member(params, "range");
+    if (rng == nil) { ret false; }
+    val so: opt[usize] = bound_of(rng, "start", t, false);
+    val eo: opt[usize] = bound_of(rng, "end", t, true);
+    if (sel so.none) { ret false; }
+    if (sel eo.none) { ret false; }
+    @lo = so.some;
+    @hi = eo.some;
+    if (@hi < @lo) { @hi = @lo; }
+    ret true;
+}
+
+fun bound_of(rng: *sj.Value, key: str, t: positions.Text, is_end: bool) opt[usize] {
+    val p:    *sj.Value = json.member(rng, key);
+    val line: i64       = json.number(json.member(p, "line"), -1);
+    val ch:   i64       = json.number(json.member(p, "character"), -1);
+    if (line < 0 || ch < 0) { ret positions.bound_at(t, 0, 0, is_end); }
+    ret positions.bound_at(t, line::usize, ch::usize, is_end);
 }

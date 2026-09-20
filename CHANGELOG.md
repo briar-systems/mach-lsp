@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-19
+
+Four syntax and token features: folding ranges, selection ranges, semantic
+tokens by viewport range, and semantic token deltas. The one protocol-visible
+shape change is `semanticTokensProvider.full`, now `{ "delta": true }`
+rather than `true`, which every client reads as the same truthy `full`. Same
+asset set, CLI and options as 1.3.0.
+
+**The linked mach moves from v5.9.0 to v5.10.0, and std from v4.0.0 to
+v6.1.0** (`^6.1`, the std mach 5.10.0 builds with).
+
+### Added
+- feat(#221): `textDocument/foldingRange`. A `fun` or `test` folds its body
+  statement, so a signature spread over lines stays in view; a `rec`, `uni`,
+  `tag` or `$if` folds from its first line to its closing brace, reported as
+  `endCharacter` so a client that folds by character keeps the brace. A run of
+  adjacent `use` and `fwd` lines is one `imports` range and a doc block one
+  `comment` range, so fold-all-imports and fold-all-comments find them. A range
+  that would hide no line is not reported. Syntax-only, like documentSymbol:
+  it answers from the buffer's own parse, while the project's manifest cannot
+  load and without waiting on a snapshot, and holds the same latency contract.
+- feat(#222): `textDocument/selectionRange`. A cursor expands one syntax level
+  at a time: the name under it, then each enclosing expression, type,
+  statement and the declaration, every step strictly containing the one
+  before. A cursor at the end of a word still starts from the word. A position
+  nothing holds answers an empty range at the cursor, so the reply keeps one
+  entry per position. Syntax-only, on the same parse as documentSymbol and
+  foldingRange, under the same latency contract.
+- perf(#225): `textDocument/semanticTokens/range`, advertised beside `full`.
+  The classification is the same walk with the viewport applied where every
+  walk converges, so a keystroke on a large module costs the tokens in view
+  rather than the 5513 of the whole file. A token that straddles a viewport
+  edge is kept whole, and a range while the buffer is ahead of the snapshot
+  widens across the edit in flight, as inlay hints already did.
+- perf(#359): `textDocument/semanticTokens/full/delta`, advertised as
+  `full: { delta: true }`. Every `full` answer carries a `resultId`, and a
+  delta against the id the server holds for the document answers the one
+  edit between the two arrays' common prefix and suffix, so a keystroke on a
+  large module resends the tokens that moved rather than all of them. An id
+  the server does not hold answers a full payload instead. The retained array
+  is one per open document, replaced by each answer and released when the
+  document closes or when an answer cannot be computed.
+
+### Changed
+- chore(#362): the linked mach moves from v5.9.0 to v5.10.0, and std from
+  v4.0.0 to v6.1.0 (`^6.1`), which mach 5.10.0 builds with. Two clock reads
+  move from std's removed `time.monotonic` to `time.instant`, and the two
+  comparator sorts to `sort_by`. Semantic tokens that start at one offset now
+  keep the longer one, the outer classification, where the tie was unordered
+  before. `[project].mach` is `^5.9`: nothing here needs a newer compiler.
+- refactor(#225): the request `range` to byte offsets conversion that inlay
+  hints and code actions each carried a copy of is one function,
+  `analysis.request_range`, which semantic tokens now share.
+
 ## [1.3.0] - 2026-09-19
 
 Completion while the buffer is ahead of the snapshot answers from the snapshot
