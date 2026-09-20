@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-09-20
+
+One completion fix for an outside report (#366): a member added to a type
+declared in an open file is offered on the next completion request instead of
+after the next project rebuild. Same asset set, CLI, options and linked mach
+(v5.10.0, std v6.1.0) as 1.4.0.
+
 ### Fixed
 - perf(#367): member completion after `.` reads the fields and tag cases of a
   type from the live parse of its declaring document while that document's
