@@ -83,7 +83,15 @@ Completion offers, by prefix, every name the document's resolve table binds,
 whether or not it is in scope at the cursor. After a `.` it offers a module
 alias's public symbols, or the fields of the record or union the receiver has.
 While the buffer is ahead of the project's last analysis, the alias's module
-is taken from that analysis by name, so the list is there while you type.
+is taken from that analysis by name, so the list is there while you type. The
+members of a receiver's type are read the same way, from the last analysis,
+with one exception (#367): when the document declaring that type is open and
+its buffer is ahead of the snapshot, the field names, written annotations and
+tag cases come from a parse of that buffer, so a member you just typed is
+offered on the next request rather than after the rebuild. The parse contributes
+text only, nothing from it is joined to the snapshot, and the answer stays
+`isIncomplete` until the rebuild lands. A document that is not open has no
+buffer to read, so a change to it waits for the rebuild.
 
 The first semantic request still performs a synchronous whole-project frontend
 analysis. Syntax-only document symbols, folding ranges and selection ranges do
