@@ -36,6 +36,7 @@ use src:     mach.lang.source;
 use sj:      std.data.json;
 use strutil: std.text.string;
 
+use mls.analysis;
 use mls.documents;
 use mls.json;
 use mls.positions;
@@ -86,7 +87,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
 
     var lo: usize = 0;
     var hi: usize = 0;
-    if (!request_range(params, v.text, ?lo, ?hi)) {
+    if (!analysis.request_range(params, v.text, ?lo, ?hi)) {
         render.reply_empty_array(alloc, id_raw);
         ret;
     }
@@ -210,28 +211,6 @@ fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
     if (end < lo)      { ret false; }
     if (start > hi)    { ret false; }
     ret true;
-}
-
-# resolve the request's `range` to byte offsets
-fun request_range(params: *sj.Value, file: positions.Text, lo: *usize, hi: *usize) bool {
-    val rng: *sj.Value = json.member(params, "range");
-    if (rng == nil) { ret false; }
-    val so: opt[usize] = bound_of(rng, "start", file, false);
-    val eo: opt[usize] = bound_of(rng, "end", file, true);
-    if (sel so.none) { ret false; }
-    if (sel eo.none) { ret false; }
-    @lo = so.some;
-    @hi = eo.some;
-    if (@hi < @lo) { @hi = @lo; }
-    ret true;
-}
-
-fun bound_of(rng: *sj.Value, key: str, file: positions.Text, is_end: bool) opt[usize] {
-    val p:    *sj.Value = json.member(rng, key);
-    val line: i64       = json.number(json.member(p, "line"), -1);
-    val ch:   i64       = json.number(json.member(p, "character"), -1);
-    if (line < 0 || ch < 0) { ret positions.bound_at(file, 0, 0, is_end); }
-    ret positions.bound_at(file, line::usize, ch::usize, is_end);
 }
 
 # whether the request's `only` filter admits quickfix

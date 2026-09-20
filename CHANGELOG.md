@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing holds answers an empty range at the cursor, so the reply keeps one
   entry per position. Syntax-only, on the same parse as documentSymbol and
   foldingRange, under the same latency contract.
+- perf(#225): `textDocument/semanticTokens/range`, advertised beside `full`.
+  The classification is the same walk with the viewport applied where every
+  walk converges, so a keystroke on a large module costs the tokens in view
+  rather than the 5513 of the whole file. A token that straddles a viewport
+  edge is kept whole, and a range while the buffer is ahead of the snapshot
+  widens across the edit in flight, as inlay hints already did. `full/delta`
+  is #359.
+
+### Changed
+- refactor(#225): the request `range` to byte offsets conversion that inlay
+  hints and code actions each carried a copy of is one function,
+  `analysis.request_range`, which semantic tokens now share.
 
 ## [1.3.0] - 2026-09-19
 

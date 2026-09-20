@@ -73,14 +73,55 @@ rec Tok {
     mods:   i64;
 }
 
+# the part of the document a request asks about, in analysis offsets
+#
+# `full` asks about all of it. `range` asks about the client's viewport, which
+# arrives in the client's buffer and is carried to the analysis through
+# `analysis.request_range`, widening across an edit in flight so the viewport
+# still covers what the snapshot can say on either side of it (#225). A token
+# that straddles a bound is kept whole: a classification is a property of the
+# token, and a viewport edge is not a reason to split one.
+# ---
+# lo: first offset of interest
+# hi: one past the last
+rec Window {
+    lo: usize;
+    hi: usize;
+}
+
 # answer textDocument/semanticTokens/full
 pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
     docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    answer(ws, es, alloc, docs, req_id, params, uri, false);
+}
+
+# answer textDocument/semanticTokens/range: the tokens of `full` that touch the
+# requested range, and no others
+pub fun semantic_tokens_range(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str) {
+    answer(ws, es, alloc, docs, req_id, params, uri, true);
+}
+
+# classify the document, or the requested range of it, and reply
+#
+# A `range` request whose range is absent or does not map answers nothing
+# rather than everything: the client asked for a viewport, and a whole-file
+# answer to that is the payload it was trying to avoid.
+fun answer(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
+    docs: *documents.Store, req_id: *sj.Value, params: *sj.Value, uri: str, ranged: bool) {
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
 
     var an: analysis.Analyzed;
     if (!analysis.analyze(ws, es, docs, uri, ?an)) {
+        reply_empty(alloc, id_raw);
+        ret;
+    }
+
+    var w: Window;
+    w.lo = 0;
+    w.hi = an.text.len;
+    if (ranged && !analysis.request_range(params, an.text, ?w.lo, ?w.hi)) {
         reply_empty(alloc, id_raw);
         ret;
     }
@@ -92,7 +133,7 @@ pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc
     }
     val toks: *Tok = ta.ok;
 
-    var n: usize = collect(an, toks, MAX_TOKENS);
+    var n: usize = collect(an, w, toks, MAX_TOKENS);
     if (n > 1) {
         sort.sort[Tok](toks, n, by_offset);
         n = drop_overlaps(toks, n);
@@ -108,13 +149,14 @@ pub fun semantic_tokens(ws: *project.Workspace, es: *editor.EditorSession, alloc
     deallocate[Tok](alloc, toks, MAX_TOKENS);
 }
 
-# gather every classifiable span in the buffer
+# gather every classifiable span in the window
 #
 # The four walks are independent: a declaration's own name comes from the decl
 # table, a reference from the expression or type side tables, and an import leaf
 # from the declaration's path. Nothing orders them, which is why the caller
-# sorts.
-fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
+# sorts. The window is applied where every walk converges, in `push`, so no walk
+# can forget it.
+fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     var n: usize = 0;
 
     var di: usize = 0;
@@ -124,10 +166,10 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
             val d:   *decl.Decl      = d_opt.some;
             val nso: opt[token.Span] = features.decl_name_span(d);
             if (sel nso.some) {
-                n = push(out, n, cap, nso.some,
+                n = push(out, n, cap, w, nso.some,
                     decl_token_type(d.kind), M_DECLARATION);
             }
-            n = collect_members(an, d, out, n, cap);
+            n = collect_members(an, d, w, out, n, cap);
         }
         di = di + 1;
     }
@@ -139,7 +181,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
             val sid: rslv.SymbolId   = so.some;
             val spo: opt[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
             if (sel spo.some) {
-                n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
+                n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ei = ei + 1;
@@ -152,7 +194,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
             val sid: rslv.SymbolId   = so.some;
             val spo: opt[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
             if (sel spo.some) {
-                n = push(out, n, cap, spo.some, symbol_token_type(an, sid), M_NONE);
+                n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ti = ti + 1;
@@ -163,7 +205,7 @@ fun collect(an: analysis.Analyzed, out: *Tok, cap: usize) usize {
 
 # a declaration's own members: record fields, union variants, parameters, and
 # generic parameters, which no side table records as references
-fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usize, cap: usize) usize {
+fun collect_members(an: analysis.Analyzed, d: *decl.Decl, w: Window, out: *Tok, count: usize, cap: usize) usize {
     var n:            usize = count;
     var fields_start: u32   = 0;
     var fields_len:   u32   = 0;
@@ -195,7 +237,7 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usiz
     var g: u32 = 0;
     for (g < gen_len && n < cap) {
         if (an.a.generic_names != nil) {
-            n = push(out, n, cap, an.a.generic_names[(gen_start + g)::usize],
+            n = push(out, n, cap, w, an.a.generic_names[(gen_start + g)::usize],
                 T_TYPE_PARAMETER, M_DECLARATION);
         }
         g = g + 1;
@@ -204,7 +246,7 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, out: *Tok, count: usiz
     for (f < fields_len && n < cap) {
         if (an.a.typed_names != nil) {
             val tn: *decl.TypedName = ?an.a.typed_names[(fields_start + f)::usize];
-            n = push(out, n, cap, tn.name, member_type, M_DECLARATION);
+            n = push(out, n, cap, w, tn.name, member_type, M_DECLARATION);
         }
         f = f + 1;
     }
@@ -257,13 +299,21 @@ fun decl_token_type(kind: decl.DeclKind) i64 {
     ret T_VARIABLE;
 }
 
-fun push(out: *Tok, count: usize, cap: usize, span: token.Span, kind: i64, mods: i64) usize {
+fun push(out: *Tok, count: usize, cap: usize, w: Window, span: token.Span, kind: i64, mods: i64) usize {
     if (count >= cap || span.len == 0) { ret count; }
+    if (!touches(w, span))             { ret count; }
     out[count].offset = span.offset;
     out[count].len    = span.len;
     out[count].kind   = kind;
     out[count].mods   = mods;
     ret count + 1;
+}
+
+# whether a token has any byte inside the window
+fun touches(w: Window, span: token.Span) bool {
+    if (span.offset >= w.hi)            { ret false; }
+    if (span.offset + span.len <= w.lo) { ret false; }
+    ret true;
 }
 
 fun by_offset(a: *Tok, b: *Tok) i64 {
