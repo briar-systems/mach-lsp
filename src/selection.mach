@@ -108,7 +108,7 @@ fun push_chain(b: *json.Buf, an: analysis.Analyzed, pos: *sj.Value, alloc: *Allo
     }
     val spans: *token.Span = sa.ok;
     val n:     usize       = collect(an.a, offset, spans, count);
-    sort.sort[token.Span](spans, n, outer_first);
+    sort.sort_by[token.Span](spans, n, outer_first);
     val depth: usize = nest(spans, n);
 
     # the innermost step is the value; each outer step is its `parent`

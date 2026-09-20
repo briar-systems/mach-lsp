@@ -40,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document closes or when an answer cannot be computed.
 
 ### Changed
+- chore(#362): the linked mach moves from v5.9.0 to v5.10.0, and std from
+  v4.0.0 to v6.1.0 (`^6.1`), which mach 5.10.0 builds with. Two clock reads
+  move from std's removed `time.monotonic` to `time.instant`, and the two
+  comparator sorts to `sort_by`. Semantic tokens that start at one offset now
+  keep the longer one, the outer classification, where the tie was unordered
+  before. `[project].mach` is `^5.9`: nothing here needs a newer compiler.
 - refactor(#225): the request `range` to byte offsets conversion that inlay
   hints and code actions each carried a copy of is one function,
   `analysis.request_range`, which semantic tokens now share.
