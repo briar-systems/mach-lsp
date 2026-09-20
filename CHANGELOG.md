@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-19
+
+Four syntax and token features: folding ranges, selection ranges, semantic
+tokens by viewport range, and semantic token deltas. The one protocol-visible
+shape change is `semanticTokensProvider.full`, now `{ "delta": true }`
+rather than `true`, which every client reads as the same truthy `full`. Same
+asset set, CLI and options as 1.3.0.
+
+**The linked mach moves from v5.9.0 to v5.10.0, and std from v4.0.0 to
+v6.1.0** (`^6.1`, the std mach 5.10.0 builds with).
+
 ### Added
 - feat(#221): `textDocument/foldingRange`. A `fun` or `test` folds its body
   statement, so a signature spread over lines stays in view; a `rec`, `uni`,
