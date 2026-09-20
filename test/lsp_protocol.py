@@ -4574,6 +4574,165 @@ def run_completion_behind_from_snapshot(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_completion_members_from_ahead_document(server: Path, timeout: float) -> None:
+    """Member completion reads a type's members from the live parse of its
+    declaring document while that document's buffer is ahead of the snapshot
+    (#367, reported as #366).
+
+    The snapshot resolves the receiver and names the declaring module. The
+    member list used to come from the snapshot's parse of that module, so a
+    field typed into a record after the snapshot was built was invisible until
+    a rebuild that included the edit landed: one to two rebuilds later, up to
+    16s on the reporter's machine. When the declaring document is open and
+    ahead, the field names, written annotations and tag cases now come from the
+    parse of its buffer, text only, and the answer is `isIncomplete` until the
+    rebuild lands.
+
+    Four shapes are asserted with the rebuild held. A field added to a record
+    declared in the edited document appears in `x.` at once. A case added to a
+    tag declared there appears in `Color.` at once. A field added to a sibling
+    document that is open and ahead appears in a chain through it from a
+    requesting buffer that is itself current, because the test is on the
+    declaring document, not the requesting one. A field added to a document
+    that is then closed waits for the rebuild: a buffer the server no longer
+    has is not a second analysis source. Released, the snapshot's own list
+    answers with `isIncomplete: false`.
+    """
+    if os.name != "posix":
+        print("  completion members from ahead document: skipped (rebuild gate needs flock)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-compl-ahead-") as directory:
+        root = Path(directory).resolve()
+        main, defs, _ = write_project(root, "ahead", 1)
+        defs_base = ["pub rec Inner { a: i32; b: i32; }",
+                     "pub rec Outer { inner: Inner; n: i32; }"]
+        defs_text = "\n".join(defs_base) + "\n"
+        defs.write_text(defs_text, encoding="utf-8")
+        base = ["use pt: ahead.defs;",
+                "",
+                "pub rec Local { x: i32; }",
+                "pub tag Color: u8 { red; green; }",
+                "",
+                "pub fun main() i32 {",
+                "    var o: pt.Outer;",
+                "    var l: Local;",
+                "    l.x = 1;",
+                "    val c: Color = Color.red{};",
+                "    ret l.x + o.n;",
+                "}"]
+        text = "\n".join(base) + "\n"
+        main.write_text(text, encoding="utf-8")
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            assert_diagnostics(session.diagnostics(main.as_uri(), 1), False, 1)
+            versions = {main.as_uri(): 1, defs.as_uri(): 0}
+
+            def changes(uri: str, body: str, count: int) -> list[tuple[str, dict[str, Any]]]:
+                out = []
+                for _ in range(count):
+                    versions[uri] += 1
+                    out.append(("textDocument/didChange",
+                                {"textDocument": {"uri": uri, "version": versions[uri]},
+                                 "contentChanges": [{"text": body}]}))
+                return out
+
+            def completion(notifications: list[tuple[str, dict[str, Any]]], lines: list[str],
+                           needle: str, incomplete: bool, what: str) -> list[str]:
+                line = lines.index(needle)
+                answer = session.request_after_notifications(
+                    notifications, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": line, "character": len(needle)}})
+                result = answer.get("result")
+                require(isinstance(result, dict) and result.get("isIncomplete") is incomplete,
+                        f"completion for {what} did not report isIncomplete={incomplete}: {answer!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            # a field added to a record declared in the edited document
+            lines = [("pub rec Local { x: i32; y: i32; }" if l.startswith("pub rec Local") else l) for l in base]
+            lines.insert(lines.index("    l.x = 1;") + 1, "    l.")
+            body = "\n".join(lines) + "\n"
+            require(completion(changes(main.as_uri(), body, 32), lines, "    l.", True, "a field added in the edited document")
+                    == ["x", "y"],
+                    "a field added to a record declared in the edited document was not offered while behind")
+
+            # a case added to a tag declared in the edited document
+            lines = [("pub tag Color: u8 { red; green; blue; }" if l.startswith("pub tag Color") else l) for l in base]
+            lines.insert(lines.index("    val c: Color = Color.red{};") + 1, "    val d: Color = Color.")
+            body = "\n".join(lines) + "\n"
+            require(completion(changes(main.as_uri(), body, 32), lines, "    val d: Color = Color.", True,
+                               "a case added in the edited document")
+                    == ["red", "green", "blue"],
+                    "a case added to a tag declared in the edited document was not offered while behind")
+
+            # let the snapshot take main's `o.inner.` line in, so the requesting
+            # buffer is current for the sibling probe
+            gate.release()
+            lines = base[:base.index("    var o: pt.Outer;") + 1] + ["    val k: i32 = o.inner.a;"] + base[base.index("    var o: pt.Outer;") + 1:]
+            body = "\n".join(lines) + "\n"
+            versions[main.as_uri()] += 1
+            session.notify("textDocument/didChange", {"textDocument": {
+                "uri": main.as_uri(), "version": versions[main.as_uri()]}, "contentChanges": [{"text": body}]})
+            session.diagnostics(main.as_uri(), versions[main.as_uri()])
+            probe = lines[:lines.index("    val k: i32 = o.inner.a;")] + ["    val k: i32 = o.inner."] + lines[lines.index("    val k: i32 = o.inner.a;") + 1:]
+            probe_body = "\n".join(probe) + "\n"
+            versions[main.as_uri()] += 1
+            session.notify("textDocument/didChange", {"textDocument": {
+                "uri": main.as_uri(), "version": versions[main.as_uri()]}, "contentChanges": [{"text": probe_body}]})
+            settled_result(
+                session, "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": probe.index("    val k: i32 = o.inner."), "character": len("    val k: i32 = o.inner.")}},
+                lambda r: isinstance(r, dict) and r.get("isIncomplete") is False
+                and [i.get("label") for i in r.get("items", [])] == ["a", "b"],
+                "the snapshot catching up with the sibling probe line")
+            gate.hold()
+
+            # a field added to a sibling document that is open and ahead: the
+            # requesting buffer is current, the declaring one is not
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": defs.as_uri(), "languageId": "mach", "version": 1, "text": defs_text}})
+            versions[defs.as_uri()] = 1
+            defs_lines = ["pub rec Inner { a: i32; b: i32; c: i32; }", defs_base[1]]
+            defs_body = "\n".join(defs_lines) + "\n"
+            require(completion(changes(defs.as_uri(), defs_body, 32), probe, "    val k: i32 = o.inner.", True,
+                               "a field added in an open sibling")
+                    == ["a", "b", "c"],
+                    "a field added in an open sibling document ahead of the snapshot was not offered")
+
+            # the sibling closed: its buffer is gone, and the snapshot's list
+            # is the only source until the rebuild lands
+            require(completion([("textDocument/didClose", {"textDocument": {"uri": defs.as_uri()}})],
+                               probe, "    val k: i32 = o.inner.", False, "a field added in a closed sibling")
+                    == ["a", "b"],
+                    "a closed document's last buffer was used as a second analysis source")
+
+            # released, the snapshot's own list answers. the sibling was closed
+            # with the file on disk unchanged, so the field is gone again
+            gate.release()
+            settled_result(
+                session, "textDocument/completion",
+                {"textDocument": {"uri": main.as_uri()},
+                 "position": {"line": probe.index("    val k: i32 = o.inner."), "character": len("    val k: i32 = o.inner.")}},
+                lambda r: isinstance(r, dict) and r.get("isIncomplete") is False
+                and [i.get("label") for i in r.get("items", [])] == ["a", "b"],
+                "the caught-up sibling member list")
+
+            session.finish()
+            finished = True
+        finally:
+            gate.close()
+            if not finished:
+                session.abort()
+
+
 def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
     """Completion after a `.` on a receiver whose type is reached through a `fwd`
     re-export, while the buffer is ahead of the snapshot (#332, #334).
@@ -6688,6 +6847,7 @@ def main() -> int:
         run_completion_type_position_and_imported_members(server, args.timeout)
         run_completion_fwd_reexport_members(server, args.timeout)
         run_completion_behind_from_snapshot(server, args.timeout)
+        run_completion_members_from_ahead_document(server, args.timeout)
         run_document_highlight(server, args.timeout)
         run_workspace_symbol(server, args.timeout)
         run_signature_help(server, args.timeout)
