@@ -2951,7 +2951,7 @@ fun emit_receiver_members(ws: *project.Workspace, es: *editor.EditorSession, doc
         ts = next.some;
         i  = i + 1;
     }
-    ret emit_type_site_members(live, alloc, id_raw, prefix, ts, incomplete);
+    ret emit_type_site_members(ws, es, an.root, live, alloc, id_raw, prefix, ts, incomplete);
 }
 
 # the identifier chain ending at `dot`, `a.b.c` as its segments in source
@@ -3269,19 +3269,47 @@ fun same_file_type_decl(a: *ast.Ast, file: *src.SourceFile, nfile: *src.SourceFi
 
 # offer the members of the type at `ts`: a rec's or uni's fields, or a tag's
 # case selectors. `pfile` is the buffer `prefix` indexes
-fun emit_type_site_members(pfile: *src.SourceFile, alloc: *Allocator, id_raw: str,
-    prefix: token.Span, ts: project.TypeSite, incomplete: bool) bool {
-    val d_opt: opt[*decl.Decl] = ast.get_decl(ts.a, ts.decl);
+#
+# The snapshot resolved the receiver and named the declaring module. When the
+# buffer of that module's document has moved past the snapshot, the member list
+# is read from the parse of that buffer instead, so a member typed since the
+# snapshot is offered on the next request rather than one rebuild later (#367,
+# reported as #366). That parse contributes text only, names and written
+# annotations, and the answer stays incomplete until the rebuild lands. The
+# test is on the declaring document, not the requesting one: a sibling buffer
+# ahead of the snapshot changes the type just the same.
+fun emit_type_site_members(ws: *project.Workspace, es: *editor.EditorSession, root: *project.Root,
+    pfile: *src.SourceFile, alloc: *Allocator, id_raw: str, prefix: token.Span, ts: project.TypeSite,
+    incomplete: bool) bool {
+    var a:     *ast.Ast            = ts.a;
+    var text:  positions.Text      = ts.text;
+    var did:   id.DeclId           = ts.decl;
+    var inc:   bool                = incomplete;
+    val ahead: *documents.Document = project.ahead_document(ws, root, ts.origin);
+    if (ahead != nil) {
+        val tree:  *ast.Ast        = analysis.syntax_tree(es, ahead);
+        val afile: *src.SourceFile = documents.live_file(ws.docs, ahead);
+        if (tree != nil && afile != nil) {
+            val own: opt[id.DeclId] = same_file_type_decl(tree, afile, ts.text.file, ts.name_span);
+            if (sel own.some) {
+                a    = tree;
+                text = positions.text_of(afile);
+                did  = own.some;
+                inc  = true;
+            }
+        }
+    }
+    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) { ret false; }
     val d: *decl.Decl = d_opt.some;
     if (d.kind == decl.DECL_KIND_REC) {
-        ret emit_fields_of(pfile, alloc, id_raw, prefix, ts.a, ts.text, d.data.rec_.fields_start, d.data.rec_.fields_len, incomplete);
+        ret emit_fields_of(pfile, alloc, id_raw, prefix, a, text, d.data.rec_.fields_start, d.data.rec_.fields_len, inc);
     }
     if (d.kind == decl.DECL_KIND_UNI) {
-        ret emit_fields_of(pfile, alloc, id_raw, prefix, ts.a, ts.text, d.data.uni_.fields_start, d.data.uni_.fields_len, incomplete);
+        ret emit_fields_of(pfile, alloc, id_raw, prefix, a, text, d.data.uni_.fields_start, d.data.uni_.fields_len, inc);
     }
     if (d.kind == decl.DECL_KIND_TAG) {
-        ret emit_tag_cases_from_decl(pfile, alloc, id_raw, prefix, ts.a, ts.text, d, incomplete);
+        ret emit_tag_cases_from_decl(pfile, alloc, id_raw, prefix, a, text, d, inc);
     }
     ret false;
 }

@@ -2170,21 +2170,34 @@ fun free_windows(w: *Workspace, r: *Root) {
 # file: the module's snapshot source
 # ret:  the pairing
 fun module_text(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile) positions.Text {
-    val plain: positions.Text = positions.text_of(file);
-    if (w.docs == nil || root.mod_paths == nil || mid::u32 >= root.mod_path_count) { ret plain; }
+    val d: *documents.Document = ahead_document(w, root, mid);
+    if (d == nil) { ret positions.text_of(file); }
+    ret positions.text_against(file, documents.live_file(w.docs, d), module_windows(w, root, mid, file, d));
+}
+
+# the open document mirroring module `mid` of `root` whose text has moved past
+# the snapshot, or nil when no open buffer is ahead of what the snapshot saw of
+# that module. the one place a snapshot module is paired with a live buffer
+# ---
+# w:    the workspace
+# root: the module's root, or nil
+# mid:  a module of `root`'s snapshot
+# ret:  the ahead document, or nil
+pub fun ahead_document(w: *Workspace, root: *Root, mid: sess.ModuleId) *documents.Document {
+    if (w.docs == nil || root == nil || root.mod_paths == nil || mid::u32 >= root.mod_path_count) { ret nil; }
     val path: str = root.mod_paths[mid::u32];
-    if (path == nil) { ret plain; }
+    if (path == nil) { ret nil; }
     val n: usize = documents.slot_count(w.docs);
     var i: usize = 0;
     for (i < n) {
         val d: *documents.Document = documents.at(w.docs, i);
         if (d != nil && d.in_use && d.path != nil && str_equals(d.path, path)) {
-            if (d.revision <= root.snapshot_revision) { ret plain; }
-            ret positions.text_against(file, documents.live_file(w.docs, d), module_windows(w, root, mid, file, d));
+            if (d.revision <= root.snapshot_revision) { ret nil; }
+            ret d;
         }
         i = i + 1;
     }
-    ret plain;
+    ret nil;
 }
 
 # the semantic type of expression `eid` in SemaResult `sr`, or TYPE_NIL
