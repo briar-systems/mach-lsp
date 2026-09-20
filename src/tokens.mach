@@ -223,7 +223,7 @@ fun answer(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
 
     var n: usize = collect(an, w, toks, MAX_TOKENS);
     if (n > 1) {
-        sort.sort[Tok](toks, n, by_offset);
+        sort.sort_by[Tok](toks, n, by_offset);
         n = drop_overlaps(toks, n);
     }
 
@@ -566,9 +566,13 @@ fun touches(w: Window, span: token.Span) bool {
     ret true;
 }
 
+# by start, and at one start the longer token first, so the outer one is the
+# one drop_overlaps keeps
 fun by_offset(a: *Tok, b: *Tok) i64 {
     if (a.offset < b.offset) { ret -1; }
     if (a.offset > b.offset) { ret 1; }
+    if (a.len > b.len)       { ret -1; }
+    if (a.len < b.len)       { ret 1; }
     ret 0;
 }
 
