@@ -29,8 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   walk converges, so a keystroke on a large module costs the tokens in view
   rather than the 5513 of the whole file. A token that straddles a viewport
   edge is kept whole, and a range while the buffer is ahead of the snapshot
-  widens across the edit in flight, as inlay hints already did. `full/delta`
-  is #359.
+  widens across the edit in flight, as inlay hints already did.
+- perf(#359): `textDocument/semanticTokens/full/delta`, advertised as
+  `full: { delta: true }`. Every `full` answer carries a `resultId`, and a
+  delta against the id the server holds for the document answers the one
+  edit between the two arrays' common prefix and suffix, so a keystroke on a
+  large module resends the tokens that moved rather than all of them. An id
+  the server does not hold answers a full payload instead. The retained array
+  is one per open document, replaced by each answer and released when the
+  document closes or when an answer cannot be computed.
 
 ### Changed
 - refactor(#225): the request `range` to byte offsets conversion that inlay
