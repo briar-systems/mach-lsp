@@ -5067,8 +5067,8 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
                 "initialize", {"rootUri": root.as_uri(), "capabilities": {}}).get("result", {})
             provider = result.get("capabilities", {}).get("semanticTokensProvider")
             require(isinstance(provider, dict), f"semanticTokensProvider missing: {provider!r}")
-            require(provider.get("full") is True and provider.get("range") is True,
-                    f"semanticTokensProvider does not offer full and range: {provider!r}")
+            require(provider.get("full") == {"delta": True} and provider.get("range") is True,
+                    f"semanticTokensProvider does not offer full with delta, and range: {provider!r}")
             legend = provider.get("legend", {})
             types = legend.get("tokenTypes")
             require(isinstance(types, list) and types, f"no token legend: {legend!r}")
@@ -5088,6 +5088,9 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
             require(isinstance(payload, dict), f"semanticTokens is not an object: {payload!r}")
             data = payload.get("data")
             require(isinstance(data, list) and data, f"no token data: {payload!r}")
+            first_id = payload.get("resultId")
+            require(isinstance(first_id, str) and first_id,
+                    f"a full answer carried no resultId: {payload!r}")
             require(len(data) % 5 == 0,
                     f"token data is not a multiple of five: {len(data)}")
 
@@ -5166,6 +5169,68 @@ def run_semantic_tokens(server: Path, timeout: float) -> None:
                 "textDocument/semanticTokens/range", {"textDocument": {"uri": main.as_uri()}})
             require(missing.get("result") == {"data": []},
                     f"a range request without a range did not answer no tokens: {missing!r}")
+
+            # full/delta against the id just issued (#359): nothing changed, so
+            # no edits, and a new id to continue from
+            def delta(previous: str) -> dict:
+                reply = session.request(
+                    "textDocument/semanticTokens/full/delta",
+                    {"textDocument": {"uri": main.as_uri()}, "previousResultId": previous})
+                result = reply.get("result")
+                require(isinstance(result, dict) and isinstance(result.get("resultId"), str),
+                        f"full/delta did not answer a result with an id: {reply!r}")
+                return result
+
+            def apply(base: list[int], edits: list[dict]) -> list[int]:
+                out = list(base)
+                for edit in sorted(edits, key=lambda e: e["start"], reverse=True):
+                    out[edit["start"]:edit["start"] + edit["deleteCount"]] = edit.get("data", [])
+                return out
+
+            unchanged = delta(first_id)
+            require(unchanged.get("edits") == [] and "data" not in unchanged,
+                    f"an unchanged document did not answer empty edits: {unchanged!r}")
+            require(unchanged["resultId"] != first_id, "a delta reused the previous resultId")
+
+            # an inserted line shifts every token after it by one line, which
+            # the delta expresses as edits that rebuild what full now answers
+            body_lines = text.splitlines(keepends=True)
+            cut = len(body_lines) // 2
+            edited = "".join(body_lines[:cut]) + "# an inserted line\n" + "".join(body_lines[cut:])
+            session.notify(
+                "textDocument/didChange",
+                {"textDocument": {"uri": main.as_uri(), "version": 2},
+                 "contentChanges": [{"text": edited}]},
+            )
+            session.diagnostics(main.as_uri(), 2)
+            moved = delta(unchanged["resultId"])
+            require(isinstance(moved.get("edits"), list) and moved["edits"] and "data" not in moved,
+                    f"an edit did not answer token edits: {moved!r}")
+            fresh = session.request(
+                "textDocument/semanticTokens/full", {"textDocument": {"uri": main.as_uri()}})["result"]
+            require(fresh["data"] != data, "the inserted line did not move any token")
+            require(apply(data, moved["edits"]) == fresh["data"],
+                    f"applying the delta does not rebuild full:\n"
+                    f"  edits {moved['edits']!r}\n  full  {fresh['data']!r}")
+            sent = sum(len(e.get("data", [])) for e in moved["edits"])
+            require(sent < len(fresh["data"]),
+                    f"the delta sent {sent} integers against a full of {len(fresh['data'])}")
+
+            # an id the server no longer holds, and an id from before a close,
+            # both fall back to a full answer
+            stale = delta(first_id)
+            require(stale.get("data") == fresh["data"] and "edits" not in stale,
+                    f"a stale resultId did not fall back to a full answer: {sorted(stale)!r}")
+            session.notify("textDocument/didClose", {"textDocument": {"uri": main.as_uri()}})
+            session.notify(
+                "textDocument/didOpen",
+                {"textDocument": {"uri": main.as_uri(), "languageId": "mach",
+                                  "version": 3, "text": edited}},
+            )
+            session.diagnostics(main.as_uri(), 3)
+            reopened = delta(stale["resultId"])
+            require(reopened.get("data") == fresh["data"] and "edits" not in reopened,
+                    f"a resultId from before a close was still honoured: {sorted(reopened)!r}")
 
             session.finish()
             finished = True

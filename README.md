@@ -339,7 +339,7 @@ a new mls major.
 | `folding` | folding ranges from the buffer's own parse |
 | `selection` | selection ranges: a cursor expanding outward through the parse |
 | `hints` | inlay hints naming arguments at a call |
-| `tokens` | semantic tokens (`full` and `range`), classified from resolved meaning |
+| `tokens` | semantic tokens (`full`, `range` and `full/delta`), classified from resolved meaning |
 | `actions` | code actions from the compiler's own fixes |
 | `callhierarchy` | call hierarchy across modules |
 | `workspace` | workspace/symbol |
