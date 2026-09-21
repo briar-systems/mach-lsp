@@ -1870,6 +1870,121 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_embed_required_artifact(server: Path, timeout: float) -> None:
+    """A non-default artifact's file embeds an output its own `need` requires (#371).
+
+    A root's analysis compiles every open file under one selected primary
+    artifact, but the files belong to whichever artifact their entry reaches.
+    `{artifact.<id>.out}` in an `embed` must therefore resolve against what the
+    project's artifacts require, as `mach build` resolves it, not against the
+    primary artifact's `need` alone. The stale complaint this guards is the
+    one the compiler never makes: "names an artifact this artifact does not
+    require" on a file whose artifact does require it, through a `need` glob.
+    An output no artifact requires is still refused.
+    """
+    manifest = """[project]
+id = "lessons"
+version = "0.1.0"
+src = "src"
+out = "out"
+
+[target.spirv]
+isa = "spirv"
+os = "freestanding"
+abi = "spirv"
+env = "vulkan1.0"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[artifact.hello]
+default = true
+kind = "bin"
+entry = "hello.mach"
+out = "bin/hello"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.shaded]
+kind = "bin"
+entry = "shaded.mach"
+out = "bin/shaded"
+targets = ["*"]
+link = []
+need = ["artifact.shader-*"]
+
+[artifact.shader-vert]
+kind = "bin"
+entry = "shaders/vert.mach"
+out = "spv/vert{artifact.suffix}"
+targets = ["spirv"]
+link = []
+need = []
+"""
+    shaded_text = ('#[embed("{artifact.shader-vert.out}")]\n'
+                   "val VERT: [_]u8;\n"
+                   "\n"
+                   "pub fun main() i32 { ret VERT[0]::i32; }\n")
+    orphan_text = ('#[embed("{artifact.hello.out}")]\n'
+                   "val HELLO: [_]u8;\n"
+                   "\n"
+                   "pub fun main() i32 { ret HELLO[0]::i32; }\n")
+
+    def messages(found: list[dict[str, Any]]) -> list[str]:
+        return [str(item.get("message", "")) for item in found]
+
+    with tempfile.TemporaryDirectory(prefix="mls-embed-") as directory:
+        root = Path(directory).resolve() / "lessons"
+        src = root / "src"
+        (src / "shaders").mkdir(parents=True)
+        (root / "mach.toml").write_text(manifest, encoding="utf-8")
+        (src / "hello.mach").write_text("pub fun main() i32 { ret 0; }\n", encoding="utf-8")
+        (src / "shaders" / "vert.mach").write_text("pub fun main() {}\n", encoding="utf-8")
+        # the required output exists, as after `mach build`, so the only thing left
+        # to reject is the template's scope
+        (root / "out" / "spv").mkdir(parents=True)
+        (root / "out" / "spv" / "vert.spv").write_bytes(b"\x03\x02\x23\x07")
+        shaded = src / "shaded.mach"
+        shaded.write_text(shaded_text, encoding="utf-8")
+        orphan = src / "orphan.mach"
+        orphan.write_text(orphan_text, encoding="utf-8")
+
+        session = LspSession(server, root, timeout)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": shaded.as_uri(), "languageId": "mach", "version": 1, "text": shaded_text}})
+            published = session.diagnostics(shaded.as_uri(), 1)
+            found = published["params"]["diagnostics"]
+            require(found == [],
+                    f"a required artifact's output is refused in its consumer: {messages(found)!r}")
+
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": orphan.as_uri(), "languageId": "mach", "version": 1, "text": orphan_text}})
+            published = session.diagnostics(orphan.as_uri(), 1)
+            found = published["params"]["diagnostics"]
+            require(len(found) == 1 and "does not require" in found[0].get("message", ""),
+                    f"an output no artifact requires is not refused: {messages(found)!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_settings(server: Path, timeout: float) -> None:
     """What a client configures at `initialize`, and how it combines (#264).
 
@@ -6815,6 +6930,7 @@ def main() -> int:
         run_version(server, args.timeout)
         run_settings(server, args.timeout)
         run_manifest_notes(server, args.timeout)
+        run_embed_required_artifact(server, args.timeout)
         run_position_encoding(server, args.timeout)
         run_option_deadline(server, args.timeout)
         run_deadline_spares_load(server, args.timeout)
@@ -6876,6 +6992,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  a request is answered while a project rebuild is still running")
+    print("  an embed of an artifact output resolves in the project's requirement scope")
     print("  an idle root warms its cold spare, so the first edit after idle is warm")
     print("  a burst of edits during a build coalesces into one follow-up build")
     print("  a failed rebuild leaves the previous snapshot answering")
