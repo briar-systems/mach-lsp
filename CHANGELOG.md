@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-23
+
+The linked mach moves to v5.11.0 (std stays at v6.1.0), which brings union
+analysis: a file of a non-default artifact is analysed in that artifact, so an
+`embed` of another artifact's output resolves (#371). A `use` that names no
+module no longer blanks the rest of the buffer (#304). Same asset set, CLI
+and options as 1.4.1.
+
 ### Fixed
 - fix(#371): a file of a non-default artifact is analysed in that artifact, so
   an `embed` of `{artifact.<id>.out}` that its `need` requires, through a glob
