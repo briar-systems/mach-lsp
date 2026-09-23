@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- fix(#371): a file of a non-default artifact is analysed in that artifact, so
+  an `embed` of `{artifact.<id>.out}` that its `need` requires, through a glob
+  or by name, is no longer refused with "names an artifact this artifact does
+  not require". The server loads the union of every artifact's closure rather
+  than the default artifact's alone, and an output no artifact requires is
+  still refused.
 - chore(#373): a `use` that names no module costs only the names it would
   have bound (#304). mach 5.10.0 ended a module's load at such a `use`, so a
   rebuilt snapshot of the buffer holding it answered nothing past it:
