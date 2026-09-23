@@ -17,8 +17,12 @@ Project documents are analyzed by the compiler's retained frontend API. Each
 manifest root owns a stable long-lived compiler Session and one current Project
 snapshot; open filesystem documents retain their own text and monotonic revision
 and enter the compiler load walk as path overlays and extra module roots. The
-selected primary artifact supplies the target, profile, defines, `$project`, and
-`$bin` context. Resolve, sema, generic instantiation, and diagnostics therefore
+selected primary artifact supplies the target, profile, defines and `$project`.
+The walk loads every artifact's entry, the union `mach build` builds across the
+project, so a module reads the `$bin` of the artifact whose entry reaches it and
+an `embed` of `{artifact.<id>.out}` resolves against what any artifact needs.
+Modules only an artifact for another target reaches are gated out, as the build
+gates them. Resolve, sema, generic instantiation, and diagnostics therefore
 come from the same compiler-owned ModuleEntry rather than LSP copies of compiler
 internals.
 
@@ -288,7 +292,7 @@ the log will then contain fragments of whatever you have open.
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
 declared as git dependencies in `mach.toml`: mach pinned to a release tag
-(`tag/v5.10.0`) and std selected by the version range that mach builds with
+(`tag/v5.11.0`) and std selected by the version range that mach builds with
 (`^6.1`), and fetched by `mach dep pull .`. The committed gitlinks under `dep/`
 are the pins; there is no lockfile. std follows the release mach's own CI,
 because the server and the compiler it links share one std.

@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-09-23
+
+The linked mach moves to v5.11.0 (std stays at v6.1.0), which brings union
+analysis: a file of a non-default artifact is analysed in that artifact, so an
+`embed` of another artifact's output resolves (#371). A `use` that names no
+module no longer blanks the rest of the buffer (#304). Same asset set, CLI
+and options as 1.4.1.
+
+### Fixed
+- fix(#371): a file of a non-default artifact is analysed in that artifact, so
+  an `embed` of `{artifact.<id>.out}` that its `need` requires, through a glob
+  or by name, is no longer refused with "names an artifact this artifact does
+  not require". The server loads the union of every artifact's closure rather
+  than the default artifact's alone, and an output no artifact requires is
+  still refused.
+- chore(#373): a `use` that names no module costs only the names it would
+  have bound (#304). mach 5.10.0 ended a module's load at such a `use`, so a
+  rebuilt snapshot of the buffer holding it answered nothing past it:
+  completion, definition and every other snapshot feature were empty until
+  the `use` was fixed (briar-systems/mach#3722).
+- chore(#373): a selection range through a parenthesized group has a step for
+  the group, `(p.x + p.y)`, and the step outside it covers the opening
+  parenthesis, where it began inside it before (briar-systems/mach#3720).
+
+### Changed
+- chore(#373): the linked mach moves from v5.10.0 to v5.11.0. std stays at
+  v6.1.0 (`^6.1`), which mach 5.11.0 builds with. The analysis entry now takes
+  the root set beside the request, and the server passes the primary
+  artifact's closure, which is what it analysed before. `[project].mach` stays
+  `^5.9`.
+
 ## [1.4.1] - 2026-09-20
 
 One completion fix for an outside report (#366): a member added to a type

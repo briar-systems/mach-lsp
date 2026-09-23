@@ -1870,6 +1870,129 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
                 session.abort()
 
 
+def run_embed_required_artifact(server: Path, timeout: float) -> None:
+    """A non-default artifact's file embeds an output its own `need` requires (#371).
+
+    A root's analysis compiles every open file under one selected primary
+    artifact, but the files belong to whichever artifact their entry reaches.
+    `{artifact.<id>.out}` in an `embed` must therefore resolve against what the
+    project's artifacts require, as `mach build` resolves it, not against the
+    primary artifact's `need` alone. The stale complaint this guards is the
+    one the compiler never makes: "names an artifact this artifact does not
+    require" on a file whose artifact does require it, through a `need` glob.
+    An output no artifact requires is still refused.
+    """
+    # the default target selects the cell on every host: with two targets and
+    # neither matching the host, the manifest selects none and the root does not load
+    manifest = """[project]
+id = "lessons"
+version = "0.1.0"
+src = "src"
+out = "out"
+
+[target.spirv]
+isa = "spirv"
+os = "freestanding"
+abi = "spirv"
+env = "vulkan1.0"
+
+[target.linux-x86_64]
+default = true
+isa = "x86_64"
+os = "linux"
+abi = "sysv64"
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[artifact.hello]
+default = true
+kind = "bin"
+entry = "hello.mach"
+out = "bin/hello"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.shaded]
+kind = "bin"
+entry = "shaded.mach"
+out = "bin/shaded"
+targets = ["*"]
+link = []
+need = ["artifact.shader-*"]
+
+[artifact.shader-vert]
+kind = "bin"
+entry = "shaders/vert.mach"
+out = "spv/vert{artifact.suffix}"
+targets = ["spirv"]
+link = []
+need = []
+"""
+    shaded_text = ('#[embed("{artifact.shader-vert.out}")]\n'
+                   "val VERT: [_]u8;\n"
+                   "\n"
+                   "pub fun main() i32 { ret VERT[0]::i32; }\n")
+    orphan_text = ('#[embed("{artifact.hello.out}")]\n'
+                   "val HELLO: [_]u8;\n"
+                   "\n"
+                   "pub fun main() i32 { ret HELLO[0]::i32; }\n")
+
+    def messages(found: list[dict[str, Any]]) -> list[str]:
+        return [str(item.get("message", "")) for item in found]
+
+    with tempfile.TemporaryDirectory(prefix="mls-embed-") as directory:
+        root = Path(directory).resolve() / "lessons"
+        src = root / "src"
+        (src / "shaders").mkdir(parents=True)
+        (root / "mach.toml").write_text(manifest, encoding="utf-8")
+        (src / "hello.mach").write_text("pub fun main() i32 { ret 0; }\n", encoding="utf-8")
+        (src / "shaders" / "vert.mach").write_text("pub fun main() {}\n", encoding="utf-8")
+        # the required output exists, as after `mach build`, so the only thing left
+        # to reject is the template's scope
+        (root / "out" / "spv").mkdir(parents=True)
+        (root / "out" / "spv" / "vert.spv").write_bytes(b"\x03\x02\x23\x07")
+        shaded = src / "shaded.mach"
+        shaded.write_text(shaded_text, encoding="utf-8")
+        orphan = src / "orphan.mach"
+        orphan.write_text(orphan_text, encoding="utf-8")
+
+        builds = BuildLog(Path(directory).resolve() / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": shaded.as_uri(), "languageId": "mach", "version": 1, "text": shaded_text}})
+            published = session.diagnostics(shaded.as_uri(), 1)
+            found = published["params"]["diagnostics"]
+            require(found == [],
+                    f"a required artifact's output is refused in its consumer: {messages(found)!r}")
+
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": orphan.as_uri(), "languageId": "mach", "version": 1, "text": orphan_text}})
+            # the root is already loaded, so the open is answered from the snapshot
+            # the first load built without it, and the rebuild that adds it publishes after
+            session.diagnostics(orphan.as_uri(), 1)
+            builds.settle(1, "the rebuild that adds the opened orphan")
+            published = session.diagnostics(orphan.as_uri(), 1)
+            found = published["params"]["diagnostics"]
+            require(len(found) == 1 and "does not require" in found[0].get("message", ""),
+                    f"an output no artifact requires is not refused: {messages(found)!r}")
+            session.finish()
+            finished = True
+        finally:
+            if not finished:
+                session.abort()
+
+
 def run_settings(server: Path, timeout: float) -> None:
     """What a client configures at `initialize`, and how it combines (#264).
 
@@ -3476,9 +3599,11 @@ def run_selection_range(server: Path, timeout: float) -> None:
                     previous = current
                     node = node.get("parent")
 
-            # a cursor on `x` in `p.x` walks out one level at a time
+            # a cursor on `x` in `p.x` walks out one level at a time, and a
+            # parenthesized group's step covers its parentheses (briar-systems/mach#3720)
             steps = selection_texts(chains[0], SELECTION_BUFFER)
-            require(steps[:3] == ["x", "p.x", "p.x + p.y"] and steps[-1].startswith("pub fun area")
+            require(steps[:4] == ["x", "p.x", "(p.x + p.y)", "(p.x + p.y) * scale"]
+                    and steps[-1].startswith("pub fun area")
                     and "total = (p.x + p.y) * scale;" in steps
                     and "if (scale > 0) {" in steps[-3],
                     f"the cursor in a nested expression did not walk out level by level: {steps!r}")
@@ -4144,6 +4269,107 @@ def run_completion_alias_while_behind(server: Path, timeout: float) -> None:
                     "a use the snapshot has not seen offered names from somewhere")
 
             gate.release()
+            session.finish()
+            finished = True
+        finally:
+            gate.close()
+            if not finished:
+                session.abort()
+
+
+def run_completion_past_unresolved_use(server: Path, timeout: float) -> None:
+    """A `use` that names no module costs only its own names (#304).
+
+    mach's loader ended a module's load at such a `use`, so the rebuilt
+    snapshot held nothing past it and every answer for the buffer was empty
+    until the `use` was fixed (briar-systems/mach#3722). Completion elsewhere
+    in the buffer answers while the buffer is ahead of the snapshot, where
+    `isIncomplete` proves the answer is the buffer's and not a caught-up
+    snapshot's, and again from the snapshot rebuilt with the bad `use` in it,
+    where a local member, a module alias and an import all still resolve.
+    """
+    if os.name != "posix":
+        print("  completion past an unresolved use: skipped (rebuild gate needs flock)")
+        return
+    with tempfile.TemporaryDirectory(prefix="mls-compl-baduse-") as directory:
+        root = Path(directory).resolve()
+        main, defs, text = write_project(root, "complbaduse", 5)
+        gate = RebuildGate(root)
+        gate.hold()
+        session = LspSession(server, root, timeout, env_extra=gate.env)
+        finished = False
+        try:
+            session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            session.notify("initialized", {})
+            session.notify("textDocument/didOpen", {"textDocument": {
+                "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
+            session.diagnostics(main.as_uri(), 1)
+
+            lines = text.splitlines()
+            lines[0:0] = ["use x: complbaduse.nothere;"]
+            lines.extend([
+                "",
+                "rec Fresh { live: i32; }",
+                "fun typing() i32 {",
+                "    var current: Fresh;",
+                "    current.",
+                "    rootmod.",
+                "    ret 0;",
+                "}",
+            ])
+            typed = "\n".join(lines) + "\n"
+            at = lambda needle: next(i for i, value in enumerate(lines) if value.strip() == needle)
+            version = 1
+            notifications = []
+            for _ in range(32):
+                version += 1
+                notifications.append((
+                    "textDocument/didChange",
+                    {"textDocument": {"uri": main.as_uri(), "version": version},
+                     "contentChanges": [{"text": typed}]},
+                ))
+
+            def behind(needle: str) -> list[Any]:
+                answer = session.request_after_notifications(
+                    notifications, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": at(needle), "character": len("    " + needle)}})
+                result = answer.get("result")
+                require(isinstance(result, dict) and result.get("isIncomplete") is True,
+                        f"completion after `{needle}` was not answered while behind, so this proves nothing: {answer!r}")
+                return [item.get("label") for item in result.get("items", [])]
+
+            labels = behind("current.")
+            require("live" in labels,
+                    f"a use that names no module silenced a local member: {labels!r}")
+            labels = behind("rootmod.")
+            require("answer" in labels and "take" in labels,
+                    f"a use that names no module silenced a module alias: {labels!r}")
+
+            # the rebuilt snapshot holds the bad `use` too, and still loads the
+            # rest of the module: its answers are complete, not isolated
+            gate.release()
+            session.diagnostics(main.as_uri(), version)
+
+            def caught_up(needle: str) -> list[Any]:
+                result = settled_result(
+                    session, "textDocument/completion",
+                    {"textDocument": {"uri": main.as_uri()},
+                     "position": {"line": at(needle), "character": len("    " + needle)}},
+                    lambda r: isinstance(r, dict) and r.get("isIncomplete") is False and r.get("items"),
+                    f"completion after `{needle}` from the rebuilt snapshot")
+                return [item.get("label") for item in result.get("items", [])]
+
+            labels = caught_up("current.")
+            require("live" in labels,
+                    f"the rebuilt snapshot lost a local member past the bad use: {labels!r}")
+            labels = caught_up("rootmod.")
+            require("answer" in labels and "take" in labels,
+                    f"the rebuilt snapshot lost a module alias past the bad use: {labels!r}")
+            found = definition(session, main, typed, "watched")
+            require(found.get("uri") == defs.as_uri(),
+                    f"a use that names no module stopped an import resolving: {found!r}")
+
             session.finish()
             finished = True
         finally:
@@ -6082,7 +6308,10 @@ def run_active_watcher_fallback(server: Path, timeout: float) -> None:
             require("watched: i32 = 99" in json.dumps(hover),
                     f"active watcher suppressed source fingerprint fallback: {hover!r}")
 
-            broken = changed + "use watch.missing.nope;\n"
+            # a declaration the importer names goes away: a use that names no
+            # module no longer ends the load (briar-systems/mach#3722), so the
+            # break has to remove what the definition resolves to
+            broken = changed.replace("pub val watched: i32 = 99;", "pub val unwatched: i32 = 99;")
             defs.write_text(broken, encoding="utf-8")
             time.sleep(0.3)
             poke()
@@ -6815,6 +7044,7 @@ def main() -> int:
         run_version(server, args.timeout)
         run_settings(server, args.timeout)
         run_manifest_notes(server, args.timeout)
+        run_embed_required_artifact(server, args.timeout)
         run_position_encoding(server, args.timeout)
         run_option_deadline(server, args.timeout)
         run_deadline_spares_load(server, args.timeout)
@@ -6843,6 +7073,7 @@ def main() -> int:
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
         run_completion_alias_while_behind(server, args.timeout)
+        run_completion_past_unresolved_use(server, args.timeout)
         run_completion_dependency_alias_while_behind(server, args.timeout)
         run_completion_type_position_and_imported_members(server, args.timeout)
         run_completion_fwd_reexport_members(server, args.timeout)
@@ -6876,6 +7107,7 @@ def main() -> int:
         return 1
     print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
     print("  a request is answered while a project rebuild is still running")
+    print("  an embed of an artifact output resolves in the project's requirement scope")
     print("  an idle root warms its cold spare, so the first edit after idle is warm")
     print("  a burst of edits during a build coalesces into one follow-up build")
     print("  a failed rebuild leaves the previous snapshot answering")
@@ -6889,6 +7121,7 @@ def main() -> int:
     print("  a syntax-only request answers from the buffer without reloading the project")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  queued completion uses current editor analysis before the deferred rebuild")
+    print("  a use that names no module costs only its names, not the buffer's completion")
     print("  documentHighlight classifies reads and writes in the active file")
     print("  workspace/symbol searches loaded roots, best matches first")
     print("  signatureHelp tracks the active argument through incomplete calls")

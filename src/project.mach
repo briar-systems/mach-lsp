@@ -49,6 +49,7 @@ use mem: std.memory;
 use mach.lang.build.outcome;
 use mach.lang.build.request;
 use mach.lang.driver;
+use dproject: mach.lang.driver.project;
 use mach.lang.fe.ast;
 use adecl: mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
@@ -1000,8 +1001,11 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     }
     val extra_count: u32 = ecr.ok;
     # the tolerant entry point keeps the project through a rejected phase, so
-    # the products behind the diagnostics stay readable while the user types
-    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project_tolerant(sn, ?m, ?req, extra, extra_count, driver.FRONTEND_SEMA);
+    # the products behind the diagnostics stay readable while the user types.
+    # the root set is every artifact's closure, so a file is checked in the artifact
+    # its entry reaches and `{artifact.<id>.out}` resolves over what any artifact needs
+    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project_tolerant(
+        sn, ?m, ?req, dproject.ROOT_UNION, extra, extra_count, driver.FRONTEND_SEMA);
     if (extra != nil) { deallocate[intern.StrId](alloc, extra, in.doc_count::usize); }
     vector.dnit[request.LinkToken](?req.link_tokens);
     vector.dnit[str](?req.lib_dirs);
