@@ -1960,7 +1960,8 @@ need = []
         orphan = src / "orphan.mach"
         orphan.write_text(orphan_text, encoding="utf-8")
 
-        session = LspSession(server, root, timeout)
+        builds = BuildLog(Path(directory).resolve() / "trace.log")
+        session = LspSession(server, root, timeout, builds.env())
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
@@ -1974,6 +1975,10 @@ need = []
 
             session.notify("textDocument/didOpen", {"textDocument": {
                 "uri": orphan.as_uri(), "languageId": "mach", "version": 1, "text": orphan_text}})
+            # the root is already loaded, so the open is answered from the snapshot
+            # the first load built without it, and the rebuild that adds it publishes after
+            session.diagnostics(orphan.as_uri(), 1)
+            builds.settle(1, "the rebuild that adds the opened orphan")
             published = session.diagnostics(orphan.as_uri(), 1)
             found = published["params"]["diagnostics"]
             require(len(found) == 1 and "does not require" in found[0].get("message", ""),
