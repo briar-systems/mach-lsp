@@ -1882,6 +1882,8 @@ def run_embed_required_artifact(server: Path, timeout: float) -> None:
     require" on a file whose artifact does require it, through a `need` glob.
     An output no artifact requires is still refused.
     """
+    # the default target selects the cell on every host: with two targets and
+    # neither matching the host, the manifest selects none and the root does not load
     manifest = """[project]
 id = "lessons"
 version = "0.1.0"
@@ -1895,6 +1897,7 @@ abi = "spirv"
 env = "vulkan1.0"
 
 [target.linux-x86_64]
+default = true
 isa = "x86_64"
 os = "linux"
 abi = "sysv64"
