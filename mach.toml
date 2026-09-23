@@ -65,4 +65,4 @@ version = "^6.1"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v5.10.0"
+ref = "tag/v5.11.0"
