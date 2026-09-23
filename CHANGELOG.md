@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- chore(#373): a `use` that names no module costs only the names it would
+  have bound (#304). mach 5.10.0 ended a module's load at such a `use`, so a
+  rebuilt snapshot of the buffer holding it answered nothing past it:
+  completion, definition and every other snapshot feature were empty until
+  the `use` was fixed (briar-systems/mach#3722).
+- chore(#373): a selection range through a parenthesized group has a step for
+  the group, `(p.x + p.y)`, and the step outside it covers the opening
+  parenthesis, where it began inside it before (briar-systems/mach#3720).
+
+### Changed
+- chore(#373): the linked mach moves from v5.10.0 to v5.11.0. std stays at
+  v6.1.0 (`^6.1`), which mach 5.11.0 builds with. The analysis entry now takes
+  the root set beside the request, and the server passes the primary
+  artifact's closure, which is what it analysed before. `[project].mach` stays
+  `^5.9`.
+
 ## [1.4.1] - 2026-09-20
 
 One completion fix for an outside report (#366): a member added to a type
