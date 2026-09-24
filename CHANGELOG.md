@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- chore(#380): the linked mach moves from v5.11.0 to v5.12.0, and std moves
+  with it from v6.1.0 to v7.4.0 (`^7.4`), which mach 5.12.0 builds with. One
+  build holds one std major. mls source needs no change for either, and
+  `[project].mach` stays `^5.9`.
+
 ## [1.4.2] - 2026-09-23
 
 The linked mach moves to v5.11.0 (std stays at v6.1.0), which brings union
