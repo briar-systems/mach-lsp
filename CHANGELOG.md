@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- chore(#385): the `mls` artifact's entry moves from `src/main.mach` to
+  `src/bin/main.mach`, as artifact entries sit across the family
+  (briar-systems/.github#107). The binary keeps its name and its place at
+  `out/<target>/<profile>/bin/mls`, so the release archives and the editor
+  extensions that start it are unchanged.
+
 ## [1.4.3] - 2026-09-25
 
 The linked mach moves to v5.12.0 and std to v7.4.0 (`^7.4`), and a grouped
