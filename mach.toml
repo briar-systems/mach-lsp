@@ -53,7 +53,7 @@ float_reassoc = false
 
 [artifact.mls]
 kind = "bin"
-entry = "main.mach"
+entry = "bin/main.mach"
 out = "bin/mls{artifact.suffix}"
 targets = ["*"]
 link = []
