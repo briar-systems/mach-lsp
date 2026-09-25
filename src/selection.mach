@@ -181,6 +181,8 @@ fun collect(a: *ast.Ast, offset: usize, out: *token.Span, cap: usize) usize {
         val e: *expr.Expr = ?a.exprs[i];
         n = push(out, n, cap, e.span, offset);
         if (e.kind == expr.EXPR_KIND_MEMBER) { n = push(out, n, cap, e.data.member.name, offset); }
+        val tso: opt[token.Span] = features.token_span_of_expr(e);
+        if (sel tso.some) { n = push(out, n, cap, tso.some, offset); }
         i = i + 1;
     }
     i = 0;
