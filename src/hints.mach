@@ -45,6 +45,7 @@ use sj: std.data.json;
 
 use mls.analysis;
 use mls.documents;
+use mls.features;
 use mls.json;
 use mls.positions;
 use mls.project;
@@ -132,12 +133,13 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
         val arg: id.ExprId        = an.a.expr_ids[(e.data.call.args_start + i)::usize];
         val ao:  opt[*aexpr.Expr] = ast.get_expr(an.a, arg);
         if (sel ao.some) {
-            val at: usize = ao.some.span.offset;
+            val arg_span: token.Span = features.text_span_of_expr(ao.some);
+            val at:       usize      = arg_span.offset;
             if (at >= lo && at <= hi && wants_hint(ao.some)) {
                 val pname: str = param_name(site_a, site_f, d.data.fun_.params_start + i, alloc);
                 if (pname != nil) {
-                    if (!names_itself(an.text.file, ao.some.span, pname)
-                        && push_hint(b, an.text, ao.some.span, pname, emitted > 0)) {
+                    if (!names_itself(an.text.file, arg_span, pname)
+                        && push_hint(b, an.text, arg_span, pname, emitted > 0)) {
                         emitted = emitted + 1;
                     }
                     json.free_str(pname, alloc);

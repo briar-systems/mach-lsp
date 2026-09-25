@@ -165,7 +165,7 @@ fun expression_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
         json.free_str(md, alloc);
         ret false;
     }
-    reply_hover(alloc, id_raw, an.text, eo.some.span, md, markdown);
+    reply_hover(alloc, id_raw, an.text, features.text_span_of_expr(eo.some), md, markdown);
     ret true;
 }
 

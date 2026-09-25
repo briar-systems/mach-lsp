@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-09-25
+
+The linked mach moves to v5.12.0 and std to v7.4.0 (`^7.4`), and a grouped
+name or literal such as `(x)` is read through its token, since mach
+5.12.0 widened its span to take in the parentheses (#379). Same asset set, CLI
+and options as 1.4.2.
+
+### Changed
+- chore(#380): the linked mach moves from v5.11.0 to v5.12.0, and std moves
+  with it from v6.1.0 to v7.4.0 (`^7.4`), which mach 5.12.0 builds with. One
+  build holds one std major. mls source needs no change for either, and
+  `[project].mach` stays `^5.9`.
+
+### Fixed
+- fix(#379): a grouped name or literal such as `(x)` is read through its token
+  rather than its span, which since mach 5.12.0 takes in the parentheses.
+  References, document highlights, hover ranges and inlay hints point at the
+  name alone, rename renames a grouped use instead of skipping it, and
+  selection range keeps a bare-token step inside the parentheses.
+
 ## [1.4.2] - 2026-09-23
 
 The linked mach moves to v5.11.0 (std stays at v6.1.0), which brings union

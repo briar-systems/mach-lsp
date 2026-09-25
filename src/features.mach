@@ -910,17 +910,45 @@ pub fun span_text_equals(file: *src.SourceFile, span: token.Span, name: str) boo
     ret true;
 }
 
-# the span identifying an expression's referenced name. for
-# an IDENT the whole expr span is the name; for a member access the name is the
-# leaf after the dot. other expressions fall back to their own span
 # the span of the name an expression writes - the member name for a
-# member access, the whole expression otherwise. what a client should highlight
-# for a reference, and the only name an unresolved expression has
+# member access, the token for a name or literal, the whole expression
+# otherwise. what a client should highlight for a reference, and the only name
+# an unresolved expression has
 # ---
 # e:   the expression
 # ret: its name span
 pub fun name_span_of_expr(e: *expr.Expr) token.Span {
     if (e.kind == expr.EXPR_KIND_MEMBER) { ret e.data.member.name; }
+    ret text_span_of_expr(e);
+}
+
+# the token of a token-backed expression (a name or a literal), or none
+#
+# An expression's `span` is its visual extent, grouping parentheses included,
+# so `(x)` spans three bytes while its name is one. The token is what the
+# expression's text is read through.
+# ---
+# e:   the expression
+# ret: some(its token) for the seven token-backed kinds, none for any other
+pub fun token_span_of_expr(e: *expr.Expr) opt[token.Span] {
+    if (e.kind == expr.EXPR_KIND_IDENT)          { ret opt[token.Span].some{e.data.ident.tok}; }
+    if (e.kind == expr.EXPR_KIND_COMPTIME_IDENT) { ret opt[token.Span].some{e.data.comptime_ident.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_INT)        { ret opt[token.Span].some{e.data.lit_int.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_FLOAT)      { ret opt[token.Span].some{e.data.lit_float.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_CHAR)       { ret opt[token.Span].some{e.data.lit_char.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_STR)        { ret opt[token.Span].some{e.data.lit_str.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_NIL)        { ret opt[token.Span].some{e.data.lit_nil.tok}; }
+    ret opt[token.Span].none{};
+}
+
+# the span an expression's own text occupies: its token for a name or a
+# literal, its whole extent otherwise
+# ---
+# e:   the expression
+# ret: the token when there is one, else the expression's span
+pub fun text_span_of_expr(e: *expr.Expr) token.Span {
+    val to: opt[token.Span] = token_span_of_expr(e);
+    if (sel to.some) { ret to.some; }
     ret e.span;
 }
 
@@ -1637,8 +1665,9 @@ fun free_sema(pa: *Allocator, sr: *sema.SemaResult) {
 # the receiver of a member access is an IDENT whose type the SemaResult carries
 fun add_ident(a: *ast.Ast, off: usize, len: usize) id.ExprId {
     var e: expr.Expr;
-    e.span = span_at(off, len);
-    e.kind = expr.EXPR_KIND_IDENT;
+    e.span           = span_at(off, len);
+    e.kind           = expr.EXPR_KIND_IDENT;
+    e.data.ident.tok = span_at(off, len);
     val r: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
     if (sel r.err) { ret id.EXPR_NIL; }
     ret r.ok;
