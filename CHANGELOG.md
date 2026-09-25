@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   build holds one std major. mls source needs no change for either, and
   `[project].mach` stays `^5.9`.
 
+### Fixed
+- fix(#379): a grouped name or literal such as `(x)` is read through its token
+  rather than its span, which since mach 5.12.0 takes in the parentheses.
+  References, document highlights, hover ranges and inlay hints point at the
+  name alone, rename renames a grouped use instead of skipping it, and
+  selection range keeps a bare-token step inside the parentheses.
+
 ## [1.4.2] - 2026-09-23
 
 The linked mach moves to v5.11.0 (std stays at v6.1.0), which brings union
