@@ -3512,11 +3512,11 @@ pub rec P {
 }
 
 pub fun area(p: P, scale: i32) i32 {
-    var total: i32 = 0;
+    var total: i32 = (0);
     if (scale > 0) {
         total = (p.x + p.y) * scale;
     }
-    ret total;
+    ret (total);
 }
 """
 
@@ -3568,6 +3568,8 @@ def run_selection_range(server: Path, timeout: float) -> None:
             lines = SELECTION_BUFFER.splitlines()
             assign = next(i for i, value in enumerate(lines) if "total = (" in value)
             rec_field = next(i for i, value in enumerate(lines) if value.startswith("    x:"))
+            grouped_name = next(i for i, value in enumerate(lines) if "ret (total)" in value)
+            grouped_lit = next(i for i, value in enumerate(lines) if "= (0)" in value)
             positions = [
                 {"line": assign, "character": lines[assign].index("p.x") + 2},
                 {"line": assign, "character": lines[assign].index("p.x") + 3},
@@ -3575,6 +3577,8 @@ def run_selection_range(server: Path, timeout: float) -> None:
                 {"line": 0, "character": lines[0].index("size")},
                 {"line": 1, "character": 0},
                 {"line": 99, "character": 0},
+                {"line": grouped_name, "character": lines[grouped_name].index("total") + 1},
+                {"line": grouped_lit, "character": lines[grouped_lit].index("(0)") + 1},
             ]
             chains = session.request(
                 "textDocument/selectionRange",
@@ -3622,6 +3626,12 @@ def run_selection_range(server: Path, timeout: float) -> None:
             for index, expected in ((4, {"line": 1, "character": 0}), (5, {"line": 99, "character": 0})):
                 require(chains[index] == {"range": {"start": expected, "end": expected}},
                         f"a position nothing holds did not answer an empty range: {chains[index]!r}")
+            # a grouped name or literal keeps a bare-token step inside its
+            # parentheses (#379)
+            require(selection_texts(chains[6], SELECTION_BUFFER)[:3] == ["total", "(total)", "ret (total);"],
+                    f"a grouped name lost its bare-token step: {selection_texts(chains[6], SELECTION_BUFFER)!r}")
+            require(selection_texts(chains[7], SELECTION_BUFFER)[:2] == ["0", "(0)"],
+                    f"a grouped literal lost its bare-token step: {selection_texts(chains[7], SELECTION_BUFFER)!r}")
 
             session.finish()
             finished = True
@@ -5153,6 +5163,9 @@ def run_document_highlight(server: Path, timeout: float) -> None:
     with tempfile.TemporaryDirectory(prefix="mls-hl-") as directory:
         root = Path(directory).resolve()
         main, defs, text = write_project(root, "imp", 4)
+        # a grouped use, whose highlight is the name inside the parentheses
+        text = text.replace("+ watched;", "+ (watched);")
+        main.write_text(text, encoding="utf-8")
         session = LspSession(server, root, timeout)
         finished = False
         try:
@@ -5192,6 +5205,15 @@ def run_document_highlight(server: Path, timeout: float) -> None:
             require(uses, "an imported symbol produced no highlight")
             require({item["kind"] for item in uses} <= {1, 2, 3},
                     f"unexpected highlight kinds: {uses!r}")
+
+            # a grouped name highlights the name alone, not its parentheses (#379)
+            ret_line = next(i for i, v in enumerate(lines) if "(watched);" in v)
+            name_at = lines[ret_line].index("(watched)") + 1
+            grouped = highlights("(watched)", "(watched);")
+            expected = {"start": {"line": ret_line, "character": name_at},
+                        "end": {"line": ret_line, "character": name_at + len("watched")}}
+            require(any(item["range"] == expected for item in grouped),
+                    f"a grouped name was not highlighted as the name alone: {grouped!r}")
 
             # a cursor on nothing answers an empty list, not an error
             blank = session.request(
@@ -5362,7 +5384,8 @@ def run_inlay_hints(server: Path, timeout: float) -> None:
         # a two-parameter callee, called with one literal and one named value
         extra = ("pub fun pair(first: i32, second: i32) i32 { ret first + second; }\n")
         defs.write_text(defs.read_text(encoding="utf-8") + extra, encoding="utf-8")
-        body = text.replace("ret take[i32](b)", "ret pair(1, watched) + take[i32](b)")
+        # the literal is grouped, so its hint must sit at the token, not the parentheses (#379)
+        body = text.replace("ret take[i32](b)", "ret pair((1), watched) + take[i32](b)")
         body = body.replace("use hint.defs.watched;", "use hint.defs.watched;\nuse hint.defs.pair;")
         main.write_text(body, encoding="utf-8")
 
@@ -5398,6 +5421,10 @@ def run_inlay_hints(server: Path, timeout: float) -> None:
             labels = [hint["label"] for hint in hints]
             require("first:" in labels,
                     f"the literal argument was not named: {labels!r}")
+            call_line = next(i for i, v in enumerate(lines) if "pair((1)" in v)
+            first = next(hint for hint in hints if hint["label"] == "first:")
+            require(first["position"] == {"line": call_line, "character": lines[call_line].index("(1)") + 1},
+                    f"a grouped literal's hint is not at its token: {first!r}")
             # `watched` is an identifier, not a literal, so it is left alone
             require("second:" not in labels,
                     f"a self-naming argument was labelled: {labels!r}")
