@@ -268,7 +268,7 @@ fun span_at(offset: usize, len: usize) token.Span {
     ret s;
 }
 
-test "render: a range spells both endpoints" {
+test a_range_spells_both_endpoints {
     var pa: Allocator;
     page.make(?pa);
     var b: json.Buf = json.buf_init(?pa);
@@ -286,7 +286,7 @@ test "render: a range spells both endpoints" {
     ret 0;
 }
 
-test "render: a location carries an escaped uri" {
+test a_location_carries_an_escaped_uri {
     var pa: Allocator;
     page.make(?pa);
     var starts: [3]usize;
@@ -310,7 +310,7 @@ test "render: a location carries an escaped uri" {
 
 # newText is user-supplied and must survive the trip; the old hand-rolled
 # escaper replaced control bytes with `?`
-test "render: a text edit escapes its replacement" {
+test a_text_edit_escapes_its_replacement {
     var pa: Allocator;
     page.make(?pa);
     var starts: [1]usize;
@@ -332,7 +332,7 @@ test "render: a text edit escapes its replacement" {
 
 # an element whose span has no counterpart in the client's buffer writes
 # nothing at all, so the caller's framing never holds half of one
-test "render: an unmapped span writes nothing" {
+test an_unmapped_span_writes_nothing {
     var pa: Allocator;
     page.make(?pa);
     var starts: [1]usize;
@@ -358,7 +358,7 @@ test "render: an unmapped span writes nothing" {
     ret 0;
 }
 
-test "render: a response envelope preserves the id's wire type" {
+test a_response_envelope_preserves_the_id_s_wire_type {
     var pa: Allocator;
     page.make(?pa);
     var b: json.Buf = json.buf_init(?pa);

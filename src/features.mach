@@ -457,15 +457,16 @@ pub fun definition_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 }
 
 # the name identifier span of a decl node, or none for a decl
-# without a single name (use / fwd / test / comptime / error)
+# without a single name (use / fwd / comptime / error)
 pub fun decl_name_span(d: *decl.Decl) opt[token.Span] {
-    if (d.kind == decl.DECL_KIND_FUN) { ret opt[token.Span].some{d.data.fun_.name}; }
-    if (d.kind == decl.DECL_KIND_REC) { ret opt[token.Span].some{d.data.rec_.name}; }
-    if (d.kind == decl.DECL_KIND_UNI) { ret opt[token.Span].some{d.data.uni_.name}; }
-    if (d.kind == decl.DECL_KIND_TAG) { ret opt[token.Span].some{d.data.tag_.name}; }
-    if (d.kind == decl.DECL_KIND_DEF) { ret opt[token.Span].some{d.data.def_.name}; }
-    if (d.kind == decl.DECL_KIND_VAL) { ret opt[token.Span].some{d.data.bind.name}; }
-    if (d.kind == decl.DECL_KIND_VAR) { ret opt[token.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_FUN)  { ret opt[token.Span].some{d.data.fun_.name}; }
+    if (d.kind == decl.DECL_KIND_REC)  { ret opt[token.Span].some{d.data.rec_.name}; }
+    if (d.kind == decl.DECL_KIND_UNI)  { ret opt[token.Span].some{d.data.uni_.name}; }
+    if (d.kind == decl.DECL_KIND_TAG)  { ret opt[token.Span].some{d.data.tag_.name}; }
+    if (d.kind == decl.DECL_KIND_DEF)  { ret opt[token.Span].some{d.data.def_.name}; }
+    if (d.kind == decl.DECL_KIND_VAL)  { ret opt[token.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_VAR)  { ret opt[token.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_TEST) { ret opt[token.Span].some{d.data.test_.name}; }
     ret opt[token.Span].none{};
 }
 
@@ -1328,7 +1329,7 @@ fun add_field(a: *ast.Ast, offset: usize, len: usize) u32 {
     ret r.ok;
 }
 
-test "features: field_decl_span matches a field in the same source" {
+test field_decl_span_matches_a_field_in_the_same_source {
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast = ast.init(?pa, 0::src.FileId);
@@ -1352,7 +1353,7 @@ test "features: field_decl_span matches a field in the same source" {
     ret 0;
 }
 
-test "features: field_decl_span matches a field across two sources (dependency)" {
+test field_decl_span_matches_a_field_across_two_sources_dependency {
     var pa: Allocator;
     page.make(?pa);
     # the declaring "module" file holds the record fields
@@ -1376,7 +1377,7 @@ test "features: field_decl_span matches a field across two sources (dependency)"
     ret 0;
 }
 
-test "features: field_decl_span returns none for an unknown field" {
+test field_decl_span_returns_none_for_an_unknown_field {
     var pa: Allocator;
     page.make(?pa);
     var a:     ast.Ast = ast.init(?pa, 0::src.FileId);
@@ -1392,7 +1393,7 @@ test "features: field_decl_span returns none for an unknown field" {
     ret 0;
 }
 
-test "features: field_decl_span returns none for an empty field range" {
+test field_decl_span_returns_none_for_an_empty_field_range {
     var pa: Allocator;
     page.make(?pa);
     var a: ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1405,7 +1406,7 @@ test "features: field_decl_span returns none for an empty field range" {
     ret 0;
 }
 
-test "features: field_decl_span returns none for a zero-length query" {
+test field_decl_span_returns_none_for_a_zero_length_query {
     var pa: Allocator;
     page.make(?pa);
     var a:     ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1419,7 +1420,7 @@ test "features: field_decl_span returns none for a zero-length query" {
     ret 0;
 }
 
-test "features: span_bytes_equal matches identical bytes across files" {
+test span_bytes_equal_matches_identical_bytes_across_files {
     var fa:   src.SourceFile = stub_file("alpha");
     var fb:   src.SourceFile = stub_file("xalphay");
     var fail: bool           = false;
@@ -1430,7 +1431,7 @@ test "features: span_bytes_equal matches identical bytes across files" {
     ret 0;
 }
 
-test "features: field_decl_self_at hits a field name and misses elsewhere" {
+test field_decl_self_at_hits_a_field_name_and_misses_elsewhere {
     var pa: Allocator;
     page.make(?pa);
     var a:     ast.Ast = ast.init(?pa, 0::src.FileId);
@@ -1489,7 +1490,7 @@ fun fun_sym(did: id.DeclId) rslv.Symbol {
     ret s;
 }
 
-test "features: doc_span_of returns the decl's first-class doc span" {
+test doc_span_of_returns_the_decl_s_first_class_doc_span {
     var pa: Allocator;
     page.make(?pa);
     var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
@@ -1509,7 +1510,7 @@ test "features: doc_span_of returns the decl's first-class doc span" {
     ret 0;
 }
 
-test "features: doc_span_of returns none for a decl with no docstring" {
+test doc_span_of_returns_none_for_a_decl_with_no_docstring {
     var pa: Allocator;
     page.make(?pa);
     var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
@@ -1523,7 +1524,7 @@ test "features: doc_span_of returns none for a decl with no docstring" {
     ret 0;
 }
 
-test "features: doc_span_of returns none for a param symbol" {
+test doc_span_of_returns_none_for_a_param_symbol {
     var pa: Allocator;
     page.make(?pa);
     var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
@@ -1538,7 +1539,7 @@ test "features: doc_span_of returns none for a param symbol" {
     ret 0;
 }
 
-test "features: field_doc_desc finds the matching component's description" {
+test field_doc_desc_finds_the_matching_component_s_description {
     # the doc block and the rec body share one source, so the field-name query
     # span and the component name span both point into `src` - the same-file
     # match field_doc_desc performs in `field_hover_markdown`.
@@ -1570,7 +1571,7 @@ test "features: field_doc_desc finds the matching component's description" {
     ret 0;
 }
 
-test "features: field_doc_desc returns none when no component matches" {
+test field_doc_desc_returns_none_when_no_component_matches {
     val src: str = "# a point\n# ---\n# x: the horizontal coordinate\nrec P { z: i32; }";
     var doc: token.Span;
     doc.offset = 0;
@@ -1582,7 +1583,7 @@ test "features: field_doc_desc returns none when no component matches" {
     ret 0;
 }
 
-test "features: field_doc_desc returns none for a summary-only doc block" {
+test field_doc_desc_returns_none_for_a_summary_only_doc_block {
     val src: str = "# just a summary, no components\nrec P { x: i32; }";
     var doc: token.Span;
     doc.offset = 0;
@@ -1708,7 +1709,7 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
     ret r.ok;
 }
 
-test "features: field_ref_span_at matches a member access of the keyed record" {
+test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     var pa: Allocator;
     page.make(?pa);
     var a:     ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1748,7 +1749,7 @@ test "features: field_ref_span_at matches a member access of the keyed record" {
     ret 0;
 }
 
-test "features: field_ref_span_at peels a pointer receiver to the record" {
+test field_ref_span_at_peels_a_pointer_receiver_to_the_record {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1780,7 +1781,7 @@ test "features: field_ref_span_at peels a pointer receiver to the record" {
     ret 0;
 }
 
-test "features: field_ref_span_at matches a struct-literal field init" {
+test field_ref_span_at_matches_a_struct_literal_field_init {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1814,7 +1815,7 @@ test "features: field_ref_span_at matches a struct-literal field init" {
     ret 0;
 }
 
-test "features: field_ref_span_at rejects a different record and a different field" {
+test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1860,7 +1861,7 @@ fun empty_doc() token.Span {
     ret d;
 }
 
-test "features: collect_field_sites gathers every site, the decl, and the doc component (rename)" {
+test collect_field_sites_gathers_every_site_the_decl_and_the_doc_component_rename {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1919,7 +1920,7 @@ test "features: collect_field_sites gathers every site, the decl, and the doc co
     ret 0;
 }
 
-test "features: collect_field_sites omits the doc component for references (want_doc false)" {
+test collect_field_sites_omits_the_doc_component_for_references_want_doc_false {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1953,7 +1954,7 @@ test "features: collect_field_sites omits the doc component for references (want
     ret 0;
 }
 
-test "features: collect_field_sites in a non-declaring module yields only body sites" {
+test collect_field_sites_in_a_non_declaring_module_yields_only_body_sites {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1985,7 +1986,7 @@ test "features: collect_field_sites in a non-declaring module yields only body s
     ret 0;
 }
 
-test "features: collect_field_sites adds the decl but no doc edit when the record has no docstring" {
+test collect_field_sites_adds_the_decl_but_no_doc_edit_when_the_record_has_no_docstring {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -2016,7 +2017,7 @@ test "features: collect_field_sites adds the decl but no doc edit when the recor
     ret 0;
 }
 
-test "features: doc_component_name_span rewrites a plain field / param component" {
+test doc_component_name_span_rewrites_a_plain_field_param_component {
     val txt: str = "# sums\n# ---\n# a: the addend\n# b: the augend\n";
     var doc: token.Span;
     doc.offset = 0;
@@ -2038,7 +2039,7 @@ test "features: doc_component_name_span rewrites a plain field / param component
     ret 0;
 }
 
-test "features: doc_component_name_span rewrites the inner identifier of a generic [T]" {
+test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
     val txt: str = "# a box\n# ---\n# [T]: the element\n# v: the value\n";
     var doc: token.Span;
     doc.offset = 0;
@@ -2064,7 +2065,7 @@ test "features: doc_component_name_span rewrites the inner identifier of a gener
     ret 0;
 }
 
-test "features: doc_component_name_span returns none with no doc, no match, summary-only" {
+test doc_component_name_span_returns_none_with_no_doc_no_match_summary_only {
     var qf:   src.SourceFile = stub_file("x");
     var fail: bool           = false;
 
@@ -2103,7 +2104,7 @@ fun t_owner(file: u32) type.TypeOwner {
     ret o;
 }
 
-test "features: symbol_denotes matches a use-imported binding by canonical name" {
+test symbol_denotes_matches_a_use_imported_binding_by_canonical_name {
     var syms: [4]rslv.Symbol;
     # the declaration itself, in the module that declares it
     syms[0].kind   = rslv.SYM_FUN;
@@ -2148,7 +2149,7 @@ test "features: symbol_denotes matches a use-imported binding by canonical name"
     ret 0;
 }
 
-test "features: symbol_denotes rejects a declaration-bearing symbol for another decl" {
+test symbol_denotes_rejects_a_declaration_bearing_symbol_for_another_decl {
     var syms: [1]rslv.Symbol;
     syms[0].kind   = rslv.SYM_FUN;
     syms[0].origin = 2::sess.ModuleId;

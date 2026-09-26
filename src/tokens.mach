@@ -542,10 +542,11 @@ fun symbol_token_type(an: analysis.Analyzed, sid: rslv.SymbolId) i64 {
 
 # the legend index for a declaration kind
 fun decl_token_type(kind: decl.DeclKind) i64 {
-    if (kind == decl.DECL_KIND_FUN) { ret T_FUNCTION; }
-    if (kind == decl.DECL_KIND_REC) { ret T_TYPE; }
-    if (kind == decl.DECL_KIND_UNI) { ret T_TYPE; }
-    if (kind == decl.DECL_KIND_DEF) { ret T_TYPE; }
+    if (kind == decl.DECL_KIND_FUN)  { ret T_FUNCTION; }
+    if (kind == decl.DECL_KIND_TEST) { ret T_FUNCTION; }
+    if (kind == decl.DECL_KIND_REC)  { ret T_TYPE; }
+    if (kind == decl.DECL_KIND_UNI)  { ret T_TYPE; }
+    if (kind == decl.DECL_KIND_DEF)  { ret T_TYPE; }
     ret T_VARIABLE;
 }
 

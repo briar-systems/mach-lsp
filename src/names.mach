@@ -265,7 +265,7 @@ fun same_nodes(x: *ast.Ast, y: *ast.Ast) bool {
 use std.allocator.page;
 use std.types.string.str_equals;
 
-test "names: an identifier is one identifier token and nothing else" {
+test an_identifier_is_one_identifier_token_and_nothing_else {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -282,7 +282,7 @@ test "names: an identifier is one identifier token and nothing else" {
     ret 0;
 }
 
-test "names: spans apply in order, once each" {
+test spans_apply_in_order_once_each {
     var pa: Allocator;
     page.make(?pa);
     var s: Spans = spans_init(?pa);
@@ -297,7 +297,7 @@ test "names: spans apply in order, once each" {
     ret 0;
 }
 
-test "names: a rename that changes what the grammar reads is refused" {
+test a_rename_that_changes_what_the_grammar_reads_is_refused {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;

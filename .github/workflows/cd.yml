@@ -121,6 +121,8 @@ jobs:
 
       - name: seed
         uses: briar-systems/.github/.github/actions/seed-mach@main
+        with:
+          tag: v6.0.0
 
       - name: release build
         shell: bash

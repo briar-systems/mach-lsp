@@ -143,7 +143,7 @@ pub fun publish(alloc: *Allocator, uri: str, n: *Notes) {
     json.buf_dnit(?b);
 }
 
-test "notes: capture keeps only the diagnostics with no file, in order" {
+test capture_keeps_only_the_diagnostics_with_no_file_in_order {
     var pa: Allocator;
     page.make(?pa);
     var store: diag.DiagnosticStore = diag.store_init(?pa);

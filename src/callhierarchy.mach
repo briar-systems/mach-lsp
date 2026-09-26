@@ -673,7 +673,6 @@ fun decl_item_maps(a: *ast.Ast, text: positions.Text, did: id.DeclId) bool {
 
 # the span `push_decl_item` names a declaration by
 fun decl_item_name(d: *decl.Decl) token.Span {
-    if (d.kind == decl.DECL_KIND_TEST) { ret d.data.test_.label; }
     val nso: opt[token.Span] = features.decl_name_span(d);
     if (sel nso.some) { ret nso.some; }
     ret d.span;
@@ -710,9 +709,6 @@ fun free_callees(ws: *project.Workspace, callees: *Callee, n: usize) {
 }
 
 # append a CallHierarchyItem for the module-scope declaration `did`
-#
-# A `test` block is a callable body with no declared name, so its label stands in;
-# every other module-scope declaration has one.
 fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text: positions.Text, did: id.DeclId) {
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) {
@@ -726,8 +722,8 @@ fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text:
 # append a CallHierarchyItem
 #
 # `name` is read out of the source rather than out of the interner: a caller may
-# be a `test` label or an unresolved callee expression, neither of which has an
-# interned name, and the bytes are what the client shows either way. the caller
+# be a `test` identifier or an unresolved callee expression, neither of which has
+# an interned name, and the bytes are what the client shows either way. the caller
 # has checked `item_maps`, so both ranges are written.
 fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
     name_span: token.Span, decl_span: token.Span, kind: i64, detail: str) {
