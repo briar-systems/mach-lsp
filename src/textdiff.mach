@@ -329,7 +329,7 @@ fun win_is(w: Window, os: usize, oe: usize, ns: usize, ne: usize) bool {
 
 # the case one window cannot serve: an import at the top and its use far below
 # become two windows with everything between them left mapped
-test "textdiff: two distant edits are two windows" {
+test two_distant_edits_are_two_windows {
     var pa: Allocator;
     page.make(?pa);
     var w:    Windows = empty();
@@ -350,7 +350,7 @@ test "textdiff: two distant edits are two windows" {
 
 # the edits bound the work, not the distance between them: two insertions three
 # hundred lines apart are still two windows
-test "textdiff: distant edits in a long text stay separate" {
+test distant_edits_in_a_long_text_stay_separate {
     var pa: Allocator;
     page.make(?pa);
     val old:  str     = t_lines(?pa, 300, false);
@@ -401,7 +401,7 @@ fun t_lines(pa: *Allocator, n: usize, edited: bool) str {
 
 # a change inside a line is narrowed to its bytes, and identical texts have no
 # windows at all
-test "textdiff: a replaced word is narrowed to its bytes" {
+test a_replaced_word_is_narrowed_to_its_bytes {
     var pa: Allocator;
     page.make(?pa);
     var w:    Windows = empty();

@@ -297,7 +297,7 @@ fun native(a: *Allocator, posix: str) str {
     ret out::str;
 }
 
-test "uris: file uri paths are decoded and normalized" {
+test file_uri_paths_are_decoded_and_normalized {
     var pa: Allocator;
     page.make(?pa);
     val got: str = path_of(?pa, "file:///tmp/a%20b/src/../main.mach");
@@ -305,14 +305,14 @@ test "uris: file uri paths are decoded and normalized" {
     ret 0;
 }
 
-test "uris: non-file uri has no compiler path" {
+test non_file_uri_has_no_compiler_path {
     var pa: Allocator;
     page.make(?pa);
     if (path_of(?pa, "untitled:buffer") != nil) { ret 1; }
     ret 0;
 }
 
-test "uris: a local file URI decodes to its path" {
+test a_local_file_uri_decodes_to_its_path {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -334,7 +334,7 @@ test "uris: a local file URI decodes to its path" {
 
 # the leading slash of `/C:/x` belongs to the URI form, not the path; a POSIX
 # path starting `/c` must keep its root, so only a real drive spec is stripped
-test "uris: a windows drive URI loses the URI's leading slash" {
+test a_windows_drive_uri_loses_the_uri_s_leading_slash {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -359,7 +359,7 @@ test "uris: a windows drive URI loses the URI's leading slash" {
 
 # a non-empty authority names a host, which is a UNC share - decoding it as the
 # first path segment would silently turn a remote path into a local one
-test "uris: a UNC authority is kept as a UNC root" {
+test a_unc_authority_is_kept_as_a_unc_root {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -372,7 +372,7 @@ test "uris: a UNC authority is kept as a UNC root" {
     ret 0;
 }
 
-test "uris: a malformed escape or an encoded NUL is refused" {
+test a_malformed_escape_or_an_encoded_nul_is_refused {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -385,7 +385,7 @@ test "uris: a malformed escape or an encoded NUL is refused" {
     ret 0;
 }
 
-test "uris: normalization collapses . and .. without escaping the root" {
+test normalization_collapses_and_without_escaping_the_root {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -409,7 +409,7 @@ test "uris: normalization collapses . and .. without escaping the root" {
     ret 0;
 }
 
-test "uris: a path becomes a file URI a client can parse" {
+test a_path_becomes_a_file_uri_a_client_can_parse {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -442,7 +442,7 @@ test "uris: a path becomes a file URI a client can parse" {
 # the two directions must compose: a URI that decodes to a path must rebuild to
 # the same URI, or a document opened by one spelling is a different document
 # from the same file reached by go-to-definition
-test "uris: uri and path round-trip" {
+test uri_and_path_round_trip {
     var pa: Allocator;
     page.make(?pa);
     var fail: bool = false;
@@ -471,7 +471,7 @@ test "uris: uri and path round-trip" {
 # an open document is found under its source directory whichever separator the
 # platform spells paths with (#273): windows paths come back from `clean` with
 # backslashes
-test "uris: a document is under its source directory with native separators" {
+test a_document_is_under_its_source_directory_with_native_separators {
     var fail: bool = false;
     if (!is_under("/p/src/m.mach", "/p/src")) { fail = true; }
     if (is_under("/p/srcx/m.mach", "/p/src")) { fail = true; }

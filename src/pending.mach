@@ -139,7 +139,7 @@ fun find(l: *Ledger, id: str) usize {
 
 use std.allocator.page;
 
-test "pending: requests close by id token, in any order, numeric or string" {
+test requests_close_by_id_token_in_any_order_numeric_or_string {
     var pa: Allocator;
     page.make(?pa);
     var l:    Ledger = init(?pa);
@@ -157,7 +157,7 @@ test "pending: requests close by id token, in any order, numeric or string" {
     ret 0;
 }
 
-test "pending: only a request that is not held is active" {
+test only_a_request_that_is_not_held_is_active {
     var pa: Allocator;
     page.make(?pa);
     var l:    Ledger = init(?pa);

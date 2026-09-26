@@ -558,7 +558,7 @@ fun some_present(o: opt[usize]) bool {
     ret sel o.some;
 }
 
-test "positions: a text offset resolves line and utf-16 column" {
+test a_text_offset_resolves_line_and_utf_16_column {
     var fail: bool = false;
     val t:    str  = "ab\ncdef\n";
     if (!some_is(offset_in_text(t, 0, 0), 0)) { fail = true; }
@@ -576,7 +576,7 @@ test "positions: a text offset resolves line and utf-16 column" {
 
 # a 4-byte sequence is one codepoint but TWO utf-16 units, so a column past it
 # must not be read as a byte count
-test "positions: an astral codepoint counts as two utf-16 units" {
+test an_astral_codepoint_counts_as_two_utf_16_units {
     var fail: bool = false;
     # "a" + U+1F600 (4 bytes) + "b"
     val t: str = "a\xF0\x9F\x98\x80b";
@@ -590,7 +590,7 @@ test "positions: an astral codepoint counts as two utf-16 units" {
 # byte offset is reached by a different column in each. against "a"+U+1F600+"b"
 # the trailing "b" sits at byte 5: three utf-16 units, five utf-8 bytes, two
 # utf-32 codepoints in. the astral codepoint is exactly where they diverge.
-test "positions: the negotiated encoding decides the column units" {
+test the_negotiated_encoding_decides_the_column_units {
     var fail: bool = false;
     # "a" + U+1F600 (4 bytes) + "b"
     val t: str = "a\xF0\x9F\x98\x80b";
@@ -619,7 +619,7 @@ test "positions: the negotiated encoding decides the column units" {
 # `Text` exists so a span is never copied against a length taken from another
 # file, and so the length is discovered once rather than once per span. Both
 # properties are invisible at a call site, so they are pinned here.
-test "positions: a text pairs a file with its own length" {
+test a_text_pairs_a_file_with_its_own_length {
     var starts: [3]usize;
     starts[0] = 0;
     starts[1] = 3;
@@ -639,7 +639,7 @@ test "positions: a text pairs a file with its own length" {
 
 # the bound is what stops a span from a stale tree reading past the buffer it is
 # applied to; dropping it was the whole cost of pairing the length with the file
-test "positions: span text stays inside the file it is bounded by" {
+test span_text_stays_inside_the_file_it_is_bounded_by {
     var pa: Allocator;
     page.make(?pa);
     var starts: [1]usize;
@@ -665,7 +665,7 @@ test "positions: span text stays inside the file it is bounded by" {
 }
 
 # `offset_at` reads the final line's end from the pairing rather than rescanning
-test "positions: the last line ends at the paired length" {
+test the_last_line_ends_at_the_paired_length {
     var starts: [2]usize;
     starts[0] = 0;
     starts[1] = 3;
@@ -682,7 +682,7 @@ test "positions: the last line ends at the paired length" {
 
 # a stale analysis is answered through the window: before it offsets hold, after
 # it they move by the length change, inside it nothing crosses
-test "positions: a paired text maps spans around the window" {
+test a_paired_text_maps_spans_around_the_window {
     var old_starts: [3]usize;
     old_starts[0] = 0;
     old_starts[1] = 7;
@@ -735,7 +735,7 @@ test "positions: a paired text maps spans around the window" {
 
 # a replacement removes bytes, so a span inside what was replaced has no
 # counterpart even at the window's first byte
-test "positions: a replaced range refuses what it replaced" {
+test a_replaced_range_refuses_what_it_replaced {
     var starts: [1]usize;
     starts[0] = 0;
     var old: src.SourceFile = t_file("abcXYZdef", ?starts[0], 1);
@@ -761,7 +761,7 @@ test "positions: a replaced range refuses what it replaced" {
 
 # the edit a single window cannot serve: an import at the top and its use far
 # below leave everything between them answerable
-test "positions: text between two windows moves by the first one" {
+test text_between_two_windows_moves_by_the_first_one {
     var old_starts: [5]usize;
     old_starts[0] = 0;
     old_starts[1] = 6;
@@ -803,7 +803,7 @@ test "positions: text between two windows moves by the first one" {
 
 # identical texts pair as an unmapped text, so a current snapshot costs nothing,
 # and unknown differences map nothing at all
-test "positions: identical texts carry no window" {
+test identical_texts_carry_no_window {
     var starts: [1]usize;
     starts[0] = 0;
     var a:  src.SourceFile = t_file("same", ?starts[0], 1);

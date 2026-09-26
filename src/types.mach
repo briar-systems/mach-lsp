@@ -231,12 +231,12 @@ fun free_sema_result(pa: *Allocator, sr: *sema.SemaResult) {
     }
 }
 
-test "types: type_of returns TYPE_NIL for a nil SemaResult" {
+test type_of_returns_type_nil_for_a_nil_semaresult {
     if (type_of(nil, 0) != type.TYPE_NIL) { ret 1; }
     ret 0;
 }
 
-test "types: type_of returns TYPE_NIL for an out-of-range expr id" {
+test type_of_returns_type_nil_for_an_out_of_range_expr_id {
     var pa: Allocator;
     page.make(?pa);
     var sr: sema.SemaResult = make_sema_result(?pa, 2, 0, 0);
@@ -248,7 +248,7 @@ test "types: type_of returns TYPE_NIL for an out-of-range expr id" {
     ret 0;
 }
 
-test "types: type_of reads the stored expression type" {
+test type_of_reads_the_stored_expression_type {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -272,7 +272,7 @@ test "types: type_of reads the stored expression type" {
     ret 0;
 }
 
-test "types: decl_type_of reads the stored declaration type" {
+test decl_type_of_reads_the_stored_declaration_type {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -297,7 +297,7 @@ test "types: decl_type_of reads the stored declaration type" {
     ret 0;
 }
 
-test "types: type_ref_of reads the resolved type of a written type node" {
+test type_ref_of_reads_the_resolved_type_of_a_written_type_node {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -323,7 +323,7 @@ test "types: type_ref_of reads the resolved type of a written type node" {
     ret 0;
 }
 
-test "types: nominal_of resolves a record TypeId to its declaration site" {
+test nominal_of_resolves_a_record_typeid_to_its_declaration_site {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -351,7 +351,7 @@ test "types: nominal_of resolves a record TypeId to its declaration site" {
     ret 0;
 }
 
-test "types: nominal_of peels a pointer to the pointee record" {
+test nominal_of_peels_a_pointer_to_the_pointee_record {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -385,7 +385,7 @@ test "types: nominal_of peels a pointer to the pointee record" {
     ret 0;
 }
 
-test "types: nominal_of maps a generic instance to its template" {
+test nominal_of_maps_a_generic_instance_to_its_template {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -426,7 +426,7 @@ test "types: nominal_of maps a generic instance to its template" {
     ret 0;
 }
 
-test "types: nominal_of returns none for a primitive type" {
+test nominal_of_returns_none_for_a_primitive_type {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
@@ -445,7 +445,7 @@ test "types: nominal_of returns none for a primitive type" {
     ret 0;
 }
 
-test "types: nominal_of returns none for sentinel TypeIds" {
+test nominal_of_returns_none_for_sentinel_typeids {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
