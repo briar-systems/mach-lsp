@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-26
+
+mls links the mach 6.2.0 front end, shows the unused-import warnings mach 6.1
+raises, and sends every diagnostic's warning kind as its `code` (#391). Same
+asset set, CLI and options as 1.5.0.
+
+**The linked mach moves from v6.0.0 to v6.2.0.** This mls refuses a project
+whose `[project].mach` range excludes mach 6.2.0, and it reports what mach 6.2
+reports: a float literal that overflows or underflows its type and a secret
+pointer cast the byte-extent rule refuses are now errors, so a project that
+was clean under 1.5.0 can show errors under 2.0.0. `[project].mach` stays
+`^6`. RELEASES.json names the mach each mls links, so an installer that reads
+it still finds 1.5.0 for mach 6.0.0.
+
+### Changed
+- Breaking: chore(#391): the linked mach moves from v6.0.0 to v6.2.0, and CI
+  and the release builds seed mach v6.2.0. std stays at v7.4.1 (`^7.4`), which
+  mach 6.2.0 builds with.
+- feat(#391): an unused symbol import in the project's own files shows as a
+  warning, ``unused import `foo` ``, as mach 6.1 reports it (mach#4007). mls's
+  own sixteen unused imports are removed.
+- feat(#391): every published diagnostic, per document or on `mach.toml`,
+  carries its warning kind's name as `code`, the name a profile's `allow` list
+  silences it by (mach#4030). `unused-import` carries the Unnecessary tag and
+  `deprecated` the Deprecated tag, so an editor fades or strikes through the
+  code. A diagnostic with no kind carries neither.
+- docs(#391): the README and the `notes` module say a root manifest without
+  `[project].mach` is refused, as mach 6 does, rather than loaded with a
+  warning.
+- test(#391): the unit tests are pruned from 99 to 55 under mach's test policy,
+  and test-only helpers are `#[testing]`.
+
 ## [1.5.0] - 2026-09-26
 
 mls moves to mach 6.0.0, whose tests are `test <identifier>`, and shows a test
