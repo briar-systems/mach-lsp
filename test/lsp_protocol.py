@@ -3324,6 +3324,10 @@ pub var W: i32 = 2;
 pub fun f(n: i32) i32 {
     ret n;
 }
+
+test f_passes_its_argument {
+    f(1);
+}
 """
 
 
@@ -3357,7 +3361,9 @@ def run_document_symbol_kinds(server: Path, timeout: float) -> None:
             require(isinstance(symbols, list) and symbols,
                     f"documentSymbol returned nothing: {symbols!r}")
             kinds = {entry["name"]: entry["kind"] for entry in symbols}
-            expected = {"R": 23, "U": 10, "T": 10, "D": 26, "V": 14, "W": 13, "f": 12}
+            # a test is named by its identifier (#387)
+            expected = {"R": 23, "U": 10, "T": 10, "D": 26, "V": 14, "W": 13, "f": 12,
+                        "f_passes_its_argument": 12}
             for name, kind in expected.items():
                 require(kinds.get(name) == kind,
                         f"{name} is SymbolKind {kinds.get(name)!r}, expected {kind}")
