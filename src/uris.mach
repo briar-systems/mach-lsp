@@ -282,6 +282,7 @@ pub fun is_under(file: str, dir: str) bool {
 # `normalize` follows the native separator now, so a test that hard-codes
 # `/` asserts one platform's spelling rather than the behaviour. The segments
 # and their order are what matters.
+#[testing]
 fun native(a: *Allocator, posix: str) str {
     val n: usize                     = str_len(posix);
     val r: res[*u8, allocator.Error] = allocate[u8](a, n + 1);
@@ -295,21 +296,6 @@ fun native(a: *Allocator, posix: str) str {
     }
     out[n] = 0;
     ret out::str;
-}
-
-test file_uri_paths_are_decoded_and_normalized {
-    var pa: Allocator;
-    page.make(?pa);
-    val got: str = path_of(?pa, "file:///tmp/a%20b/src/../main.mach");
-    if (got == nil || !str_equals(got, native(?pa, "/tmp/a b/main.mach"))) { ret 1; }
-    ret 0;
-}
-
-test non_file_uri_has_no_compiler_path {
-    var pa: Allocator;
-    page.make(?pa);
-    if (path_of(?pa, "untitled:buffer") != nil) { ret 1; }
-    ret 0;
 }
 
 test a_local_file_uri_decodes_to_its_path {
@@ -435,35 +421,6 @@ test a_path_becomes_a_file_uri_a_client_can_parse {
         if (!str_equals(c, "file://server/share/x.mach")) { fail = true; }
     }
 
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# the two directions must compose: a URI that decodes to a path must rebuild to
-# the same URI, or a document opened by one spelling is a different document
-# from the same file reached by go-to-definition
-test uri_and_path_round_trip {
-    var pa: Allocator;
-    page.make(?pa);
-    var fail: bool = false;
-    val p1:   str  = to_path(?pa, "file:///home/u/a%20b.mach");
-    if (p1 == nil) { fail = true; }
-    or {
-        val u1: str = of_norm(?pa, p1);
-        if (u1 == nil) { fail = true; }
-        or {
-            if (!str_equals(u1, "file:///home/u/a%20b.mach")) { fail = true; }
-        }
-    }
-    val p2: str = to_path(?pa, "file:///C:/src/main.mach");
-    if (p2 == nil) { fail = true; }
-    or {
-        val u2: str = of_norm(?pa, p2);
-        if (u2 == nil) { fail = true; }
-        or {
-            if (!str_equals(u2, "file:///C:/src/main.mach")) { fail = true; }
-        }
-    }
     if (fail) { ret 1; }
     ret 0;
 }

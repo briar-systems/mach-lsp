@@ -17,7 +17,6 @@ use std.types.bool.true;
 use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_len;
 
 use std.allocator.Allocator;
 

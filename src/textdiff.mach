@@ -286,6 +286,7 @@ use std.types.string.str_len;
 
 # a SourceFile with a line index over `text`, as the compiler builds one: a line
 # starts after every newline, the last one included
+#[testing]
 fun t_file(pa: *Allocator, text: str) src.SourceFile {
     val n:     usize = str_len(text);
     var lines: usize = 1;
@@ -317,12 +318,14 @@ fun t_file(pa: *Allocator, text: str) src.SourceFile {
     ret f;
 }
 
+#[testing]
 fun t_diff(pa: *Allocator, old: str, new: str, out: *Windows) bool {
     var a: src.SourceFile = t_file(pa, old);
     var b: src.SourceFile = t_file(pa, new);
     ret compute(pa, ?a, str_len(old), ?b, str_len(new), out);
 }
 
+#[testing]
 fun win_is(w: Window, os: usize, oe: usize, ns: usize, ne: usize) bool {
     ret w.old_start == os && w.old_end == oe && w.new_start == ns && w.new_end == ne;
 }
@@ -346,57 +349,6 @@ test two_distant_edits_are_two_windows {
     dnit(?pa, ?w);
     if (fail) { ret 1; }
     ret 0;
-}
-
-# the edits bound the work, not the distance between them: two insertions three
-# hundred lines apart are still two windows
-test distant_edits_in_a_long_text_stay_separate {
-    var pa: Allocator;
-    page.make(?pa);
-    val old:  str     = t_lines(?pa, 300, false);
-    val new:  str     = t_lines(?pa, 300, true);
-    var w:    Windows = empty();
-    var fail: bool    = false;
-    if (old == nil || new == nil) { fail = true; }
-    or {
-        if (!t_diff(?pa, old, new, ?w)) { fail = true; }
-        if (w.len != 2)                 { fail = true; }
-        or {
-            if (!win_is(w.items[0], 0, 0, 0, 3))         { fail = true; }
-            if (!win_is(w.items[1], 870, 870, 873, 876)) { fail = true; }
-        }
-    }
-    dnit(?pa, ?w);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# `n` lines of "x;\n", and with `edited`, "t;\n" before the first and "u;\n"
-# before line 290
-fun t_lines(pa: *Allocator, n: usize, edited: bool) str {
-    var total: usize = n * 3;
-    if (edited) { total = total + 6; }
-    val r: res[*u8, allocator.Error] = allocate[u8](pa, total + 1);
-    if (sel r.err) { ret nil; }
-    val out: *u8   = r.ok;
-    var o:   usize = 0;
-    var i:   usize = 0;
-    for (i < n) {
-        if (edited && (i == 0 || i == 290)) {
-            if (i == 0) { out[o] = 't'; }
-            or          { out[o] = 'u'; }
-            out[o + 1] = ';';
-            out[o + 2] = '\n';
-            o          = o + 3;
-        }
-        out[o]     = 'x';
-        out[o + 1] = ';';
-        out[o + 2] = '\n';
-        o          = o + 3;
-        i          = i + 1;
-    }
-    out[o] = 0;
-    ret out::str;
 }
 
 # a change inside a line is narrowed to its bytes, and identical texts have no

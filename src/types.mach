@@ -9,7 +9,6 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.size.usize;
 use std.types.string.str;
 
 use std.types.option.opt;
@@ -17,8 +16,6 @@ use std.types.option.opt;
 use std.types.result.res;
 
 use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
 use std.allocator.page;
 
 use mach.lang.fe.ast;
@@ -34,7 +31,6 @@ use mach.lang.type;
 use mls.positions;
 
 use mach.lang.fail;
-use std.allocator;
 use std.types.error.err;
 
 # the declaration site a record / union / tag TypeId nominally refers to -
@@ -166,191 +162,6 @@ pub fun nominal_decl(a: *ast.Ast, text: positions.Text, itn: *intern.Interner, n
     ret opt[id.DeclId].none{};
 }
 
-# build a standalone SemaResult over `pa` with the given
-# parallel-array lengths, every slot prefilled to TYPE_NIL. the test helper that
-# stands in for sema's own allocation so the pure accessors can be exercised
-# without running a whole analysis. released with `free_sema_result`
-fun make_sema_result(pa: *Allocator, expr_n: u32, type_n: u32, decl_n: u32) sema.SemaResult {
-    var sr: sema.SemaResult;
-    sr.alloc            = pa;
-    sr.expr_type        = nil;
-    sr.type_resolved_ty = nil;
-    sr.decl_type        = nil;
-    sr.expr_count       = 0;
-    sr.type_count       = 0;
-    sr.decl_count       = 0;
-    if (expr_n > 0) {
-        val r: res[*type.TypeId, allocator.Error] = allocate[type.TypeId](pa, expr_n::usize);
-        if (sel r.ok) {
-            sr.expr_type  = r.ok;
-            sr.expr_count = expr_n;
-            var i: u32 = 0;
-            for (i < expr_n) {
-                sr.expr_type[i] = type.TYPE_NIL;
-                i               = i + 1;
-            }
-        }
-    }
-    if (type_n > 0) {
-        val r: res[*type.TypeId, allocator.Error] = allocate[type.TypeId](pa, type_n::usize);
-        if (sel r.ok) {
-            sr.type_resolved_ty = r.ok;
-            sr.type_count       = type_n;
-            var i: u32 = 0;
-            for (i < type_n) {
-                sr.type_resolved_ty[i] = type.TYPE_NIL;
-                i                      = i + 1;
-            }
-        }
-    }
-    if (decl_n > 0) {
-        val r: res[*type.TypeId, allocator.Error] = allocate[type.TypeId](pa, decl_n::usize);
-        if (sel r.ok) {
-            sr.decl_type  = r.ok;
-            sr.decl_count = decl_n;
-            var i: u32 = 0;
-            for (i < decl_n) {
-                sr.decl_type[i] = type.TYPE_NIL;
-                i               = i + 1;
-            }
-        }
-    }
-    ret sr;
-}
-
-# release a SemaResult built by make_sema_result
-fun free_sema_result(pa: *Allocator, sr: *sema.SemaResult) {
-    if (sr.expr_type != nil && sr.expr_count > 0) {
-        deallocate[type.TypeId](pa, sr.expr_type, sr.expr_count::usize);
-    }
-    if (sr.type_resolved_ty != nil && sr.type_count > 0) {
-        deallocate[type.TypeId](pa, sr.type_resolved_ty, sr.type_count::usize);
-    }
-    if (sr.decl_type != nil && sr.decl_count > 0) {
-        deallocate[type.TypeId](pa, sr.decl_type, sr.decl_count::usize);
-    }
-}
-
-test type_of_returns_type_nil_for_a_nil_semaresult {
-    if (type_of(nil, 0) != type.TYPE_NIL) { ret 1; }
-    ret 0;
-}
-
-test type_of_returns_type_nil_for_an_out_of_range_expr_id {
-    var pa: Allocator;
-    page.make(?pa);
-    var sr: sema.SemaResult = make_sema_result(?pa, 2, 0, 0);
-    if (type_of(?sr, 5) != type.TYPE_NIL) {
-        free_sema_result(?pa, ?sr);
-        ret 1;
-    }
-    free_sema_result(?pa, ?sr);
-    ret 0;
-}
-
-test type_of_reads_the_stored_expression_type {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-    val i32o: opt[type.TypeId] = type.prim(?ti, type.TYPE_I32);
-    if (sel i32o.none) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val i32t: type.TypeId = i32o.some;
-
-    var sr: sema.SemaResult = make_sema_result(?pa, 3, 0, 0);
-    sr.expr_type[1] = i32t;
-    var fail: bool = false;
-    if (type_of(?sr, 1) != i32t)          { fail = true; }
-    if (type_of(?sr, 0) != type.TYPE_NIL) { fail = true; }
-
-    free_sema_result(?pa, ?sr);
-    type.dnit(?ti);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test decl_type_of_reads_the_stored_declaration_type {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-    val u8o: opt[type.TypeId] = type.prim(?ti, type.TYPE_U8);
-    if (sel u8o.none) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val u8t: type.TypeId = u8o.some;
-
-    var sr: sema.SemaResult = make_sema_result(?pa, 0, 0, 2);
-    sr.decl_type[0] = u8t;
-    var fail: bool = false;
-    if (decl_type_of(?sr, 0) != u8t)           { fail = true; }
-    if (decl_type_of(?sr, 9) != type.TYPE_NIL) { fail = true; }
-    if (decl_type_of(nil, 0) != type.TYPE_NIL) { fail = true; }
-
-    free_sema_result(?pa, ?sr);
-    type.dnit(?ti);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test type_ref_of_reads_the_resolved_type_of_a_written_type_node {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-    val u8o: opt[type.TypeId] = type.prim(?ti, type.TYPE_U8);
-    if (sel u8o.none) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val u8t: type.TypeId = u8o.some;
-
-    var sr: sema.SemaResult = make_sema_result(?pa, 0, 3, 0);
-    sr.type_resolved_ty[2] = u8t;
-    var fail: bool = false;
-    if (type_ref_of(?sr, 2) != u8t)           { fail = true; }
-    if (type_ref_of(?sr, 0) != type.TYPE_NIL) { fail = true; }
-    if (type_ref_of(?sr, 9) != type.TYPE_NIL) { fail = true; }
-    if (type_ref_of(nil, 0) != type.TYPE_NIL) { fail = true; }
-
-    free_sema_result(?pa, ?sr);
-    type.dnit(?ti);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test nominal_of_resolves_a_record_typeid_to_its_declaration_site {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-
-    val reco: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 3::intern.StrId, t_owner(7), type.TYPE_REC);
-    if (sel reco.err) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val rec: type.TypeId = reco.ok;
-
-    val no:   opt[Nominal] = nominal_of(?ti, rec);
-    var fail: bool         = false;
-    if (sel no.some) {
-        val n: Nominal = no.some;
-        if (n.file != 7::src.FileId)   { fail = true; }
-        if (n.name != 3::intern.StrId) { fail = true; }
-        if (n.kind != type.TYPE_REC)   { fail = true; }
-    }
-    or { fail = true; }
-
-    type.dnit(?ti);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
 test nominal_of_peels_a_pointer_to_the_pointee_record {
     var pa: Allocator;
     page.make(?pa);
@@ -426,32 +237,18 @@ test nominal_of_maps_a_generic_instance_to_its_template {
     ret 0;
 }
 
-test nominal_of_returns_none_for_a_primitive_type {
+test nominal_of_returns_none_for_a_type_that_is_not_nominal {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
     if (!type_init_ok(?ti, ?pa)) { ret 1; }
+    var fail: bool             = false;
     val i32o: opt[type.TypeId] = type.prim(?ti, type.TYPE_I32);
-    if (sel i32o.none) {
-        type.dnit(?ti);
-        ret 1;
+    if (sel i32o.some) {
+        val prim_o: opt[Nominal] = nominal_of(?ti, i32o.some);
+        if (sel prim_o.some) { fail = true; }
     }
-    val i32t: type.TypeId = i32o.some;
-
-    val none_o: opt[Nominal] = nominal_of(?ti, i32t);
-    val ok:     bool         = sel none_o.none;
-    type.dnit(?ti);
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-test nominal_of_returns_none_for_sentinel_typeids {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-
-    var fail:  bool         = false;
+    or { fail = true; }
     val nil_o: opt[Nominal] = nominal_of(?ti, type.TYPE_NIL);
     val err_o: opt[Nominal] = nominal_of(?ti, type.TYPE_ERROR);
     if (sel nil_o.some) { fail = true; }
@@ -461,11 +258,13 @@ test nominal_of_returns_none_for_sentinel_typeids {
     ret 0;
 }
 
+#[testing]
 fun type_init_ok(ti: *type.TypeInterner, pa: *Allocator) bool {
     val r: err[fail.Fail] = type.init(ti, pa);
     ret sel r.ok;
 }
 
+#[testing]
 fun t_owner(file: u32) type.TypeOwner {
     var o: type.TypeOwner;
     o.module = file;

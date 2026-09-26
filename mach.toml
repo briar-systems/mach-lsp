@@ -1,6 +1,6 @@
 [project]
 id = "mls"
-version = "1.5.0"
+version = "2.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 mach = "^6"
@@ -65,4 +65,4 @@ version = "^7.4"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v6.0.0"
+ref = "tag/v6.2.0"
