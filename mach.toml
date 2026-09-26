@@ -3,7 +3,7 @@ id = "mls"
 version = "1.4.3"
 src = "src"
 out = "out/{target.name}/{profile.name}"
-mach = "^5.9"
+mach = "^6"
 
 [target.linux-x86_64]
 default = true
@@ -65,4 +65,4 @@ version = "^7.4"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v5.12.0"
+ref = "tag/v6.0.0"
