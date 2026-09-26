@@ -225,6 +225,7 @@ fun push_entry(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocato
     render.range(b, r);
     json.buf_push(b, ",\"severity\":");
     json.buf_push_i64(b, notes.lsp_severity(d.severity));
+    notes.push_kind(b, d.kind);
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     push_message(b, d);
     push_related(b, at, d, alloc);

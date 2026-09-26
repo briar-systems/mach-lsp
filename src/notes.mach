@@ -23,8 +23,9 @@ use std.allocator.deallocate;
 
 use strutil: std.text.string;
 
-use diag: mach.lang.diagnostic;
-use src:  mach.lang.source;
+use diag:  mach.lang.diagnostic;
+use dkind: mach.lang.diagnostic.kind;
+use src:   mach.lang.source;
 
 use mls.json;
 use mls.transport;
@@ -38,9 +39,14 @@ pub val LSP_HINT:    i64 = 4;
 # the most notes one root carries; a load records a handful at most
 val MAX_NOTES: usize = 16;
 
-# one note: an LSP severity and owned text
+# the LSP diagnostic tags
+pub val LSP_TAG_UNNECESSARY: i64 = 1;
+pub val LSP_TAG_DEPRECATED:  i64 = 2;
+
+# one note: an LSP severity, the compiler's diagnostic kind and owned text
 pub rec Note {
     severity: i64;
+    kind:     dkind.Kind;
     text:     str;
 }
 
@@ -61,6 +67,29 @@ pub fun lsp_severity(sev: diag.Severity) i64 {
     ret LSP_HINT;
 }
 
+# the LSP tag a diagnostic kind carries, or 0 for none. an unused import is
+# code the editor may fade, a deprecated use is code it may strike through
+pub fun lsp_tag(k: dkind.Kind) i64 {
+    if (k == dkind.UNUSED_IMPORT) { ret LSP_TAG_UNNECESSARY; }
+    if (k == dkind.DEPRECATED)    { ret LSP_TAG_DEPRECATED; }
+    ret 0;
+}
+
+# append `,"code":"<kind>"` and the kind's tags for a diagnostic of kind `k`,
+# nothing for a diagnostic that names no kind. the code is the name a profile's
+# `allow` list silences the kind by
+pub fun push_kind(b: *json.Buf, k: dkind.Kind) {
+    val row: *dkind.Spec = dkind.spec(k);
+    if (row == nil) { ret; }
+    json.buf_push(b, ",\"code\":");
+    json.buf_push_quoted(b, row.name);
+    val tag: i64 = lsp_tag(k);
+    if (tag == 0) { ret; }
+    json.buf_push(b, ",\"tags\":[");
+    json.buf_push_i64(b, tag);
+    json.buf_push_byte(b, ']');
+}
+
 pub fun empty() Notes {
     ret Notes{items: nil, len: 0};
 }
@@ -71,7 +100,7 @@ pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore) Notes {
     var i: usize = 0;
     for (store != nil && i < store.items.len) {
         val d: *diag.Diagnostic = ?store.items.data[i];
-        if (d.loc.file_id == src.FILE_NIL) { add(alloc, ?n, lsp_severity(d.severity), d.message); }
+        if (d.loc.file_id == src.FILE_NIL) { add(alloc, ?n, lsp_severity(d.severity), d.kind, d.message); }
         i = i + 1;
     }
     ret n;
@@ -80,11 +109,11 @@ pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore) Notes {
 # one error: the reason a load was refused
 pub fun refusal(alloc: *Allocator, text: str) Notes {
     var n: Notes = empty();
-    add(alloc, ?n, LSP_ERROR, text);
+    add(alloc, ?n, LSP_ERROR, dkind.NONE, text);
     ret n;
 }
 
-fun add(alloc: *Allocator, n: *Notes, severity: i64, text: str) {
+fun add(alloc: *Allocator, n: *Notes, severity: i64, kind: dkind.Kind, text: str) {
     if (text == nil || n.len >= MAX_NOTES) { ret; }
     if (n.items == nil) {
         val r: res[*Note, allocator.Error] = allocate[Note](alloc, MAX_NOTES);
@@ -93,7 +122,7 @@ fun add(alloc: *Allocator, n: *Notes, severity: i64, text: str) {
     }
     val dr: res[str, allocator.Error] = strutil.str_dup(alloc, text);
     if (sel dr.err) { ret; }
-    n.items[n.len] = Note{severity: severity, text: dr.ok};
+    n.items[n.len] = Note{severity: severity, kind: kind, text: dr.ok};
     n.len          = n.len + 1;
 }
 
@@ -102,6 +131,7 @@ pub fun equal(a: *Notes, b: *Notes) bool {
     var i: usize = 0;
     for (i < a.len) {
         if (a.items[i].severity != b.items[i].severity)    { ret false; }
+        if (a.items[i].kind != b.items[i].kind)            { ret false; }
         if (!str_equals(a.items[i].text, b.items[i].text)) { ret false; }
         i = i + 1;
     }
@@ -131,6 +161,7 @@ pub fun publish(alloc: *Allocator, uri: str, n: *Notes) {
         if (i > 0) { json.buf_push_byte(?b, ','); }
         json.buf_push(?b, "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":");
         json.buf_push_i64(?b, n.items[i].severity);
+        push_kind(?b, n.items[i].kind);
         json.buf_push(?b, ",\"source\":\"mach\",\"message\":");
         json.buf_push_quoted(?b, n.items[i].text);
         json.buf_push_byte(?b, '}');
@@ -142,15 +173,15 @@ pub fun publish(alloc: *Allocator, uri: str, n: *Notes) {
     json.buf_dnit(?b);
 }
 
-test capture_keeps_only_the_diagnostics_with_no_file_in_order {
+test capture_keeps_only_the_diagnostics_with_no_file_in_order_with_their_kind {
     var pa: Allocator;
     page.make(?pa);
     var store: diag.DiagnosticStore = diag.store_init(?pa);
     var span:  mach_token.Span;
     span.offset = 0;
     span.len    = 0;
-    diag.record_warning(?store, src.FILE_NIL, span, "no range");
-    diag.record_warning(?store, 3::src.FileId, span, "in a file");
+    diag.record_warning(?store, dkind.DEPRECATED, src.FILE_NIL, span, "no range");
+    diag.record_warning(?store, dkind.UNUSED_IMPORT, 3::src.FileId, span, "in a file");
     diag.record_error(?store, src.FILE_NIL, span, "refused");
     var n:    Notes = capture(?pa, ?store);
     var same: Notes = capture(?pa, ?store);
@@ -163,6 +194,14 @@ test capture_keeps_only_the_diagnostics_with_no_file_in_order {
     or (!str_equals(n.items[1].text, "refused"))  { fail = true; }
     if (!equal(?n, ?same))                        { fail = true; }
     if (equal(?n, ?none))                         { fail = true; }
+    # a kind rides as its name and tag, and a diagnostic with none adds nothing
+    var b: json.Buf = json.buf_init(?pa);
+    if (n.len == 2) {
+        push_kind(?b, n.items[0].kind);
+        push_kind(?b, n.items[1].kind);
+    }
+    if (!str_equals(json.buf_str(?b), ",\"code\":\"deprecated\",\"tags\":[2]")) { fail = true; }
+    json.buf_dnit(?b);
     dnit(?pa, ?n);
     dnit(?pa, ?same);
     diag.store_dnit(?store);
