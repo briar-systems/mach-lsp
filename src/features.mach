@@ -459,13 +459,13 @@ pub fun definition_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 # the name identifier span of a decl node, or none for a decl
 # without a single name (use / fwd / comptime / error)
 pub fun decl_name_span(d: *decl.Decl) opt[token.Span] {
-    if (d.kind == decl.DECL_KIND_FUN) { ret opt[token.Span].some{d.data.fun_.name}; }
-    if (d.kind == decl.DECL_KIND_REC) { ret opt[token.Span].some{d.data.rec_.name}; }
-    if (d.kind == decl.DECL_KIND_UNI) { ret opt[token.Span].some{d.data.uni_.name}; }
-    if (d.kind == decl.DECL_KIND_TAG) { ret opt[token.Span].some{d.data.tag_.name}; }
-    if (d.kind == decl.DECL_KIND_DEF) { ret opt[token.Span].some{d.data.def_.name}; }
-    if (d.kind == decl.DECL_KIND_VAL) { ret opt[token.Span].some{d.data.bind.name}; }
-    if (d.kind == decl.DECL_KIND_VAR) { ret opt[token.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_FUN)  { ret opt[token.Span].some{d.data.fun_.name}; }
+    if (d.kind == decl.DECL_KIND_REC)  { ret opt[token.Span].some{d.data.rec_.name}; }
+    if (d.kind == decl.DECL_KIND_UNI)  { ret opt[token.Span].some{d.data.uni_.name}; }
+    if (d.kind == decl.DECL_KIND_TAG)  { ret opt[token.Span].some{d.data.tag_.name}; }
+    if (d.kind == decl.DECL_KIND_DEF)  { ret opt[token.Span].some{d.data.def_.name}; }
+    if (d.kind == decl.DECL_KIND_VAL)  { ret opt[token.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_VAR)  { ret opt[token.Span].some{d.data.bind.name}; }
     if (d.kind == decl.DECL_KIND_TEST) { ret opt[token.Span].some{d.data.test_.name}; }
     ret opt[token.Span].none{};
 }
