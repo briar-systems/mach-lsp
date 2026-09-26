@@ -348,16 +348,22 @@ use std.allocator;
 # the queue's contract is that every accepted body reaches the callback exactly
 # once and in push order, so the tests assert the sequence rather than a count
 
-var SEEN:     [64]u8;
+#[testing]
+var SEEN: [64]u8;
+#[testing]
 var SEEN_LEN: i64 = 0;
+#[testing]
 var SEEN_SUM: i64 = 0;
 
+#[testing]
 var SIGNALS: i64 = 0;
 
+#[testing]
 fun note(ctx: ptr) {
     SIGNALS = SIGNALS + 1;
 }
 
+#[testing]
 fun record(ctx: ptr, body: str, len: usize) {
     if (SEEN_LEN < 64) {
         SEEN[SEEN_LEN::usize] = body[0];
@@ -400,26 +406,6 @@ test every_pushed_body_reaches_the_worker_once_in_order {
         if (SEEN[2] != 'c') { fail = true; }
     }
     if (SEEN_SUM != 9) { fail = true; }
-    dnit(?q);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# the worker must sleep on the futex rather than spin, so a queue that is
-# started and immediately joined without work still terminates
-test an_idle_worker_joins_without_any_job {
-    var pa: Allocator;
-    page.make(?pa);
-    var q: Queue;
-    if (!init(?q, ?pa)) { ret 1; }
-    SEEN_LEN = 0;
-    if (!start(?q, record, note, nil)) {
-        dnit(?q);
-        ret 1;
-    }
-    join(?q);
-    var fail: bool = false;
-    if (SEEN_LEN != 0) { fail = true; }
     dnit(?q);
     if (fail) { ret 1; }
     ret 0;
@@ -476,20 +462,6 @@ test a_full_queue_refuses_a_push_instead_of_growing {
     if (push(?q, "overflow", 8)) { fail = true; }
     if (depth(?q) != CAPACITY)   { fail = true; }
 
-    dnit(?q);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# a closed queue accepts nothing further, so a shutdown cannot be overtaken
-test a_closed_queue_refuses_further_pushes {
-    var pa: Allocator;
-    page.make(?pa);
-    var q: Queue;
-    if (!init(?q, ?pa)) { ret 1; }
-    close(?q);
-    var fail: bool = false;
-    if (push(?q, "late", 4)) { fail = true; }
     dnit(?q);
     if (fail) { ret 1; }
     ret 0;

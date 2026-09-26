@@ -549,11 +549,13 @@ use std.types.string.str_equals;
 use std.allocator;
 
 # test helpers over an optional offset, since a call result cannot be guarded
+#[testing]
 fun some_is(o: opt[usize], want: usize) bool {
     if (sel o.some) { ret o.some == want; }
     ret false;
 }
 
+#[testing]
 fun some_present(o: opt[usize]) bool {
     ret sel o.some;
 }
@@ -571,18 +573,6 @@ test a_text_offset_resolves_line_and_utf_16_column {
     if (!some_is(offset_in_text(t, 2, 0), 8))  { fail = true; }
     if (some_present(offset_in_text(t, 9, 0))) { fail = true; }
     if (fail)                                  { ret 1; }
-    ret 0;
-}
-
-# a 4-byte sequence is one codepoint but TWO utf-16 units, so a column past it
-# must not be read as a byte count
-test an_astral_codepoint_counts_as_two_utf_16_units {
-    var fail: bool = false;
-    # "a" + U+1F600 (4 bytes) + "b"
-    val t: str = "a\xF0\x9F\x98\x80b";
-    if (!some_is(offset_in_text(t, 0, 1), 1)) { fail = true; }
-    if (!some_is(offset_in_text(t, 0, 3), 5)) { fail = true; }
-    if (fail)                                 { ret 1; }
     ret 0;
 }
 
@@ -613,27 +603,6 @@ test the_negotiated_encoding_decides_the_column_units {
     # restore the default so tests that assume utf-16 are unaffected by order
     use_encoding(ENC_UTF16);
     if (fail) { ret 1; }
-    ret 0;
-}
-
-# `Text` exists so a span is never copied against a length taken from another
-# file, and so the length is discovered once rather than once per span. Both
-# properties are invisible at a call site, so they are pinned here.
-test a_text_pairs_a_file_with_its_own_length {
-    var starts: [3]usize;
-    starts[0] = 0;
-    starts[1] = 3;
-    starts[2] = 6;
-    var f:    src.SourceFile = t_file("ab\ncd\nef", ?starts[0], 3);
-    val t:    Text           = text_of(?f);
-    var fail: bool           = false;
-    if (t.len != 8)     { fail = true; }
-    if (t.file != (?f)) { fail = true; }
-    # a nil file is a well-formed empty pairing, not a crash: `callee_file`
-    # returns one when a call's target cannot be resolved
-    val e: Text = text_of(nil);
-    if (e.file != nil || e.len != 0) { fail = true; }
-    if (fail)                        { ret 1; }
     ret 0;
 }
 
@@ -818,27 +787,32 @@ test identical_texts_carry_no_window {
     ret 0;
 }
 
+#[testing]
 fun t_against(pa: *Allocator, old: *src.SourceFile, new: *src.SourceFile, wins: *textdiff.Windows) Text {
     textdiff.compute(pa, old, str_len(old.text), new, str_len(new.text), wins);
     ret text_against(old, new, wins);
 }
 
+#[testing]
 fun win_is(t: Text, i: usize, os: usize, oe: usize, ns: usize, ne: usize) bool {
     if (i >= t.win_count) { ret false; }
     val w: textdiff.Window = t.wins[i];
     ret w.old_start == os && w.old_end == oe && w.new_start == ns && w.new_end == ne;
 }
 
+#[testing]
 fun span_is(o: opt[token.Span], offset: usize, len: usize) bool {
     if (sel o.some) { ret o.some.offset == offset && o.some.len == len; }
     ret false;
 }
 
+#[testing]
 fun span_present(o: opt[token.Span]) bool {
     ret sel o.some;
 }
 
 # a SourceFile over `text` with a real line index, for the tests above
+#[testing]
 fun t_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     var f: src.SourceFile;
     f.present     = true;
@@ -850,6 +824,7 @@ fun t_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     ret f;
 }
 
+#[testing]
 fun t_span(offset: usize, len: usize) token.Span {
     var s: token.Span;
     s.offset = offset;

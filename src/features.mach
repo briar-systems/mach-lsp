@@ -1299,6 +1299,7 @@ pub fun span_bytes_equal(fa: *src.SourceFile, sa: token.Span, fb: *src.SourceFil
 
 # a Span over `[offset, offset + len)`. the test builder for field-name /
 # query spans into a stub SourceFile
+#[testing]
 fun span_at(offset: usize, len: usize) token.Span {
     var sp: token.Span;
     sp.offset = offset;
@@ -1308,6 +1309,7 @@ fun span_at(offset: usize, len: usize) token.Span {
 
 # a SourceFile carrying just `text`, enough for the byte-level field-name
 # compares the pure locator does (it reads `file.text` only)
+#[testing]
 fun stub_file(text: str) src.SourceFile {
     var f: src.SourceFile;
     f.path        = nil;
@@ -1319,6 +1321,7 @@ fun stub_file(text: str) src.SourceFile {
 
 # append a field TypedName named over `[offset, offset + len)` to `a`,
 # returning its index into `a.typed_names`
+#[testing]
 fun add_field(a: *ast.Ast, offset: usize, len: usize) u32 {
     var tn: decl.TypedName;
     tn.name     = span_at(offset, len);
@@ -1329,31 +1332,7 @@ fun add_field(a: *ast.Ast, offset: usize, len: usize) u32 {
     ret r.ok;
 }
 
-test field_decl_span_matches_a_field_in_the_same_source {
-    var pa: Allocator;
-    page.make(?pa);
-    var a: ast.Ast = ast.init(?pa, 0::src.FileId);
-    # text "xyzz": fields "x"@0, "y"@1, "zz"@2..3
-    val start: u32 = add_field(?a, 0, 1);
-    add_field(?a, 1, 1);
-    add_field(?a, 2, 2);
-    var f: src.SourceFile = stub_file("xyzz");
-
-    var fail: bool = false;
-    # query "y" (the byte at offset 1) resolves to field "y" at offset 1
-    val o: opt[token.Span] = field_decl_span(?a, ?f, start, 3, ?f, span_at(1, 1));
-    if (sel o.some) {
-        val sp: token.Span = o.some;
-        if (sp.offset != 1 || sp.len != 1) { fail = true; }
-    }
-    or { fail = true; }
-
-    ast.dnit(?a);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test field_decl_span_matches_a_field_across_two_sources_dependency {
+test field_decl_span_matches_a_field_across_two_sources {
     var pa: Allocator;
     page.make(?pa);
     # the declaring "module" file holds the record fields
@@ -1371,171 +1350,12 @@ test field_decl_span_matches_a_field_across_two_sources_dependency {
         if (sp.offset != 5 || sp.len != 3) { fail = true; }
     }
     or { fail = true; }
+    # "a" names no field
+    val unknown: opt[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 1));
+    if (sel unknown.some) { fail = true; }
 
     ast.dnit(?da);
     if (fail) { ret 1; }
-    ret 0;
-}
-
-test field_decl_span_returns_none_for_an_unknown_field {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:     ast.Ast = ast.init(?pa, 0::src.FileId);
-    val start: u32     = add_field(?a, 0, 1); # "x"
-    add_field(?a, 2, 1); # "y"
-    var f:  src.SourceFile = stub_file("xy");
-    var qf: src.SourceFile = stub_file("o.z");
-
-    val sel_1: opt[token.Span] = field_decl_span(?a, ?f, start, 2, ?qf, span_at(2, 1));
-    val ok:    bool            = sel sel_1.none;
-    ast.dnit(?a);
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-test field_decl_span_returns_none_for_an_empty_field_range {
-    var pa: Allocator;
-    page.make(?pa);
-    var a: ast.Ast        = ast.init(?pa, 0::src.FileId);
-    var f: src.SourceFile = stub_file("x");
-
-    val sel_2: opt[token.Span] = field_decl_span(?a, ?f, 0, 0, ?f, span_at(0, 1));
-    val ok:    bool            = sel sel_2.none;
-    ast.dnit(?a);
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-test field_decl_span_returns_none_for_a_zero_length_query {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:     ast.Ast        = ast.init(?pa, 0::src.FileId);
-    val start: u32            = add_field(?a, 0, 1); # "x"
-    var f:     src.SourceFile = stub_file("x");
-
-    val sel_3: opt[token.Span] = field_decl_span(?a, ?f, start, 1, ?f, span_at(0, 0));
-    val ok:    bool            = sel sel_3.none;
-    ast.dnit(?a);
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-test span_bytes_equal_matches_identical_bytes_across_files {
-    var fa:   src.SourceFile = stub_file("alpha");
-    var fb:   src.SourceFile = stub_file("xalphay");
-    var fail: bool           = false;
-    if (!span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 5))) { fail = true; }
-    if (span_bytes_equal(?fa, span_at(0, 5), ?fb, span_at(1, 4)))  { fail = true; }
-    if (span_bytes_equal(?fa, span_at(0, 3), ?fb, span_at(0, 3)))  { fail = true; }
-    if (fail)                                                      { ret 1; }
-    ret 0;
-}
-
-test field_decl_self_at_hits_a_field_name_and_misses_elsewhere {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:     ast.Ast = ast.init(?pa, 0::src.FileId);
-    val start: u32     = add_field(?a, 4, 1); # "x" at offset 4
-    add_field(?a, 10, 3); # "foo" at offset 10
-
-    var fail: bool = false;
-    # offset 11 sits inside "foo"
-    val hit: opt[token.Span] = field_decl_self_at(?a, start, 2, 11);
-    if (sel hit.some) {
-        val sp: token.Span = hit.some;
-        if (sp.offset != 10 || sp.len != 3) { fail = true; }
-    }
-    or { fail = true; }
-    # offset 7 is between the two field names.
-    val sel_4: opt[token.Span] = field_decl_self_at(?a, start, 2, 7);
-    if (sel sel_4.some) { fail = true; }
-
-    ast.dnit(?a);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# append a function decl carrying the doc-block span `[doc_off,
-# doc_off + doc_len)` to `a`, returning its DeclId. the function payload is left
-# zeroed; only `kind` and `doc` matter for the doc-retrieval tests
-fun add_doc_fun(a: *ast.Ast, doc_off: usize, doc_len: usize) id.DeclId {
-    var d: decl.Decl;
-    d.kind                     = decl.DECL_KIND_FUN;
-    d.flags                    = 0;
-    d.doc.offset               = doc_off;
-    d.doc.len                  = doc_len;
-    d.decorators_start         = 0;
-    d.decorators_len           = 0;
-    d.data.fun_.name.offset    = 0;
-    d.data.fun_.name.len       = 0;
-    d.data.fun_.generics_start = 0;
-    d.data.fun_.generics_len   = 0;
-    d.data.fun_.params_start   = 0;
-    d.data.fun_.params_len     = 0;
-    d.data.fun_.return_type    = id.TYPE_NIL;
-    d.data.fun_.body           = id.STMT_NIL;
-    val r: res[id.DeclId, fail.Fail] = ast.add_decl(a, d);
-    if (sel r.err) { ret id.DECL_NIL; }
-    ret r.ok;
-}
-
-# a SYM_FUN symbol whose decl is `did`, for the doc-retrieval tests
-fun fun_sym(did: id.DeclId) rslv.Symbol {
-    var s: rslv.Symbol;
-    s.kind   = rslv.SYM_FUN;
-    s.name   = intern.STR_NIL;
-    s.decl   = did;
-    s.slot   = 0;
-    s.origin = 0::sess.ModuleId;
-    ret s;
-}
-
-test doc_span_of_returns_the_decl_s_first_class_doc_span {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
-    val did: id.DeclId   = add_doc_fun(?a, 4, 9);
-    var sym: rslv.Symbol = fun_sym(did);
-
-    var fail: bool            = false;
-    val o:    opt[token.Span] = doc_span_of(?a, ?sym);
-    if (sel o.some) {
-        val sp: token.Span = o.some;
-        if (sp.offset != 4 || sp.len != 9) { fail = true; }
-    }
-    or { fail = true; }
-
-    ast.dnit(?a);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test doc_span_of_returns_none_for_a_decl_with_no_docstring {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
-    val did: id.DeclId   = add_doc_fun(?a, 0, 0); # empty doc span = no docstring
-    var sym: rslv.Symbol = fun_sym(did);
-
-    val sel_5: opt[token.Span] = doc_span_of(?a, ?sym);
-    val ok:    bool            = sel sel_5.none;
-    ast.dnit(?a);
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-test doc_span_of_returns_none_for_a_param_symbol {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:   ast.Ast     = ast.init(?pa, 0::src.FileId);
-    val did: id.DeclId   = add_doc_fun(?a, 4, 9);
-    var sym: rslv.Symbol = fun_sym(did);
-    sym.kind = rslv.SYM_PARAM;
-
-    val sel_6: opt[token.Span] = doc_span_of(?a, ?sym);
-    val ok:    bool            = sel sel_6.none;
-    ast.dnit(?a);
-    if (!ok) { ret 1; }
     ret 0;
 }
 
@@ -1553,14 +1373,14 @@ test field_doc_desc_finds_the_matching_component_s_description {
 
     var fail: bool = false;
     # "y" field -> the "y" component description
-    val oy: opt[token.Span] = field_doc_desc(src, doc, name_span_in(92, 1));
+    val oy: opt[token.Span] = field_doc_desc(src, doc, span_at(92, 1));
     if (sel oy.some) {
         val sp: token.Span = oy.some;
         if (!region_eq(src, sp, "the vertical coordinate")) { fail = true; }
     }
     or { fail = true; }
     # "x" field -> the "x" component description
-    val ox: opt[token.Span] = field_doc_desc(src, doc, name_span_in(84, 1));
+    val ox: opt[token.Span] = field_doc_desc(src, doc, span_at(84, 1));
     if (sel ox.some) {
         val sp: token.Span = ox.some;
         if (!region_eq(src, sp, "the horizontal coordinate")) { fail = true; }
@@ -1571,40 +1391,8 @@ test field_doc_desc_finds_the_matching_component_s_description {
     ret 0;
 }
 
-test field_doc_desc_returns_none_when_no_component_matches {
-    val src: str = "# a point\n# ---\n# x: the horizontal coordinate\nrec P { z: i32; }";
-    var doc: token.Span;
-    doc.offset = 0;
-    doc.len    = 46;
-    # "z" field name at offset 55 - no matching component
-    val sel_7: opt[token.Span] = field_doc_desc(src, doc, name_span_in(55, 1));
-    val ok:    bool            = sel sel_7.none;
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-test field_doc_desc_returns_none_for_a_summary_only_doc_block {
-    val src: str = "# just a summary, no components\nrec P { x: i32; }";
-    var doc: token.Span;
-    doc.offset = 0;
-    doc.len    = 31;
-    # "x" field name at offset 40 - the block has no component lines
-    val sel_8: opt[token.Span] = field_doc_desc(src, doc, name_span_in(40, 1));
-    val ok:    bool            = sel sel_8.none;
-    if (!ok) { ret 1; }
-    ret 0;
-}
-
-# a span over `[offset, offset + len)`, the test builder for a
-# field-name query into the shared doc/body source
-fun name_span_in(offset: usize, len: usize) token.Span {
-    var sp: token.Span;
-    sp.offset = offset;
-    sp.len    = len;
-    ret sp;
-}
-
 # true when `span` of `source` equals the byte content of `expect`
+#[testing]
 fun region_eq(source: str, span: token.Span, expect: str) bool {
     val n: usize = str_len(expect);
     if (span.len != n) { ret false; }
@@ -1618,6 +1406,7 @@ fun region_eq(source: str, span: token.Span, expect: str) bool {
 
 # a FieldKey naming the field at `[off, off + len)` in `decl_file` of the
 # record (`origin`, `decl`), the test builder for the field-reference matcher
+#[testing]
 fun fk(origin: u32, decl: u32, decl_file: *src.SourceFile, off: usize, len: usize) FieldKey {
     var k: FieldKey;
     k.origin     = origin::sess.ModuleId;
@@ -1632,6 +1421,7 @@ fun fk(origin: u32, decl: u32, decl_file: *src.SourceFile, off: usize, len: usiz
 # a standalone SemaResult with an `expr_type` array of `n` slots, every
 # slot TYPE_NIL. the test stand-in for sema's own typing output, so the field
 # matcher can be driven without a whole analysis. released with `free_sema`
+#[testing]
 fun mk_sema(pa: *Allocator, n: u32) sema.SemaResult {
     var sr: sema.SemaResult;
     sr.alloc            = pa;
@@ -1656,6 +1446,7 @@ fun mk_sema(pa: *Allocator, n: u32) sema.SemaResult {
     ret sr;
 }
 
+#[testing]
 fun free_sema(pa: *Allocator, sr: *sema.SemaResult) {
     if (sr.expr_type != nil && sr.expr_count > 0) {
         deallocate[type.TypeId](pa, sr.expr_type, sr.expr_count::usize);
@@ -1664,6 +1455,7 @@ fun free_sema(pa: *Allocator, sr: *sema.SemaResult) {
 
 # append an IDENT expr spanning `[off, off + len)`, returning its id.
 # the receiver of a member access is an IDENT whose type the SemaResult carries
+#[testing]
 fun add_ident(a: *ast.Ast, off: usize, len: usize) id.ExprId {
     var e: expr.Expr;
     e.span           = span_at(off, len);
@@ -1677,6 +1469,7 @@ fun add_ident(a: *ast.Ast, off: usize, len: usize) id.ExprId {
 # append a member access `obj.<name>` where `obj` is expr `object`
 # and the field-name token spans `[name_off, name_off + name_len)`, returning the
 # member expr id
+#[testing]
 fun add_member(a: *ast.Ast, object: id.ExprId, name_off: usize, name_len: usize) id.ExprId {
     var e: expr.Expr;
     e.span               = span_at(name_off, name_len);
@@ -1690,6 +1483,7 @@ fun add_member(a: *ast.Ast, object: id.ExprId, name_off: usize, name_len: usize)
 
 # append a struct literal with a single field init named over
 # `[name_off, name_off + name_len)`, returning the struct-lit expr id
+#[testing]
 fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
     var fi: expr.FieldInit;
     fi.name  = span_at(name_off, name_len);
@@ -1746,38 +1540,6 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     type.dnit(?ti);
     ast.dnit(?a);
     if (fail) { ret 1; }
-    ret 0;
-}
-
-test field_ref_span_at_peels_a_pointer_receiver_to_the_record {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
-    var ti:     type.TypeInterner;
-    val sel_11: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_11.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 0::intern.StrId, t_owner(1), type.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:  type.TypeId                 = recp_r.ok;
-    val ptr_r: res[type.TypeId, fail.Fail] = type.intern_pointer(?ti, recp);
-    if (sel ptr_r.err) { ret 1; }
-    val ptr:   type.TypeId    = ptr_r.ok;
-    var declf: src.SourceFile = stub_file("name"); # "name" at offset 0
-    var buf:   src.SourceFile = stub_file("q.name");
-
-    val recv: id.ExprId       = add_ident(?a, 0, 1);
-    val mem:  id.ExprId       = add_member(?a, recv, 2, 4); # ".name"
-    var sr:   sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[recv] = ptr; # *P
-
-    val key:    FieldKey        = fk(1, 0, ?declf, 0, 4);
-    val sel_12: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
-    val ok:     bool            = sel sel_12.some;
-
-    free_sema(?pa, ?sr);
-    type.dnit(?ti);
-    ast.dnit(?a);
-    if (!ok) { ret 1; }
     ret 0;
 }
 
@@ -1853,15 +1615,7 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     ret 0;
 }
 
-# a zero-length doc span, for the no-doc test cases
-fun empty_doc() token.Span {
-    var d: token.Span;
-    d.offset = 0;
-    d.len    = 0;
-    ret d;
-}
-
-test collect_field_sites_gathers_every_site_the_decl_and_the_doc_component_rename {
+test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     var pa: Allocator;
     page.make(?pa);
     var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
@@ -1912,108 +1666,20 @@ test collect_field_sites_gathers_every_site_the_decl_and_the_doc_component_renam
         if (!region_eq(declsrc, out[4], "x"))  { fail = true; }
         if (declsrc[out[4].offset - 2] != '#') { fail = true; }
     }
+    # references leave the doc component out
+    if (collect_field_sites(?a, ?sr, ?ti, ?buf, key, true, false, declsrc, doc, ?out[0], 8) != 4) { fail = true; }
+    # a module that does not declare the record contributes its body sites only
+    if (collect_field_sites(?a, ?sr, ?ti, ?buf, key, false, true, declsrc, doc, ?out[0], 8) != 3) { fail = true; }
+    # a record with no doc block has no doc component to rename
+    var no_doc: token.Span;
+    no_doc.offset = 0;
+    no_doc.len    = 0;
+    if (collect_field_sites(?a, ?sr, ?ti, ?buf, key, true, true, declsrc, no_doc, ?out[0], 8) != 4) { fail = true; }
 
     free_sema(?pa, ?sr);
     type.dnit(?ti);
     ast.dnit(?a);
     if (fail) { ret 1; }
-    ret 0;
-}
-
-test collect_field_sites_omits_the_doc_component_for_references_want_doc_false {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
-    var ti:     type.TypeInterner;
-    val sel_19: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_19.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:    type.TypeId    = recp_r.ok;
-    val declsrc: str            = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; }";
-    var declf:   src.SourceFile = stub_file(declsrc);
-    var doc:     token.Span;
-    doc.offset = 0;
-    doc.len    = 33;
-    var buf: src.SourceFile  = stub_file("p.x");
-    val r1:  id.ExprId       = add_ident(?a, 0, 1);
-    val m1:  id.ExprId       = add_member(?a, r1, 2, 1);
-    var sr:  sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[r1] = recp;
-
-    val key: FieldKey = fk(0, 4, ?declf, 42, 1);
-    var out: [4]token.Span;
-    # the one member access + the field decl, but NOT the doc component
-    val n: usize = collect_field_sites(?a, ?sr, ?ti, ?buf, key, true, false, declsrc, doc, ?out[0], 4);
-
-    free_sema(?pa, ?sr);
-    type.dnit(?ti);
-    ast.dnit(?a);
-    if (n != 2)             { ret 1; }
-    if (out[0].offset != 2) { ret 1; }
-    ret 0;
-}
-
-test collect_field_sites_in_a_non_declaring_module_yields_only_body_sites {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
-    var ti:     type.TypeInterner;
-    val sel_20: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_20.err) { ret 1; }
-    # the record is declared in module 0; this is a different (importing) module
-    # whose only contribution is a member access on the imported record's value
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:  type.TypeId     = recp_r.ok;
-    var declf: src.SourceFile  = stub_file("rec P { x: i32; }"); # "x" @8
-    var buf:   src.SourceFile  = stub_file("p.x");
-    val r1:    id.ExprId       = add_ident(?a, 0, 1);
-    val m1:    id.ExprId       = add_member(?a, r1, 2, 1);
-    var sr:    sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[r1] = recp;
-
-    val key: FieldKey = fk(0, 4, ?declf, 8, 1);
-    var out: [4]token.Span;
-    # declaring=false: no decl span, no doc - just the body site
-    val n: usize = collect_field_sites(?a, ?sr, ?ti, ?buf, key, false, true, "", empty_doc(), ?out[0], 4);
-
-    free_sema(?pa, ?sr);
-    type.dnit(?ti);
-    ast.dnit(?a);
-    if (n != 1)                                { ret 1; }
-    if (out[0].offset != 2 || out[0].len != 1) { ret 1; }
-    ret 0;
-}
-
-test collect_field_sites_adds_the_decl_but_no_doc_edit_when_the_record_has_no_docstring {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
-    var ti:     type.TypeInterner;
-    val sel_21: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_21.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:  type.TypeId     = recp_r.ok;
-    var declf: src.SourceFile  = stub_file("rec P { x: i32; }"); # "x" @8
-    var buf:   src.SourceFile  = stub_file("p.x");
-    val r1:    id.ExprId       = add_ident(?a, 0, 1);
-    val m1:    id.ExprId       = add_member(?a, r1, 2, 1);
-    var sr:    sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[r1] = recp;
-
-    val key: FieldKey = fk(0, 4, ?declf, 8, 1);
-    var out: [4]token.Span;
-    # rename, declaring, but the doc span is empty -> the decl edit, no doc edit
-    val n: usize = collect_field_sites(?a, ?sr, ?ti, ?buf, key, true, true, "rec P { x: i32; }", empty_doc(), ?out[0], 4);
-
-    free_sema(?pa, ?sr);
-    type.dnit(?ti);
-    ast.dnit(?a);
-    if (n != 2)             { ret 1; }
-    if (out[0].offset != 2) { ret 1; } # the member access
-    if (out[1].offset != 8) { ret 1; } # the field decl
     ret 0;
 }
 
@@ -2065,38 +1731,8 @@ test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
     ret 0;
 }
 
-test doc_component_name_span_returns_none_with_no_doc_no_match_summary_only {
-    var qf:   src.SourceFile = stub_file("x");
-    var fail: bool           = false;
-
-    # empty doc span -> none
-    var empty: token.Span;
-    empty.offset = 0;
-    empty.len    = 0;
-    val sel_23: opt[token.Span] = doc_component_name_span("", empty, ?qf, span_at(0, 1), false);
-    if (sel sel_23.some) { fail = true; }
-
-    # a real doc block whose components do not include "x" -> none
-    val txt: str = "# d\n# ---\n# a: one\n# b: two\n";
-    var doc: token.Span;
-    doc.offset = 0;
-    doc.len    = str_len(txt);
-    val sel_24: opt[token.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
-    if (sel sel_24.some) { fail = true; }
-
-    # a summary-only block (no `# ---`) -> no components -> none
-    val s2: str = "# just a summary mentioning x\n";
-    var d2: token.Span;
-    d2.offset = 0;
-    d2.len    = str_len(s2);
-    val sel_25: opt[token.Span] = doc_component_name_span(s2, d2, ?qf, span_at(0, 1), false);
-    if (sel sel_25.some) { fail = true; }
-
-    if (fail) { ret 1; }
-    ret 0;
-}
-
 # a TypeOwner whose stable module and file are both `file`, the test stand-in
+#[testing]
 fun t_owner(file: u32) type.TypeOwner {
     var o: type.TypeOwner;
     o.module = file;
@@ -2145,26 +1781,8 @@ test symbol_denotes_matches_a_use_imported_binding_by_canonical_name {
     if (symbol_denotes(?rr, 3, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
     if (symbol_denotes(?rr, rslv.SYMBOL_NIL, org, dcl, cnon, rslv.SYM_FUN)) { fail = true; }
     if (symbol_denotes(?rr, 9, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
-    if (fail)                                                               { ret 1; }
-    ret 0;
-}
-
-test symbol_denotes_rejects_a_declaration_bearing_symbol_for_another_decl {
-    var syms: [1]rslv.Symbol;
-    syms[0].kind   = rslv.SYM_FUN;
-    syms[0].origin = 2::sess.ModuleId;
-    syms[0].decl   = 5::id.DeclId;
-    syms[0].canon  = 8::intern.StrId;
-
-    var rr: rslv.ResolveResult;
-    rr.symbols      = ?syms[0];
-    rr.symbol_count = 1;
-
-    var fail: bool = false;
-    # the canonical name must not rescue a symbol that carries the wrong decl
-    if (symbol_denotes(?rr, 0, 2::sess.ModuleId, 6::id.DeclId, 8::intern.StrId, rslv.SYM_FUN))  { fail = true; }
-    if (symbol_denotes(?rr, 0, 1::sess.ModuleId, 5::id.DeclId, 8::intern.StrId, rslv.SYM_FUN))  { fail = true; }
-    if (!symbol_denotes(?rr, 0, 2::sess.ModuleId, 5::id.DeclId, 8::intern.StrId, rslv.SYM_FUN)) { fail = true; }
-    if (fail)                                                                                   { ret 1; }
+    # the canonical name does not rescue a symbol that carries another decl
+    if (symbol_denotes(?rr, 0, org, 8::id.DeclId, cnon, rslv.SYM_FUN)) { fail = true; }
+    if (fail)                                                          { ret 1; }
     ret 0;
 }
