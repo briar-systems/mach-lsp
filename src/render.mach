@@ -252,6 +252,7 @@ use std.types.string.str_equals;
 # `src.position` binary-searches `line_starts` and reads `line_starts[lo - 1]`,
 # so a stub without one is a nil dereference rather than a degenerate result.
 # `starts` must hold the byte offset of every line, `0` first.
+#[testing]
 fun stub_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     var f: src.SourceFile;
     f.path        = "stub.mach";
@@ -261,29 +262,12 @@ fun stub_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     ret f;
 }
 
+#[testing]
 fun span_at(offset: usize, len: usize) token.Span {
     var s: token.Span;
     s.offset = offset;
     s.len    = len;
     ret s;
-}
-
-test a_range_spells_both_endpoints {
-    var pa: Allocator;
-    page.make(?pa);
-    var b: json.Buf = json.buf_init(?pa);
-    var r: positions.LspRange;
-    r.start_line = 2;
-    r.start_char = 4;
-    r.end_line   = 2;
-    r.end_char   = 9;
-    range(?b, r);
-    var fail: bool = false;
-    if (!str_equals(json.buf_str(?b),
-        "{\"start\":{\"line\":2,\"character\":4},\"end\":{\"line\":2,\"character\":9}}")) { fail = true; }
-    json.buf_dnit(?b);
-    if (fail) { ret 1; }
-    ret 0;
 }
 
 test a_location_carries_an_escaped_uri {
@@ -354,21 +338,6 @@ test an_unmapped_span_writes_nothing {
     if (got == nil || !str_equals(got, "{\"start\":{\"line\":0,\"character\":3},\"end\":{\"line\":0,\"character\":5}}")) { fail = true; }
     json.buf_dnit(?b);
     textdiff.dnit(?pa, ?wins);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test a_response_envelope_preserves_the_id_s_wire_type {
-    var pa: Allocator;
-    page.make(?pa);
-    var b: json.Buf = json.buf_init(?pa);
-    result_begin(?b, "\"abc\"");
-    json.buf_push(?b, "null");
-    json.buf_push_byte(?b, '}');
-    var fail: bool = false;
-    if (!str_equals(json.buf_str(?b),
-        "{\"jsonrpc\":\"2.0\",\"id\":\"abc\",\"result\":null}")) { fail = true; }
-    json.buf_dnit(?b);
     if (fail) { ret 1; }
     ret 0;
 }

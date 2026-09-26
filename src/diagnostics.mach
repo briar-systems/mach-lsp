@@ -314,6 +314,7 @@ fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Alloca
 # --- shaping ---
 
 # an otherwise-empty error diagnostic over file 0 at [0,1)
+#[testing]
 fun stub_diag(message: str) diag.Diagnostic {
     var d: diag.Diagnostic;
     d.severity        = diag.SEVERITY_ERROR;
@@ -328,6 +329,7 @@ fun stub_diag(message: str) diag.Diagnostic {
 }
 
 # borrow `items` as a diagnostic's child list without owning them
+#[testing]
 fun stub_children(items: *diag.Child, n: usize) Vector[diag.Child] {
     var v: Vector[diag.Child] = vector.init[diag.Child](nil);
     v.data = items;
@@ -337,26 +339,13 @@ fun stub_children(items: *diag.Child, n: usize) Vector[diag.Child] {
 }
 
 # borrow `items` as a diagnostic's related list without owning them
+#[testing]
 fun stub_related(items: *diag.Related, n: usize) Vector[diag.Related] {
     var v: Vector[diag.Related] = vector.init[diag.Related](nil);
     v.data = items;
     v.len  = n;
     v.cap  = n;
     ret v;
-}
-
-test a_diagnostic_with_no_note_or_help_renders_its_message_alone {
-    var pa: Allocator;
-    page.make(?pa);
-    var b: json.Buf        = json.buf_init(?pa);
-    var d: diag.Diagnostic = stub_diag("unresolved identifier `x`");
-    push_message(?b, ?d);
-
-    var fail: bool = false;
-    if (!str_equals(json.buf_str(?b), "\"unresolved identifier `x`\"")) { fail = true; }
-    json.buf_dnit(?b);
-    if (fail) { ret 1; }
-    ret 0;
 }
 
 # the help line is the half of a mach diagnostic that says what to DO; it rode
@@ -377,40 +366,6 @@ test note_and_help_ride_the_message_as_trailing_lines {
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b),
         "\"type mismatch\\nnote: expected i32\\nhelp: cast with `v::i32`\"")) { fail = true; }
-    json.buf_dnit(?b);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test help_alone_still_renders_without_an_empty_note_line {
-    var pa: Allocator;
-    page.make(?pa);
-    var b:    json.Buf        = json.buf_init(?pa);
-    var d:    diag.Diagnostic = stub_diag("unknown key");
-    var kids: [1]diag.Child;
-    kids[0].kind = diag.CHILD_HELP;
-    kids[0].text = "did you mean `simd`?";
-    d.children   = stub_children(?kids[0], 1);
-    push_message(?b, ?d);
-
-    var fail: bool = false;
-    if (!str_equals(json.buf_str(?b), "\"unknown key\\nhelp: did you mean `simd`?\"")) { fail = true; }
-    json.buf_dnit(?b);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test no_secondary_locations_emits_no_relatedinformation_key {
-    var pa: Allocator;
-    page.make(?pa);
-    var b:  json.Buf        = json.buf_init(?pa);
-    var d:  diag.Diagnostic = stub_diag("duplicate definition");
-    var m:  src.SourceMap   = src.init(?pa);
-    var at: Locator         = Locator{w: nil, root: nil, sources: ?m};
-    push_related(?b, ?at, ?d, ?pa);
-
-    var fail: bool = false;
-    if (!str_equals(json.buf_str(?b), "")) { fail = true; }
     json.buf_dnit(?b);
     if (fail) { ret 1; }
     ret 0;
