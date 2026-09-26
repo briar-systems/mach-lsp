@@ -1,9 +1,9 @@
 [project]
 id = "mls"
-version = "1.4.3"
+version = "1.5.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
-mach = "^5.9"
+mach = "^6"
 
 [target.linux-x86_64]
 default = true
@@ -53,7 +53,7 @@ float_reassoc = false
 
 [artifact.mls]
 kind = "bin"
-entry = "main.mach"
+entry = "bin/main.mach"
 out = "bin/mls{artifact.suffix}"
 targets = ["*"]
 link = []
@@ -65,4 +65,4 @@ version = "^7.4"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v5.12.0"
+ref = "tag/v6.0.0"

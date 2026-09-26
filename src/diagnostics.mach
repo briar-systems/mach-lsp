@@ -345,7 +345,7 @@ fun stub_related(items: *diag.Related, n: usize) Vector[diag.Related] {
     ret v;
 }
 
-test "diagnostics: a diagnostic with no note or help renders its message alone" {
+test a_diagnostic_with_no_note_or_help_renders_its_message_alone {
     var pa: Allocator;
     page.make(?pa);
     var b: json.Buf        = json.buf_init(?pa);
@@ -361,7 +361,7 @@ test "diagnostics: a diagnostic with no note or help renders its message alone" 
 
 # the help line is the half of a mach diagnostic that says what to DO; it rode
 # nowhere before, so its presence in the rendered message is the regression pin
-test "diagnostics: note and help ride the message as trailing lines" {
+test note_and_help_ride_the_message_as_trailing_lines {
     var pa: Allocator;
     page.make(?pa);
     var b:    json.Buf        = json.buf_init(?pa);
@@ -382,7 +382,7 @@ test "diagnostics: note and help ride the message as trailing lines" {
     ret 0;
 }
 
-test "diagnostics: help alone still renders, without an empty note line" {
+test help_alone_still_renders_without_an_empty_note_line {
     var pa: Allocator;
     page.make(?pa);
     var b:    json.Buf        = json.buf_init(?pa);
@@ -400,7 +400,7 @@ test "diagnostics: help alone still renders, without an empty note line" {
     ret 0;
 }
 
-test "diagnostics: no secondary locations emits no relatedInformation key" {
+test no_secondary_locations_emits_no_relatedinformation_key {
     var pa: Allocator;
     page.make(?pa);
     var b:  json.Buf        = json.buf_init(?pa);
@@ -418,7 +418,7 @@ test "diagnostics: no secondary locations emits no relatedInformation key" {
 
 # a secondary location carries the file it points INTO, which need not be the
 # primary's - so the entry resolves its own uri rather than reusing the request's
-test "diagnostics: a secondary location renders as a located relatedInformation entry" {
+test a_secondary_location_renders_as_a_located_relatedinformation_entry {
     var pa: Allocator;
     page.make(?pa);
 
@@ -451,7 +451,7 @@ test "diagnostics: a secondary location renders as a located relatedInformation 
 
 # an unresolvable file id would otherwise render a well-formed entry pointing at
 # the wrong place, which is worse than no entry at all
-test "diagnostics: a secondary location with an unresolvable file is skipped" {
+test a_secondary_location_with_an_unresolvable_file_is_skipped {
     var pa: Allocator;
     page.make(?pa);
     var m: src.SourceMap = src.init(?pa);

@@ -308,7 +308,7 @@ fun usize_to_buf(buf: *u8, cap: usize, value: usize) usize {
     ret cap - pos;
 }
 
-test "mls.transport.parse_content_length:bounded_strict_decimal" {
+test parse_content_length__bounded_strict_decimal {
     val valid: str = "content-type: application/vscode-jsonrpc; charset=utf-8\r\nCoNtEnT-LeNgTh:\t 42\r\n\r\n";
     if (parse_content_length(valid::*u8, str_len(valid)) != 42) { ret 1; }
 

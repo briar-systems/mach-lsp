@@ -195,7 +195,7 @@ fun lower(c: u8) u8 {
     ret c;
 }
 
-test "workspace: match rank prefers leading over interior hits" {
+test match_rank_prefers_leading_over_interior_hits {
     var fail: bool = false;
     if (match_tier("json", "json_buf_push") != MATCH_PREFIX) { fail = true; }
     if (match_tier("JSON", "json_buf_push") != MATCH_PREFIX) { fail = true; }

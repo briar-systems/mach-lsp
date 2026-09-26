@@ -541,7 +541,7 @@ pub fun id_text(id: *sj.Value, alloc: *Allocator) str {
 
 # --- Buf ---
 
-test "json: an untouched Buf reads as the empty string and needs no allocation" {
+test an_untouched_buf_reads_as_the_empty_string_and_needs_no_allocation {
     var pa: Allocator;
     page.make(?pa);
     var b:    Buf  = buf_init(?pa);
@@ -553,7 +553,7 @@ test "json: an untouched Buf reads as the empty string and needs no allocation" 
     ret 0;
 }
 
-test "json: pushes concatenate and nil is a no-op" {
+test pushes_concatenate_and_nil_is_a_no_op {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf = buf_init(?pa);
@@ -572,7 +572,7 @@ test "json: pushes concatenate and nil is a no-op" {
 
 # the growth path is the whole reason Buf exists, so it is exercised past the
 # doubling boundary rather than only within the first allocation
-test "json: content survives growth past the initial capacity" {
+test content_survives_growth_past_the_initial_capacity {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf   = buf_init(?pa);
@@ -601,7 +601,7 @@ test "json: content survives growth past the initial capacity" {
 
 # escaping is the std emitter's, so a control byte survives as an escape rather
 # than the `?` placeholder the hand-rolled escaper substituted
-test "json: buf_push_quoted escapes the JSON control set losslessly" {
+test buf_push_quoted_escapes_the_json_control_set_losslessly {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf = buf_init(?pa);
@@ -613,7 +613,7 @@ test "json: buf_push_quoted escapes the JSON control set losslessly" {
     ret 0;
 }
 
-test "json: buf_push_quoted renders nil as an empty JSON string" {
+test buf_push_quoted_renders_nil_as_an_empty_json_string {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf = buf_init(?pa);
@@ -625,7 +625,7 @@ test "json: buf_push_quoted renders nil as an empty JSON string" {
     ret 0;
 }
 
-test "json: numbers render in base 10 with a sign only where negative" {
+test numbers_render_in_base_10_with_a_sign_only_where_negative {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf = buf_init(?pa);
@@ -646,7 +646,7 @@ test "json: numbers render in base 10 with a sign only where negative" {
 # the scanner this replaced looked for a quoted key ANYWHERE in the body, so a
 # key spelled inside an opened file's own source text could win over the real
 # envelope member. a language server is handed exactly that input on didOpen
-test "json: a key spelled inside a string value never shadows a real member" {
+test a_key_spelled_inside_a_string_value_never_shadows_a_real_member {
     var pa: Allocator;
     page.make(?pa);
     var rd: Reader;
@@ -669,7 +669,7 @@ test "json: a key spelled inside a string value never shadows a real member" {
     ret 0;
 }
 
-test "json: member2 walks one level and misses report nil" {
+test member2_walks_one_level_and_misses_report_nil {
     var pa: Allocator;
     page.make(?pa);
     var rd: Reader;
@@ -695,7 +695,7 @@ test "json: member2 walks one level and misses report nil" {
     ret 0;
 }
 
-test "json: string escapes in a value decode to their logical bytes" {
+test string_escapes_in_a_value_decode_to_their_logical_bytes {
     var pa: Allocator;
     page.make(?pa);
     var rd: Reader;
@@ -720,7 +720,7 @@ test "json: string escapes in a value decode to their logical bytes" {
 
 # a response must echo the request id with the type it arrived as; a string id
 # is re-emitted from its wire bytes rather than decoded and re-escaped
-test "json: an id round-trips with its wire type preserved" {
+test an_id_round_trips_with_its_wire_type_preserved {
     var pa: Allocator;
     page.make(?pa);
     var rd: Reader;
@@ -765,7 +765,7 @@ test "json: an id round-trips with its wire type preserved" {
     ret 0;
 }
 
-test "json: a malformed body reports invalid rather than a partial tree" {
+test a_malformed_body_reports_invalid_rather_than_a_partial_tree {
     var pa: Allocator;
     page.make(?pa);
     var rd: Reader;
@@ -785,7 +785,7 @@ test "json: a malformed body reports invalid rather than a partial tree" {
 
 # the arena is what makes per-message parsing affordable: releasing must return
 # the chunks rather than grow without bound across a session's messages
-test "json: releasing a message reuses the arena instead of growing it" {
+test releasing_a_message_reuses_the_arena_instead_of_growing_it {
     var pa: Allocator;
     page.make(?pa);
     var rd: Reader;

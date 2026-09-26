@@ -366,7 +366,7 @@ fun record(ctx: ptr, body: str, len: usize) {
     SEEN_SUM = SEEN_SUM + len::i64;
 }
 
-test "jobs: every pushed body reaches the worker once, in order" {
+test every_pushed_body_reaches_the_worker_once_in_order {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -407,7 +407,7 @@ test "jobs: every pushed body reaches the worker once, in order" {
 
 # the worker must sleep on the futex rather than spin, so a queue that is
 # started and immediately joined without work still terminates
-test "jobs: an idle worker joins without any job" {
+test an_idle_worker_joins_without_any_job {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -426,7 +426,7 @@ test "jobs: an idle worker joins without any job" {
 }
 
 # a body is copied on push, so the caller's buffer may be reused immediately
-test "jobs: a pushed body is copied, not borrowed" {
+test a_pushed_body_is_copied_not_borrowed {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -461,7 +461,7 @@ test "jobs: a pushed body is copied, not borrowed" {
 }
 
 # the bound is what stops a client from buying unbounded memory with didChange
-test "jobs: a full queue refuses a push instead of growing" {
+test a_full_queue_refuses_a_push_instead_of_growing {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -482,7 +482,7 @@ test "jobs: a full queue refuses a push instead of growing" {
 }
 
 # a closed queue accepts nothing further, so a shutdown cannot be overtaken
-test "jobs: a closed queue refuses further pushes" {
+test a_closed_queue_refuses_further_pushes {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -497,7 +497,7 @@ test "jobs: a closed queue refuses further pushes" {
 
 # a rebuild finishing off the analysis thread reaches it only through a signal,
 # so the queue must deliver one that arrives while the worker is asleep
-test "jobs: a signal reaches the worker with no message queued" {
+test a_signal_reaches_the_worker_with_no_message_queued {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -520,7 +520,7 @@ test "jobs: a signal reaches the worker with no message queued" {
 
 # a signal carries no payload, so two that land before the worker looks are one
 # piece of work, not two
-test "jobs: pending signals collapse" {
+test pending_signals_collapse {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -543,7 +543,7 @@ test "jobs: pending signals collapse" {
 
 # queued input is drained ahead of a signal, so a rebuild landing mid-burst
 # never delays the message already waiting
-test "jobs: a queued message is taken before a pending signal" {
+test a_queued_message_is_taken_before_a_pending_signal {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;

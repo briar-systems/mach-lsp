@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-26
+
+mls moves to mach 6.0.0, whose tests are `test <identifier>`, and shows a test
+by that identifier (#387). Same asset set, CLI and options as 1.4.3.
+
+**The linked mach moves from v5.12.0 to v6.0.0.** This mls refuses a project
+whose `[project].mach` range excludes mach 6, and building mls from source
+needs mach 6 (`[project].mach` moves from `^5.9` to `^6`). That breaks mach 5
+projects, and it ships as a minor version by this project's practice: mls
+versions its own protocol, CLI, options and asset contract, and a compiler
+requirement change has been a minor bump before (`^5.3` to `^5.9` and mach
+v5.9.0 to v5.10.0 in 1.4.0). RELEASES.json names the mach each mls links, so an
+installer that reads it still finds 1.4.3 for a mach 5 project.
+
+### Changed
+- feat(#387): the linked mach moves from v5.12.0 to v6.0.0 and
+  `[project].mach` from `^5.9` to `^6`. std moves from v7.4.0 to v7.4.1,
+  inside the existing `^7.4` range, which mach 6.0.0 requires.
+- feat(#387): a test is named by its identifier. Document symbols, the call
+  hierarchy and selection ranges show `test <identifier>` by the identifier
+  where they showed its label, and semantic tokens classify the identifier as a
+  `function`, matching its document symbol kind.
+- feat(#387): a manifest without `[project].mach` is refused by mach 6 rather
+  than loaded with a warning, and the complaint on `mach.toml` says so.
+- chore(#385): the `mls` artifact's entry moves from `src/main.mach` to
+  `src/bin/main.mach`, as artifact entries sit across the family
+  (briar-systems/.github#107). The binary keeps its name and its place at
+  `out/<target>/<profile>/bin/mls`, so the release archives and the editor
+  extensions that start it are unchanged.
+
 ## [1.4.3] - 2026-09-25
 
 The linked mach moves to v5.12.0 and std to v7.4.0 (`^7.4`), and a grouped

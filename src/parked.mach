@@ -137,7 +137,7 @@ fun copy_bytes(alloc: *Allocator, text: str, len: usize) str {
 use std.allocator;
 use std.allocator.page;
 
-test "parked: requests are held in arrival order and taken together" {
+test requests_are_held_in_arrival_order_and_taken_together {
     var pa: Allocator;
     page.make(?pa);
     var q:    Queue = init(?pa);
