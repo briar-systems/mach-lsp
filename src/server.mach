@@ -17,11 +17,8 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
-use std.types.string.str_len;
 
 use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
 
 use mem:     std.memory;
 use strutil: std.text.string;
