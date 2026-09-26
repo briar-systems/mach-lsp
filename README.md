@@ -307,9 +307,9 @@ A project states the compilers it builds with as `[project].mach` in its
 `mach.toml`, and its dependencies may state their own. When the linked release
 is outside any of those ranges, the project is not loaded. The server shows
 why, naming each unmet range and the dependency chain that states it, as an
-error on the root's `mach.toml` and in a message. A manifest without the key
-loads with a warning there that gives the line to add. Both clear when the
-manifest is fixed.
+error on the root's `mach.toml` and in a message. A root manifest without the
+key is refused the same way, with the line to add. Both clear when the manifest
+is fixed.
 
 So a project that requires a newer mach than the server links needs a newer
 server. A release that moves the linked mach says so in the changelog, naming
