@@ -35,6 +35,7 @@ jobs:
       heavy: ${{ inputs.heavy }}
       submodules: "true"
       light-legs: '["x86_64-windows"]'
+      mach-version: v6.0.0
 
   gate:
     if: always()
