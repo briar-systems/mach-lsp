@@ -30,6 +30,12 @@ HEADER_MAX = 8 * 1024
 BODY_MAX = 16 * 1024 * 1024
 ANY_VERSION = object()
 
+# the compiler range every root fixture states: a root manifest without one is
+# refused, so it follows the major of the mach this server links
+COMPILER_RANGE = 'mach = "^{}"'.format(
+    re.search(r'^version = "(\d+)\.', (Path(__file__).resolve().parents[1] / "dep" / "mach" / "mach.toml")
+              .read_text(encoding="utf-8"), re.M).group(1))
+
 
 class ProtocolError(RuntimeError):
     """Raised when the live protocol session violates an asserted contract."""
@@ -477,6 +483,7 @@ def write_project(parent: Path, project_id: str, value: int) -> tuple[Path, Path
     source.mkdir(parents=True)
     (root / "mach.toml").write_text(
         f"""[project]
+{COMPILER_RANGE}
 id = "{project_id}"
 version = "0.1.0"
 src = "src"
@@ -548,11 +555,12 @@ def write_vendored_project(parent: Path) -> tuple[Path, Path, str, str]:
     source.mkdir(parents=True)
     dep_source.mkdir(parents=True)
     (root / "mach.toml").write_text(
-        """[project]
+        f"""[project]
+{COMPILER_RANGE}
 id = "vendorapp"
 version = "0.1.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux]
 isa = "x86_64"
@@ -1058,6 +1066,7 @@ def write_wide_project(parent: Path, project_id: str, modules: int) -> tuple[Pat
     source.mkdir(parents=True)
     (root / "mach.toml").write_text(
         f"""[project]
+{COMPILER_RANGE}
 id = "{project_id}"
 version = "0.1.0"
 src = "src"
@@ -1645,11 +1654,12 @@ def run_position_encoding(server: Path, timeout: float) -> None:
     column in each, and every one must still resolve to the same definition
     through the single conversion point in `positions`.
     """
-    manifest = """[project]
+    manifest = f"""[project]
+{COMPILER_RANGE}
 id = "penc"
 version = "0.1.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 isa = "x86_64"
@@ -1757,15 +1767,16 @@ need = []
 def run_manifest_notes(server: Path, timeout: float) -> None:
     """What a load says about the project itself shows on its mach.toml (#266).
 
-    A manifest without `[project].mach` loads with a warning that belongs to no
-    source file, and a compiler outside a stated range refuses the load. Both are
-    published on the root's `mach.toml`, and cleared when the manifest is fixed:
+    A manifest without `[project].mach`, or with a range that excludes the
+    compiler, refuses the load with a complaint that belongs to no source file.
+    Both are published on the root's `mach.toml`, and cleared when the manifest
+    is fixed:
     through `workspace/didChangeWatchedFiles`, through the next request when the
     client sends no such notification, and for a root that never loaded as well
     as one that did. A stale complaint on a fixed file is the failure this
     guards.
     """
-    # the range the warning tells the user to add is read from the warning itself,
+    # the range the refusal tells the user to add is read from the refusal itself,
     # since the compiler chooses it (the oldest release that reads the key, not the
     # running one) and may change it across versions
     admitted = ""
@@ -1801,30 +1812,30 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
         root = Path(directory).resolve() / "notes"
         manifest = root / "mach.toml"
         uri = manifest.as_uri()
-        base = manifest.read_text(encoding="utf-8")
+        base = manifest.read_text(encoding="utf-8").replace(f"{COMPILER_RANGE}\n", "", 1)
         require(base.startswith("[project]\n") and "mach =" not in base,
                 "write_project's manifest changed shape")
+        manifest.write_text(base, encoding="utf-8")
 
         def set_range(line: str | None) -> None:
             manifest.write_text(base if line is None else base.replace("[project]\n", f"[project]\n{line}\n", 1),
                                 encoding="utf-8")
 
-        # a loaded root
+        # a root that loads once its missing range is added
         session = LspSession(server, root, timeout)
         finished = False
         try:
             open_doc(session, root, main, text)
-            found = notes_for(session, uri, one(2, "states no compiler range"),
-                              "the missing-range warning on mach.toml")
+            found = notes_for(session, uri, one(1, "states no compiler range"),
+                              "the missing-range refusal on mach.toml")
             suggested = re.search(r'mach = "([^"]+)"', found[0]["message"])
             require(suggested is not None,
-                    f"the warning does not name the line to add: {found[0]!r}")
+                    f"the refusal does not name the line to add: {found[0]!r}")
             admitted = f'mach = "{suggested.group(1)}"'
-            session.diagnostics(main.as_uri(), 1)
 
             set_range(admitted)
             changed(session, uri)
-            notes_for(session, uri, cleared, "the warning cleared once the range was added")
+            notes_for(session, uri, cleared, "the refusal cleared once the range was added")
 
             set_range(refused)
             changed(session, uri)
@@ -1884,7 +1895,8 @@ def run_embed_required_artifact(server: Path, timeout: float) -> None:
     """
     # the default target selects the cell on every host: with two targets and
     # neither matching the host, the manifest selects none and the root does not load
-    manifest = """[project]
+    manifest = f"""[project]
+{COMPILER_RANGE}
 id = "lessons"
 version = "0.1.0"
 src = "src"
@@ -1930,7 +1942,7 @@ need = ["artifact.shader-*"]
 [artifact.shader-vert]
 kind = "bin"
 entry = "shaders/vert.mach"
-out = "spv/vert{artifact.suffix}"
+out = "spv/vert{{artifact.suffix}}"
 targets = ["spirv"]
 link = []
 need = []
@@ -2672,11 +2684,12 @@ def run_import_navigation(server: Path, timeout: float) -> None:
                 session.abort()
 
 
-NAV_MANIFEST = """[project]
+NAV_MANIFEST = f"""[project]
+{COMPILER_RANGE}
 id = "nav"
 version = "0.1.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 isa = "x86_64"
@@ -3865,11 +3878,12 @@ def write_std_backed_project(parent: Path) -> tuple[Path, str]:
     shutil.copytree(source, root / "dep" / "std",
                     ignore=shutil.ignore_patterns(".git", "out", "dep"))
     (root / "mach.toml").write_text(
-        """[project]
+        f"""[project]
+{COMPILER_RANGE}
 id = "stdapp"
 version = "0.1.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux]
 isa = "x86_64"
@@ -4429,6 +4443,7 @@ def run_completion_dependency_alias_while_behind(server: Path, timeout: float) -
         shutil.copytree(std, root / "dep" / "std", ignore=shutil.ignore_patterns(".git"))
         (root / "mach.toml").write_text(
             f"""[project]
+{COMPILER_RANGE}
 id = "depalias"
 version = "0.1.0"
 src = "src"
@@ -5007,7 +5022,7 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
         source = project / "src"
         source.mkdir(parents=True)
         (project / "mach.toml").write_text(
-            '[project]\nid = "fwd"\nversion = "0.1.0"\nsrc = "src"\n'
+            f'[project]\n{COMPILER_RANGE}\nid = "fwd"\nversion = "0.1.0"\nsrc = "src"\n'
             'out = "out/{target.name}/{profile.name}"\n\n'
             '[target.linux-x86_64]\nisa = "x86_64"\nos = "linux"\nabi = "sysv64"\n\n'
             '[profile.debug]\nopt = 0\ndebug = true\nsimd = "scalarize"\n'
