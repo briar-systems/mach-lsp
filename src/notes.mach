@@ -4,9 +4,9 @@
 # the manifest raises. A load can also be refused outright, as when the root
 # states no compiler range or the compiler is outside a range the closure
 # states. Neither belongs to a document the client has open, so the
-# per-document publish never carries them. The server shows them on the root's `mach.toml` instead, and
-# publishes that list again whenever it changes, including to empty, so a fixed
-# manifest never keeps an old complaint.
+# per-document publish never carries them. The server shows them on the root's
+# `mach.toml` instead, and publishes that list again whenever it changes,
+# including to empty, so a fixed manifest never keeps an old complaint.
 
 use std.types.bool.bool;
 use std.types.bool.false;
