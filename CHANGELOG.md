@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-26
+
+mls links the mach 6.3.0 front end and std 9, and a diagnostic's `code` is
+now mach 6.3's dotted key for its kind (#396). Same asset set, CLI and options
+as 2.0.0.
+
+**The `code` values clients see changed.** mach 6.3 renamed every diagnostic
+kind to a dotted key with no aliases, and mls sends that key as the LSP
+`code`, so `unused-import` is now `import.unused`. An editor setting, filter,
+suppression or other tooling keyed on a 2.0.0 code must be updated to the new
+key:
+
+| 2.0.0 code | 2.1.0 code |
+|---|---|
+| `unused-import` | `import.unused` |
+| `deprecated` | `decl.deprecated` |
+| `doclint` | `doc.lint` |
+| `inexact-float-literal` | `float.inexact` |
+| `fwd-instances` | `fwd.instances` |
+| `debug-dropped` | `debug.dropped` |
+| `target-skipped` | `target.skipped` |
+| `native-fallback` | `target.native_fallback` |
+| `scalarize` | `vector.scalarize` |
+| `not-oblivious` | `secret.not_oblivious` |
+| (new) | `expect.unfulfilled` |
+
+The linked mach moves from v6.2.0 to v6.3.0, so this mls refuses a project
+whose `[project].mach` range excludes mach 6.3.0. `[project].mach` stays `^6`.
+RELEASES.json names the mach each mls links, so an installer that reads it
+still finds 2.0.0 for mach 6.2.0.
+
+### Changed
+- chore(#396): the linked mach moves from v6.2.0 to v6.3.0 and std from v7.4.1
+  (`^7.4`) to v9.0.0 (`^9.0`), the std mach 6.3.0 builds with. CI and the
+  release builds seed mach v6.3.0, and the README pin matches.
+- chore(#396): a diagnostic's `code` is its kind's dotted key, the key a
+  profile's `allow` and a declaration's `#[expect]` select it by (mach#4065).
+  The Unnecessary tag follows `import.unused` and the Deprecated tag
+  `decl.deprecated`.
+
 ## [2.0.0] - 2026-09-26
 
 mls links the mach 6.2.0 front end, shows the unused-import warnings mach 6.1
