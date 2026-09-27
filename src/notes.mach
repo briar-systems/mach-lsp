@@ -67,22 +67,23 @@ pub fun lsp_severity(sev: diag.Severity) i64 {
     ret LSP_HINT;
 }
 
-# the LSP tag a diagnostic kind carries, or 0 for none. an unused import is
-# code the editor may fade, a deprecated use is code it may strike through
+# the LSP tag a diagnostic kind carries, or 0 for none. an unused import
+# (`import.unused`) is code the editor may fade, a deprecated use
+# (`decl.deprecated`) is code it may strike through
 pub fun lsp_tag(k: dkind.Kind) i64 {
     if (k == dkind.UNUSED_IMPORT) { ret LSP_TAG_UNNECESSARY; }
     if (k == dkind.DEPRECATED)    { ret LSP_TAG_DEPRECATED; }
     ret 0;
 }
 
-# append `,"code":"<kind>"` and the kind's tags for a diagnostic of kind `k`,
-# nothing for a diagnostic that names no kind. the code is the name a profile's
-# `allow` list silences the kind by
+# append `,"code":"<key>"` and the kind's tags for a diagnostic of kind `k`,
+# nothing for a diagnostic that names no kind. the code is the dotted key a
+# profile's `allow` and a declaration's `#[expect]` select the kind by
 pub fun push_kind(b: *json.Buf, k: dkind.Kind) {
     val row: *dkind.Spec = dkind.spec(k);
     if (row == nil) { ret; }
     json.buf_push(b, ",\"code\":");
-    json.buf_push_quoted(b, row.name);
+    json.buf_push_quoted(b, row.key);
     val tag: i64 = lsp_tag(k);
     if (tag == 0) { ret; }
     json.buf_push(b, ",\"tags\":[");
@@ -194,13 +195,13 @@ test capture_keeps_only_the_diagnostics_with_no_file_in_order_with_their_kind {
     or (!str_equals(n.items[1].text, "refused"))  { fail = true; }
     if (!equal(?n, ?same))                        { fail = true; }
     if (equal(?n, ?none))                         { fail = true; }
-    # a kind rides as its name and tag, and a diagnostic with none adds nothing
+    # a kind rides as its key and tag, and a diagnostic with none adds nothing
     var b: json.Buf = json.buf_init(?pa);
     if (n.len == 2) {
         push_kind(?b, n.items[0].kind);
         push_kind(?b, n.items[1].kind);
     }
-    if (!str_equals(json.buf_str(?b), ",\"code\":\"deprecated\",\"tags\":[2]")) { fail = true; }
+    if (!str_equals(json.buf_str(?b), ",\"code\":\"decl.deprecated\",\"tags\":[2]")) { fail = true; }
     json.buf_dnit(?b);
     dnit(?pa, ?n);
     dnit(?pa, ?same);
