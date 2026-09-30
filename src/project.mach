@@ -1246,14 +1246,11 @@ fun empty_cli() request.CliArgs {
     var c: request.CliArgs;
     c.verbosity    = 0;
     c.quiet        = false;
-    c.target       = nil;
+    c.selectors    = manifest.selectors_init(nil);
     c.output       = nil;
     c.emit_asm     = false;
     c.emit_ir      = false;
-    c.profile      = nil;
-    c.bin          = nil;
-    c.lib          = nil;
-    c.all_targets  = false;
+    c.emit_ir_form = nil;
     c.pie          = false;
     c.subsystem    = nil;
     c.g            = false;
@@ -1261,6 +1258,7 @@ fun empty_cli() request.CliArgs {
     c.opt_release  = false;
     c.jobs         = nil;
     c.include_deps = false;
+    c.no_cache     = false;
     c.link_tokens  = vector.init[*u8](nil);
     c.lib_dirs     = vector.init[*u8](nil);
     ret c;
@@ -2728,8 +2726,8 @@ pub fun has_project(w: *Workspace, uri: str) bool {
 # warning - name the channel the detail actually went to instead
 fun fail_message(f: *outcome.Fail) str {
     if (sel f.internal)    { ret "internal compiler error while loading the project"; }
-    if (sel f.user)        { ret f.user; }
-    if (sel f.environment) { ret f.environment; }
+    if (sel f.user)        { ret f.user.text; }
+    if (sel f.environment) { ret f.environment.text; }
     ret "the project does not compile; see the diagnostics on its source files";
 }
 

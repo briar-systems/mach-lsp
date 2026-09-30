@@ -6,7 +6,6 @@ out = "out/{target.name}/{profile.name}"
 mach = "^6"
 
 [target.linux-x86_64]
-default = true
 isa = "x86_64"
 os  = "linux"
 abi = "sysv64"
@@ -65,4 +64,4 @@ version = "^9.0"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v6.3.0"
+ref = "branch/dev"

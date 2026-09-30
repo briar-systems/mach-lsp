@@ -71,8 +71,8 @@ pub fun lsp_severity(sev: diag.Severity) i64 {
 # (`import.unused`) is code the editor may fade, a deprecated use
 # (`decl.deprecated`) is code it may strike through
 pub fun lsp_tag(k: dkind.Kind) i64 {
-    if (k == dkind.UNUSED_IMPORT) { ret LSP_TAG_UNNECESSARY; }
-    if (k == dkind.DEPRECATED)    { ret LSP_TAG_DEPRECATED; }
+    if (k == dkind.IMPORT_UNUSED)   { ret LSP_TAG_UNNECESSARY; }
+    if (k == dkind.DECL_DEPRECATED) { ret LSP_TAG_DEPRECATED; }
     ret 0;
 }
 
@@ -181,25 +181,26 @@ test capture_keeps_only_the_diagnostics_with_no_file_in_order_with_their_kind {
     var span:  mach_token.Span;
     span.offset = 0;
     span.len    = 0;
-    diag.record_warning(?store, dkind.DEPRECATED, src.FILE_NIL, span, "no range");
-    diag.record_warning(?store, dkind.UNUSED_IMPORT, 3::src.FileId, span, "in a file");
-    diag.record_error(?store, src.FILE_NIL, span, "refused");
+    diag.record_warning(?store, dkind.DECL_DEPRECATED, src.FILE_NIL, span, "no range");
+    diag.record_warning(?store, dkind.IMPORT_UNUSED, 3::src.FileId, span, "in a file");
+    diag.record_error(?store, dkind.MANIFEST_INVALID_VALUE, src.FILE_NIL, span, "refused");
     var n:    Notes = capture(?pa, ?store);
     var same: Notes = capture(?pa, ?store);
     var none: Notes = empty();
     var fail: bool  = false;
-    if (n.len != 2)                               { fail = true; }
-    or (n.items[0].severity != LSP_WARNING)       { fail = true; }
-    or (!str_equals(n.items[0].text, "no range")) { fail = true; }
-    or (n.items[1].severity != LSP_ERROR)         { fail = true; }
-    or (!str_equals(n.items[1].text, "refused"))  { fail = true; }
-    if (!equal(?n, ?same))                        { fail = true; }
-    if (equal(?n, ?none))                         { fail = true; }
+    if (n.len != 2)                                      { fail = true; }
+    or (n.items[0].severity != LSP_WARNING)              { fail = true; }
+    or (!str_equals(n.items[0].text, "no range"))        { fail = true; }
+    or (n.items[1].severity != LSP_ERROR)                { fail = true; }
+    or (!str_equals(n.items[1].text, "refused"))         { fail = true; }
+    or (n.items[1].kind != dkind.MANIFEST_INVALID_VALUE) { fail = true; }
+    if (!equal(?n, ?same))                               { fail = true; }
+    if (equal(?n, ?none))                                { fail = true; }
     # a kind rides as its key and tag, and a diagnostic with none adds nothing
     var b: json.Buf = json.buf_init(?pa);
     if (n.len == 2) {
         push_kind(?b, n.items[0].kind);
-        push_kind(?b, n.items[1].kind);
+        push_kind(?b, dkind.NONE);
     }
     if (!str_equals(json.buf_str(?b), ",\"code\":\"decl.deprecated\",\"tags\":[2]")) { fail = true; }
     json.buf_dnit(?b);

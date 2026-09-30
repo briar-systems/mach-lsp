@@ -349,7 +349,7 @@ use std.allocator;
 # once and in push order, so the tests assert the sequence rather than a count
 
 #[testing]
-var SEEN: [64]u8;
+var SEEN:     [64]u8;
 #[testing]
 var SEEN_LEN: i64 = 0;
 #[testing]
