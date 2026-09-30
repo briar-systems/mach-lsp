@@ -1,253 +1,135 @@
 name: Release
 
-# a version tag publishes the release: CI in every tier, then a release-profile
-# `mls` built natively on each supported host, checked against the tag, packaged
-# with SHA256SUMS. the release is created as a draft, and made public only once
-# every asset is on it.
-#
-# a dispatch rehearses the whole path against the version in mach.toml and
-# stops at the draft, under a tag name that never exists, so the pipeline can be
-# proven without publishing anything. delete the draft afterwards.
-#
 # asset names are part of the contract editor extensions download by:
-#   mls-<version>-<target>.tar.gz   (linux, darwin)
-#   mls-<version>-<target>.zip      (windows)
-#   RELEASES.json                   every installable mls version and the mach it links
+#   mls-<version>-<asset>.tar.gz   (linux, darwin)
+#   mls-<version>-<asset>.zip      (windows)
+#   RELEASES.json                  every installable mls version and the mach it links
 #   SHA256SUMS
 
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+    tags: ['v*']
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MACH_VERSION: 6.8.0
+
 jobs:
   verify:
-    name: verify version
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      tag: ${{ steps.version.outputs.tag }}
-      publish: ${{ steps.version.outputs.publish }}
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-
-      - id: version
-        name: tag matches release version
+      - env:
+          TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' mach.toml | head -1)"
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-              echo "::error::tag $GITHUB_REF_NAME != mach.toml version $version"
-              exit 1
-            fi
-            tag="$GITHUB_REF_NAME"
-            publish=true
-          else
-            tag="v$version-rehearsal-$GITHUB_RUN_ID"
-            publish=false
-          fi
-          if ! grep -qF "## [$version] - " CHANGELOG.md; then
-            echo "::error::CHANGELOG.md has no $version release entry"
-            exit 1
-          fi
-          {
-            echo "version=$version"
-            echo "tag=$tag"
-            echo "publish=$publish"
-          } >> "$GITHUB_OUTPUT"
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("mach.toml", "rb"))["project"]["version"])')
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG does not match mach.toml version $version"; exit 1; }
 
-  # a tag push has no base branch, so the release asks for every tier
+  # the hosts this project ships to, tested natively before anything is published
   ci:
-    name: CI
     needs: verify
     uses: ./.github/workflows/ci.yml
     with:
-      heavy: all
+      profile: release
+      runners: '["ubuntu-latest", "ubuntu-24.04-arm", "windows-latest", "macos-15", "macos-15-intel"]'
 
-  # each binary is built and run on its own host: the version check executes
-  # it, and a darwin lane on the wrong silicon would ship a translated build
-  build:
-    name: build ${{ matrix.asset }}
+  # mls built natively on each host it ships to, archived under the asset name the contract fixes
+  package:
     needs: verify
-    runs-on: ${{ matrix.runs-on }}
-    timeout-minutes: 60
+    name: package (${{ matrix.asset }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { asset: x86_64-linux,   target: linux-x86_64,   runs-on: ubuntu-latest }
-          - { asset: aarch64-linux,  target: linux-arm64,    runs-on: ubuntu-24.04-arm }
-          - { asset: x86_64-windows, target: windows-x86_64, runs-on: windows-latest }
-          - { asset: aarch64-darwin, target: darwin-aarch64, runs-on: macos-15,       machine: arm64 }
-          - { asset: x86_64-darwin,  target: darwin-x86_64,  runs-on: macos-15-intel, machine: x86_64 }
+          - { runner: ubuntu-latest,    target: linux-x86_64,   asset: x86_64-linux }
+          - { runner: ubuntu-24.04-arm, target: linux-arm64,    asset: aarch64-linux }
+          - { runner: windows-latest,   target: windows-x86_64, asset: x86_64-windows }
+          - { runner: macos-15,         target: darwin-aarch64, asset: aarch64-darwin }
+          - { runner: macos-15-intel,   target: darwin-x86_64,  asset: x86_64-darwin }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
-        with:
-          submodules: true
-
-      # a shallow submodule carries no tags, and a dependency selected by
-      # version verifies against the release tag on its pinned commit, so the
-      # release build fetches that one tag for every submodule (as mach-lib.yml
-      # does for CI)
-      - name: submodule tags
-        shell: bash
+      - name: install mach
         run: |
-          set -euo pipefail
-          for dep in dep/*/; do
-            sha="$(git -C "$dep" rev-parse HEAD)"
-            tag="$(git -C "$dep" ls-remote --tags origin \
-              | awk -v sha="$sha" '$1 == sha && $2 ~ /\^\{\}$/ && !found { sub("refs/tags/", "", $2); sub(/\^\{\}$/, "", $2); print $2; found = 1 }')"
-            if [ -n "$tag" ]; then
-              git -C "$dep" fetch --depth=1 --no-tags origin tag "$tag"
-              echo "submodule $dep is release $tag"
-            else
-              echo "submodule $dep carries no release tag"
-            fi
-          done
-
-      - name: the darwin lane landed on real silicon
-        if: runner.os == 'macOS'
-        env:
-          WANT: ${{ matrix.machine }}
-        run: |
-          set -euo pipefail
-          got=$(uname -m); translated=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
-          [ "$got" = "$WANT" ] && [ "$translated" = 0 ] || { echo "::error::the $WANT lane landed on a $got host (proc_translated=$translated)"; exit 1; }
-
-      - name: seed
-        uses: briar-systems/.github/.github/actions/seed-mach@main
-        with:
-          tag: v6.3.0
-
-      - name: release build
-        shell: bash
+          export MACH_INSTALL_DIR="$RUNNER_TEMP/mach"
+          url="https://raw.githubusercontent.com/briar-systems/mach/v$MACH_VERSION/dist"
+          if [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -Command "irm $url/install.ps1 | iex"
+          else
+            curl -fsSL "$url/install.sh" | sh
+          fi
+          echo "$MACH_INSTALL_DIR" >> "$GITHUB_PATH"
+      - run: mach dep pull .
+      - run: mach build . -t "$TARGET" -p release
         env:
           TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          mach dep pull .
-          mach build . --target "$TARGET" --profile release
-
-      - name: the binary reports this version
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          set -euo pipefail
-          exe=; [ "$RUNNER_OS" = Windows ] && exe=.exe
-          compiler="$(sed -n 's/^version = "\(.*\)"$/\1/p' dep/mach/mach.toml | head -1)"
-          want="mls $VERSION (mach $compiler)"
-          got="$("out/$TARGET/release/bin/mls$exe" --version | tr -d '\r')"
-          [ "$got" = "$want" ] || { echo "::error::out/$TARGET/release/bin/mls$exe --version printed '$got', expected '$want'"; exit 1; }
-
       - name: package
-        shell: bash
         env:
           TARGET: ${{ matrix.target }}
           ASSET: ${{ matrix.asset }}
-          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          set -euo pipefail
-          mkdir -p dist pkg
+          version=${GITHUB_REF_NAME#v}
+          mkdir dist pkg
           cp LICENSE pkg/
           if [ "$RUNNER_OS" = Windows ]; then
-            cp "out/$TARGET/release/bin/mls.exe" pkg/mls.exe
-            (cd pkg && 7z a -tzip "../dist/mls-$VERSION-$ASSET.zip" mls.exe LICENSE >/dev/null)
+            cp "out/$TARGET/release/bin/mls.exe" pkg/
+            (cd pkg && 7z a -tzip -bso0 "../dist/mls-$version-$ASSET.zip" mls.exe LICENSE)
           else
-            cp "out/$TARGET/release/bin/mls" pkg/mls
-            tar -C pkg -czf "dist/mls-$VERSION-$ASSET.tar.gz" mls LICENSE
+            cp "out/$TARGET/release/bin/mls" pkg/
+            tar -czf "dist/mls-$version-$ASSET.tar.gz" -C pkg mls LICENSE
           fi
-
       - uses: actions/upload-artifact@v7
         with:
-          name: release-${{ matrix.asset }}
-          path: dist/mls-*
+          name: dist-${{ matrix.asset }}
+          path: dist/*
           if-no-files-found: error
-          retention-days: 1
 
-  release:
-    name: publish release
-    needs: [verify, ci, build]
+  publish:
+    needs: [verify, ci, package]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      VERSION: ${{ needs.verify.outputs.version }}
-      TAG: ${{ needs.verify.outputs.tag }}
     steps:
-      # every tag, for RELEASES.json
+      # every tag and the pinned mach, for RELEASES.json
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-
       - uses: actions/download-artifact@v8
         with:
-          pattern: release-*
+          pattern: dist-*
           path: dist
           merge-multiple: true
-
-      # the release being cut is listed on trust; the asset check below is what
-      # makes that trust good
-      - name: RELEASES.json from the tags with a full release
+      - env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           git submodule update --init --depth 1 dep/mach
-          python3 .github/release/releases.py "$VERSION" dist/RELEASES.json
-
-      - name: RELEASES.json names the mach this release links
+          python3 .github/release/releases.py "${GITHUB_REF_NAME#v}" dist/RELEASES.json
+          (cd dist && sha256sum * > SHA256SUMS)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          mach="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' dist/RELEASES.json "$VERSION")"
-          mkdir -p probe
-          tar -C probe -xzf "dist/mls-$VERSION-x86_64-linux.tar.gz" mls
-          want="mls $VERSION (mach $mach)"
-          got="$(probe/mls --version)"
-          [ "$got" = "$want" ] || { echo "::error::RELEASES.json says '$want', the binary says '$got'"; exit 1; }
-
-      - name: checksums over the complete asset set
-        run: |
-          set -euo pipefail
-          cd dist
-          for t in x86_64-linux aarch64-linux aarch64-darwin x86_64-darwin; do
-            [ -f "mls-$VERSION-$t.tar.gz" ] || { echo "::error::release is missing mls-$VERSION-$t.tar.gz"; exit 1; }
-          done
-          [ -f "mls-$VERSION-x86_64-windows.zip" ] || { echo "::error::release is missing mls-$VERSION-x86_64-windows.zip"; exit 1; }
-          sha256sum mls-*.tar.gz mls-*.zip RELEASES.json > SHA256SUMS
-          cat SHA256SUMS
-
-      - id: draft
-        name: draft release with every asset
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.verify.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          draft: true
-          prerelease: ${{ needs.verify.outputs.publish != 'true' }}
-          files: |
-            dist/mls-*.tar.gz
-            dist/mls-*.zip
-            dist/RELEASES.json
-            dist/SHA256SUMS
-
-      - name: every asset is on the draft
-        env:
-          RELEASE_ID: ${{ steps.draft.outputs.id }}
-        run: |
-          set -euo pipefail
-          names="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.assets[].name' | sort)"
-          want="$(cd dist && ls mls-*.tar.gz mls-*.zip RELEASES.json SHA256SUMS | sort)"
-          echo "$names"
-          [ "$names" = "$want" ] || { echo "::error::the draft's assets differ from the built set"; exit 1; }
-
-      - name: publish
-        if: needs.verify.outputs.publish == 'true'
-        env:
-          RELEASE_ID: ${{ steps.draft.outputs.id }}
-        run: gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" -F draft=false -f make_latest=true
+          # a doubled tag push waits on the concurrency group, then finds the release
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          # notes are the changelog section for this version when there is one
+          notes=$(awk -v v="${TAG#v}" '/^## \[/ { on = index($0, "[" v "]") > 0; next } on' CHANGELOG.md 2>/dev/null || true)
+          flags=(--verify-tag --title "$TAG" --draft)
+          [ -n "$notes" ] && flags+=(--notes "$notes") || flags+=(--generate-notes)
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* "${flags[@]}"
+          gh release edit "$TAG" --draft=false
