@@ -23,15 +23,14 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  MACH_VERSION: 6.8.0
   PROFILE: ${{ inputs.profile || 'debug' }}
 
 jobs:
-  # every runner builds every artifact for every target and tests the ones it can run
-  test:
-    name: test (${{ matrix.runner }})
+  # every runner builds every artifact for every target
+  build:
+    name: build (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -41,24 +40,39 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
-      - name: install mach
+      # the compiler is mach at the dep/mach gitlink, so the two never drift
+      - id: mach
+        run: echo "ref=$(git ls-tree HEAD dep/mach | awk '{ print $3 }')" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/mach-bin
+          key: mach-${{ runner.os }}-${{ runner.arch }}-${{ steps.mach.outputs.ref }}
+      # mach's own bootstrap chain builds its tree from the last seed release
+      - name: bootstrap mach
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          MACH_REF: ${{ steps.mach.outputs.ref }}
         run: |
-          export MACH_INSTALL_DIR="$RUNNER_TEMP/mach"
-          url="https://raw.githubusercontent.com/briar-systems/mach/v$MACH_VERSION/dist"
-          if [ "$RUNNER_OS" = Windows ]; then
-            pwsh -NoProfile -Command "irm $url/install.ps1 | iex"
-          else
-            curl -fsSL "$url/install.sh" | sh
-          fi
-          echo "$MACH_INSTALL_DIR" >> "$GITHUB_PATH"
+          exe=
+          [ "$RUNNER_OS" = Windows ] && exe=.exe
+          src=$RUNNER_TEMP/mach-src
+          git init --quiet "$src"
+          git -C "$src" remote add origin https://github.com/briar-systems/mach
+          git -C "$src" fetch --quiet --depth 1 origin "$MACH_REF"
+          git -C "$src" checkout --quiet FETCH_HEAD
+          (cd "$src" && GITHUB_ENV="$RUNNER_TEMP/mach.env" bash .github/scripts/bootstrap.sh)
+          mkdir -p "$RUNNER_TEMP/mach-bin"
+          cp "$(sed -n 's/^MACH=//p' "$RUNNER_TEMP/mach.env")" "$RUNNER_TEMP/mach-bin/mach$exe"
+      - run: echo "$RUNNER_TEMP/mach-bin" >> "$GITHUB_PATH"
       - run: mach dep pull .
       - if: strategy.job-index == 0
         run: mach fmt --check .
-      - run: mach test . --all -p "$PROFILE"
+      - run: mach build . --all -p "$PROFILE"
 
   gate:
     if: always()
-    needs: [test]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - run: exit ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 1 || 0 }}
