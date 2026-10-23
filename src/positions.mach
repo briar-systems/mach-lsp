@@ -4,7 +4,7 @@
 # it by byte offset (and reports 1-based line/col via `source.position`). the
 # language features pivot on byte offset - `ast.offset_to_*` takes an offset
 # and the resolve side tables index by node id - so every request first maps
-# the incoming LSP position to an offset, and every response maps a `token.Span`
+# the incoming LSP position to an offset, and every response maps a `src.Span`
 # back to an LSP range. these helpers are the single conversion point.
 #
 # the compiler core is byte-oriented (parser spans, `source.position`), so the
@@ -35,7 +35,6 @@ use std.allocator.allocate;
 
 use mem: std.memory;
 
-use mach.lang.fe.token;
 use src: mach.lang.source;
 
 use mls.textdiff;
@@ -198,25 +197,25 @@ fun shift_before(t: Text, i: usize) i64 {
 # span:      a span of `t.file`
 # enclosing: whether a span around whole windows may be carried
 # ret:       the same bytes' span in the client's buffer, or none
-pub fun live_span(t: Text, span: token.Span, enclosing: bool) opt[token.Span] {
-    if (t.live == nil) { ret opt[token.Span].some{span}; }
-    if (t.blind)       { ret opt[token.Span].none{}; }
+pub fun live_span(t: Text, span: src.Span, enclosing: bool) opt[src.Span] {
+    if (t.live == nil) { ret opt[src.Span].some{span}; }
+    if (t.blind)       { ret opt[src.Span].none{}; }
     val a:   usize = span.offset;
     val b:   usize = span.offset + span.len;
     val i:   usize = first_after_old(t, a);
-    var out: token.Span;
+    var out: src.Span;
     out.offset = (a::i64 + shift_before(t, i))::usize;
     out.len    = span.len;
-    if (i == t.win_count || b <= t.wins[i].old_start) { ret opt[token.Span].some{out}; }
+    if (i == t.win_count || b <= t.wins[i].old_start) { ret opt[src.Span].some{out}; }
 
     # the span reaches window `i`: it maps only by enclosing whole windows
-    if (!enclosing || a >= t.wins[i].old_start) { ret opt[token.Span].none{}; }
+    if (!enclosing || a >= t.wins[i].old_start) { ret opt[src.Span].none{}; }
     var j: usize = i;
     for (j + 1 < t.win_count && t.wins[j + 1].old_start < b) { j = j + 1; }
-    if (b < t.wins[j].old_end) { ret opt[token.Span].none{}; }
+    if (b < t.wins[j].old_end) { ret opt[src.Span].none{}; }
     val end: usize = (b::i64 + shift_before(t, j + 1))::usize;
     out.len = end - out.offset;
-    ret opt[token.Span].some{out};
+    ret opt[src.Span].some{out};
 }
 
 # whether `span` can be reported to the client
@@ -224,15 +223,15 @@ pub fun live_span(t: Text, span: token.Span, enclosing: bool) opt[token.Span] {
 # A span that encloses the window is refused: a name, a reference, a highlight
 # is a claim about exactly those bytes, and a change inside them changed what it
 # names. A declaration's full range is not such a claim; see `maps_around`.
-pub fun maps(t: Text, span: token.Span) bool {
-    val o: opt[token.Span] = live_span(t, span, false);
+pub fun maps(t: Text, span: src.Span) bool {
+    val o: opt[src.Span] = live_span(t, span, false);
     ret sel o.some;
 }
 
 # as `maps`, for a range that merely surrounds what it describes - a
 # declaration around an edit to its body is still that declaration
-pub fun maps_around(t: Text, span: token.Span) bool {
-    val o: opt[token.Span] = live_span(t, span, true);
+pub fun maps_around(t: Text, span: src.Span) bool {
+    val o: opt[src.Span] = live_span(t, span, true);
     ret sel o.some;
 }
 
@@ -253,19 +252,19 @@ fun analyzed_offset(t: Text, q: usize) opt[usize] {
 # t:    the pairing
 # span: a non-empty span of `client_file(t)`
 # ret:  the same bytes' span in `t.file`, or none
-pub fun analyzed_span(t: Text, span: token.Span) opt[token.Span] {
-    if (span.len == 0) { ret opt[token.Span].none{}; }
+pub fun analyzed_span(t: Text, span: src.Span) opt[src.Span] {
+    if (span.len == 0) { ret opt[src.Span].none{}; }
     val ao: opt[usize] = analyzed_offset(t, span.offset);
-    if (sel ao.none) { ret opt[token.Span].none{}; }
+    if (sel ao.none) { ret opt[src.Span].none{}; }
     val bo: opt[usize] = analyzed_offset(t, span.offset + span.len - 1);
-    if (sel bo.none) { ret opt[token.Span].none{}; }
+    if (sel bo.none) { ret opt[src.Span].none{}; }
     val a: usize = ao.some;
     val b: usize = bo.some;
-    if (b < a) { ret opt[token.Span].none{}; }
-    var out: token.Span;
+    if (b < a) { ret opt[src.Span].none{}; }
+    var out: src.Span;
     out.offset = a;
     out.len    = b - a + 1;
-    ret opt[token.Span].some{out};
+    ret opt[src.Span].some{out};
 }
 
 # the analysis offset the client's offset `q` stands at, widened to the start
@@ -344,7 +343,7 @@ fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
     val ls_off: usize = ls.some;
 
     var le_off: usize = client_len(t);
-    if (line + 1 < file.line_len) { le_off = file.line_starts[line + 1]; }
+    if (line + 1 < file.lines.len) { le_off = file.lines.starts[line + 1]; }
 
     ret opt[usize].some{byte_of_col(file, ls_off, le_off, ch)};
 }
@@ -355,17 +354,17 @@ fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
 # t:    the pairing the span indexes
 # span: a span of `t.file`
 # ret:  the 0-based range in the client's buffer, or none
-pub fun span_range(t: Text, span: token.Span) opt[LspRange] {
+pub fun span_range(t: Text, span: src.Span) opt[LspRange] {
     if (t.file == nil) { ret opt[LspRange].none{}; }
-    val lo: opt[token.Span] = live_span(t, span, false);
+    val lo: opt[src.Span] = live_span(t, span, false);
     if (sel lo.none) { ret opt[LspRange].none{}; }
     ret opt[LspRange].some{range_of(client_file(t), lo.some)};
 }
 
 # as `span_range`, carrying a range that surrounds the window; see `maps_around`
-pub fun span_range_around(t: Text, span: token.Span) opt[LspRange] {
+pub fun span_range_around(t: Text, span: src.Span) opt[LspRange] {
     if (t.file == nil) { ret opt[LspRange].none{}; }
-    val lo: opt[token.Span] = live_span(t, span, true);
+    val lo: opt[src.Span] = live_span(t, span, true);
     if (sel lo.none) { ret opt[LspRange].none{}; }
     ret opt[LspRange].some{range_of(client_file(t), lo.some)};
 }
@@ -377,7 +376,7 @@ pub fun span_range_around(t: Text, span: token.Span) opt[LspRange] {
 # file: the source file the span addresses
 # span: the byte range to convert
 # ret:  the equivalent 0-based LSP range
-pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
+pub fun range_of(file: *src.SourceFile, span: src.Span) LspRange {
     var r:  LspRange;
     val sp: src.Position = src.position(file, span.offset);
     r.start_line = dec(sp.line);
@@ -398,7 +397,7 @@ pub fun range_of(file: *src.SourceFile, span: token.Span) LspRange {
 # span: the byte range to compare
 # name: the text to compare against
 # ret:  true when the span is in bounds and spells `name` exactly
-pub fun span_equals(t: Text, span: token.Span, name: str) bool {
+pub fun span_equals(t: Text, span: src.Span, name: str) bool {
     if (name == nil || t.file == nil)                           { ret false; }
     if (span.offset >= t.len || span.offset + span.len > t.len) { ret false; }
     if (span.len != str_len(name))                              { ret false; }
@@ -418,7 +417,7 @@ pub fun span_equals(t: Text, span: token.Span, name: str) bool {
 # span:  the byte range to copy
 # alloc: allocator backing the returned string
 # ret:   owned copy of the span text, or nil
-pub fun span_text(t: Text, span: token.Span, alloc: *Allocator) str {
+pub fun span_text(t: Text, span: src.Span, alloc: *Allocator) str {
     if (span.len == 0 || t.file == nil) { ret nil; }
     if (span.offset >= t.len)           { ret nil; }
     var len: usize = span.len;
@@ -440,7 +439,7 @@ pub fun span_text(t: Text, span: token.Span, alloc: *Allocator) str {
 # offset: byte offset whose column is measured
 # ret:    0-based column in the negotiated encoding
 fun col_of(file: *src.SourceFile, line: usize, offset: usize) usize {
-    var o:     usize = file.line_starts[line - 1];
+    var o:     usize = file.lines.starts[line - 1];
     var units: usize = 0;
     for (o < offset) {
         val b: u8 = file.text[o];
@@ -801,13 +800,13 @@ fun win_is(t: Text, i: usize, os: usize, oe: usize, ns: usize, ne: usize) bool {
 }
 
 #[testing]
-fun span_is(o: opt[token.Span], offset: usize, len: usize) bool {
+fun span_is(o: opt[src.Span], offset: usize, len: usize) bool {
     if (sel o.some) { ret o.some.offset == offset && o.some.len == len; }
     ret false;
 }
 
 #[testing]
-fun span_present(o: opt[token.Span]) bool {
+fun span_present(o: opt[src.Span]) bool {
     ret sel o.some;
 }
 
@@ -815,18 +814,17 @@ fun span_present(o: opt[token.Span]) bool {
 #[testing]
 fun t_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     var f: src.SourceFile;
-    f.present     = true;
-    f.revision    = 0;
-    f.path        = "t.mach";
-    f.text        = text;
-    f.line_starts = starts;
-    f.line_len    = nlines;
+    f.present  = true;
+    f.revision = 0;
+    f.path     = "t.mach";
+    f.text     = text;
+    f.lines    = src.Lines{starts: starts, len: nlines, n: str_len(text)};
     ret f;
 }
 
 #[testing]
-fun t_span(offset: usize, len: usize) token.Span {
-    var s: token.Span;
+fun t_span(offset: usize, len: usize) src.Span {
+    var s: src.Span;
     s.offset = offset;
     s.len    = len;
     ret s;

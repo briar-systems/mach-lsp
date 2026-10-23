@@ -42,10 +42,10 @@ use atype: mach.lang.fe.ast.type;
 use fedoc: mach.lang.fe.doc;
 use rslv:  mach.lang.fe.resolve;
 use mach.lang.fe.sema;
-use mach.lang.fe.token;
 use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use lmodule: mach.lang.module;
+use sess:    mach.lang.session;
+use src:     mach.lang.source;
 use mach.lang.type;
 
 use mtypes: mls.types;
@@ -62,7 +62,7 @@ use std.allocator;
 #            this module), false for a cross-module `use`d / imported symbol
 pub rec SymbolRef {
     sym_id:    rslv.SymbolId;
-    name_span: token.Span;
+    name_span: src.Span;
     local:     bool;
 }
 
@@ -75,11 +75,11 @@ pub rec SymbolRef {
 # own:    this buffer's module id (Symbol.origin equals it for local symbols)
 # offset: byte offset into the buffer
 # ret:    some(SymbolRef) for a resolved position, or none
-pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
+pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
     val eid: id.ExprId = ast.offset_to_expr(a, offset);
-    if (eid != id.EXPR_NIL && rr.expr_resolved != nil && eid::u32 < rr.expr_count) {
-        val sid: rslv.SymbolId = rr.expr_resolved[eid];
-        if (sid != rslv.SYMBOL_NIL && sid < rr.symbol_count) {
+    if (!id.expr_is_nil(eid) && rr.expr_resolved != nil && id.expr_index(eid) < rr.expr_count) {
+        val sid: rslv.SymbolId = rr.expr_resolved[id.expr_index(eid)];
+        if (!rslv.symbol_is_nil(sid) && rslv.symbol_index(sid) < rr.symbol_count) {
             val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
             if (sel eo.some) {
                 ret opt[SymbolRef].some{make_ref(rr, own, sid, name_span_of_expr(eo.some))};
@@ -88,10 +88,10 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, file: *
     }
 
     val tid: id.TypeId = ast.offset_to_type(a, offset);
-    if (tid != id.TYPE_NIL && rr.type_resolved != nil && tid::u32 < rr.type_count) {
-        val sid: rslv.SymbolId = rr.type_resolved[tid];
-        if (sid != rslv.SYMBOL_NIL && sid < rr.symbol_count) {
-            val tno: opt[token.Span] = type_name_span(a, tid);
+    if (!id.type_is_nil(tid) && rr.type_resolved != nil && id.type_index(tid) < rr.type_count) {
+        val sid: rslv.SymbolId = rr.type_resolved[id.type_index(tid)];
+        if (!rslv.symbol_is_nil(sid) && rslv.symbol_index(sid) < rr.symbol_count) {
+            val tno: opt[src.Span] = type_name_span(a, tid);
             if (sel tno.some) {
                 ret opt[SymbolRef].some{make_ref(rr, own, sid, tno.some)};
             }
@@ -102,15 +102,15 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, file: *
     # is not an expr or type node - resolve it through the decl_symbol table
     # when the offset falls inside the decl's name span
     val did: id.DeclId = ast.offset_to_decl(a, offset);
-    if (did != id.DECL_NIL) {
-        if (rr.decl_symbol != nil && did::u32 < rr.decl_count) {
-            val sid: rslv.SymbolId = rr.decl_symbol[did];
-            if (sid != rslv.SYMBOL_NIL && sid < rr.symbol_count) {
+    if (!id.decl_is_nil(did)) {
+        if (rr.decl_symbol != nil && id.decl_index(did) < rr.decl_count) {
+            val sid: rslv.SymbolId = rr.decl_symbol[id.decl_index(did)];
+            if (!rslv.symbol_is_nil(sid) && rslv.symbol_index(sid) < rr.symbol_count) {
                 val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
                 if (sel d_opt.some) {
-                    val nso: opt[token.Span] = decl_name_span(d_opt.some);
+                    val nso: opt[src.Span] = decl_name_span(d_opt.some);
                     if (sel nso.some) {
-                        val nspan: token.Span = nso.some;
+                        val nspan: src.Span = nso.some;
                         if (ast.span_contains(nspan, offset)) {
                             ret opt[SymbolRef].some{make_ref(rr, own, sid, nspan)};
                         }
@@ -151,18 +151,18 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, file: *
 # file:   source file backing the import path, to locate the leaf
 # offset: cursor byte offset
 # ret:    some(ref) when the cursor is on an import path or alias, else none
-fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, did: id.DeclId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
-    if (file == nil)                                        { ret opt[SymbolRef].none{}; }
-    if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret opt[SymbolRef].none{}; }
-    val sid: rslv.SymbolId = rr.decl_symbol[did];
-    if (sid == rslv.SYMBOL_NIL || sid >= rr.symbol_count) { ret opt[SymbolRef].none{}; }
+fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, did: id.DeclId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
+    if (file == nil)                                                  { ret opt[SymbolRef].none{}; }
+    if (rr.decl_symbol == nil || id.decl_index(did) >= rr.decl_count) { ret opt[SymbolRef].none{}; }
+    val sid: rslv.SymbolId = rr.decl_symbol[id.decl_index(did)];
+    if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= rr.symbol_count) { ret opt[SymbolRef].none{}; }
 
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) { ret opt[SymbolRef].none{}; }
     val d: *decl.Decl = d_opt.some;
 
-    var path:  token.Span;
-    var alias: token.Span;
+    var path:  src.Span;
+    var alias: src.Span;
     if (d.kind == decl.DECL_KIND_USE) {
         path  = d.data.use_.path;
         alias = d.data.use_.alias;
@@ -184,7 +184,7 @@ fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId,
 # parameter or generic binding name within decl `did`, or none. params and
 # generics carry no Decl node - their symbol is found by matching (decl, slot)
 # in the symbol table
-fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId, did: id.DeclId, offset: usize) opt[SymbolRef] {
+fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, did: id.DeclId, offset: usize) opt[SymbolRef] {
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) { ret opt[SymbolRef].none{}; }
     val d: *decl.Decl = d_opt.some;
@@ -193,10 +193,10 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId
     val glen:   u32 = generics_len_of(d);
     var gi:     u32 = 0;
     for (gi < glen) {
-        val gname: token.Span = a.generic_names[gstart + gi];
+        val gname: src.Span = a.generic_names.data[gstart + gi];
         if (ast.span_contains(gname, offset)) {
             val sid: rslv.SymbolId = find_binding_symbol(rr, rslv.SYM_GENERIC, did, gi);
-            if (sid != rslv.SYMBOL_NIL) { ret opt[SymbolRef].some{make_ref(rr, own, sid, gname)}; }
+            if (!rslv.symbol_is_nil(sid)) { ret opt[SymbolRef].some{make_ref(rr, own, sid, gname)}; }
         }
         gi = gi + 1;
     }
@@ -205,10 +205,10 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.ModuleId
     if (d.kind == decl.DECL_KIND_FUN) {
         var pi: u32 = 0;
         for (pi < d.data.fun_.params_len) {
-            val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
+            val tn: *decl.TypedName = ?a.typed_names.data[d.data.fun_.params_start + pi];
             if (ast.span_contains(tn.name, offset)) {
                 val sid: rslv.SymbolId = find_binding_symbol(rr, rslv.SYM_PARAM, did, pi);
-                if (sid != rslv.SYMBOL_NIL) { ret opt[SymbolRef].some{make_ref(rr, own, sid, tn.name)}; }
+                if (!rslv.symbol_is_nil(sid)) { ret opt[SymbolRef].some{make_ref(rr, own, sid, tn.name)}; }
             }
             pi = pi + 1;
         }
@@ -228,7 +228,7 @@ pub fun param_type_at(a: *ast.Ast, did: id.DeclId, offset: usize) id.TypeId {
 
     var pi: u32 = 0;
     for (pi < d.data.fun_.params_len) {
-        val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + pi];
+        val tn: *decl.TypedName = ?a.typed_names.data[d.data.fun_.params_start + pi];
         if (ast.span_contains(tn.name, offset)) { ret tn.ty; }
         pi = pi + 1;
     }
@@ -257,7 +257,7 @@ fun find_binding_symbol(rr: *rslv.ResolveResult, kind: rslv.SymKind, did: id.Dec
     var i: u32 = 0;
     for (i < rr.symbol_count) {
         val sym: *rslv.Symbol = ?rr.symbols[i];
-        if (sym.kind == kind && sym.decl == did && sym.slot == slot) { ret i::rslv.SymbolId; }
+        if (sym.kind == kind && id.decl_same(sym.decl, did) && sym.slot == slot) { ret rslv.symbol_id(i); }
         i = i + 1;
     }
     ret rslv.SYMBOL_NIL;
@@ -272,24 +272,24 @@ fun find_binding_symbol(rr: *rslv.ResolveResult, kind: rslv.SymKind, did: id.Dec
 # a:   the Ast holding the declaration
 # sym: the param / generic symbol whose binding span is wanted
 # ret: some(name span) of the binding, or none
-pub fun binding_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
-    if (sym.kind != rslv.SYM_PARAM && sym.kind != rslv.SYM_GENERIC) { ret opt[token.Span].none{}; }
-    if (sym.decl == id.DECL_NIL)                                    { ret opt[token.Span].none{}; }
+pub fun binding_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
+    if (sym.kind != rslv.SYM_PARAM && sym.kind != rslv.SYM_GENERIC) { ret opt[src.Span].none{}; }
+    if (id.decl_is_nil(sym.decl))                                   { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
 
     if (sym.kind == rslv.SYM_GENERIC) {
-        if (sym.slot >= generics_len_of(d)) { ret opt[token.Span].none{}; }
-        ret opt[token.Span].some{a.generic_names[generics_start_of(d) + sym.slot]};
+        if (sym.slot >= generics_len_of(d)) { ret opt[src.Span].none{}; }
+        ret opt[src.Span].some{a.generic_names.data[generics_start_of(d) + sym.slot]};
     }
-    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret opt[token.Span].none{}; }
-    ret opt[token.Span].some{(?a.typed_names[d.data.fun_.params_start + sym.slot]).name};
+    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{(?a.typed_names.data[d.data.fun_.params_start + sym.slot]).name};
 }
 
 # build a SymbolRef, flagging whether the symbol is local to this
 # buffer's module
-fun make_ref(rr: *rslv.ResolveResult, own: sess.ModuleId, sid: rslv.SymbolId, name_span: token.Span) SymbolRef {
+fun make_ref(rr: *rslv.ResolveResult, own: sess.StableModuleId, sid: rslv.SymbolId, name_span: src.Span) SymbolRef {
     var sr: SymbolRef;
     sr.sym_id    = sid;
     sr.name_span = name_span;
@@ -300,12 +300,12 @@ fun make_ref(rr: *rslv.ResolveResult, own: sess.ModuleId, sid: rslv.SymbolId, na
 # whether `sid`'s decl is owned by `own` (this buffer's
 # module) and so addressable in this Ast. primitives and imported / used
 # symbols originate elsewhere
-pub fun symbol_is_local(rr: *rslv.ResolveResult, own: sess.ModuleId, sid: rslv.SymbolId) bool {
-    if (sid >= rr.symbol_count) { ret false; }
-    val sym: *rslv.Symbol = ?rr.symbols[sid];
+pub fun symbol_is_local(rr: *rslv.ResolveResult, own: sess.StableModuleId, sid: rslv.SymbolId) bool {
+    if (rslv.symbol_index(sid) >= rr.symbol_count) { ret false; }
+    val sym: *rslv.Symbol = ?rr.symbols[rslv.symbol_index(sid)];
     if (sym.kind == rslv.SYM_PRIM) { ret false; }
-    if (sym.decl == id.DECL_NIL)   { ret false; }
-    ret sym.origin == own;
+    if (id.decl_is_nil(sym.decl))  { ret false; }
+    ret lmodule.stable_same(sym.origin, own);
 }
 
 # the SymbolId in `rr` whose declaration is the module-scoped
@@ -321,13 +321,13 @@ pub fun symbol_is_local(rr: *rslv.ResolveResult, own: sess.ModuleId, sid: rslv.S
 # origin: ModuleId owning the declaration
 # decl:   DeclId of the declaration in `origin`'s Ast
 # ret:    the local SymbolId, or SYMBOL_NIL
-pub fun symbol_by_decl(rr: *rslv.ResolveResult, origin: sess.ModuleId, decl: id.DeclId) rslv.SymbolId {
-    if (decl == id.DECL_NIL) { ret rslv.SYMBOL_NIL; }
+pub fun symbol_by_decl(rr: *rslv.ResolveResult, origin: sess.StableModuleId, decl: id.DeclId) rslv.SymbolId {
+    if (id.decl_is_nil(decl)) { ret rslv.SYMBOL_NIL; }
     var i: u32 = 0;
     for (i < rr.symbol_count) {
         val sym: *rslv.Symbol = ?rr.symbols[i];
         if (sym.kind != rslv.SYM_PARAM && sym.kind != rslv.SYM_GENERIC
-            && sym.decl == decl && sym.origin == origin) { ret i::rslv.SymbolId; }
+            && id.decl_same(sym.decl, decl) && lmodule.stable_same(sym.origin, origin)) { ret rslv.symbol_id(i); }
         i = i + 1;
     }
     ret rslv.SYMBOL_NIL;
@@ -365,15 +365,15 @@ pub fun definition_kind_of(sym: *rslv.Symbol) rslv.SymKind {
 # canon:  the target's interned canonical name
 # kind:   the kind the target was declared as
 # ret:    true when `sid` names that declaration
-pub fun symbol_denotes(rr: *rslv.ResolveResult, sid: rslv.SymbolId, origin: sess.ModuleId,
+pub fun symbol_denotes(rr: *rslv.ResolveResult, sid: rslv.SymbolId, origin: sess.StableModuleId,
     decl: id.DeclId, canon: intern.StrId, kind: rslv.SymKind) bool {
-    if (sid == rslv.SYMBOL_NIL || sid >= rr.symbol_count) { ret false; }
-    val sym: *rslv.Symbol = ?rr.symbols[sid];
-    if (sym.origin != origin)                                       { ret false; }
+    if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= rr.symbol_count) { ret false; }
+    val sym: *rslv.Symbol = ?rr.symbols[rslv.symbol_index(sid)];
+    if (!lmodule.stable_same(sym.origin, origin))                   { ret false; }
     if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) { ret false; }
-    if (sym.decl != id.DECL_NIL)                                    { ret sym.decl == decl; }
-    if (canon == intern.STR_NIL)                                    { ret false; }
-    ret sym.canon == canon && definition_kind_of(sym) == kind;
+    if (!id.decl_is_nil(sym.decl))                                  { ret id.decl_same(sym.decl, decl); }
+    if (intern.str_is_nil(canon))                                   { ret false; }
+    ret intern.str_same(sym.canon, canon) && definition_kind_of(sym) == kind;
 }
 
 # the number of declarations at the buffer's module scope -
@@ -400,7 +400,7 @@ pub fun top_level_decl(a: *ast.Ast, i: u32) id.DeclId {
     if (sel mo.none) { ret id.DECL_NIL; }
     val m: *module.Module = mo.some;
     if (i >= m.decls_len) { ret id.DECL_NIL; }
-    ret a.decl_ids[m.decls_start + i];
+    ret a.decl_ids.data[m.decls_start + i];
 }
 
 # the Symbol for a SymbolId, or none when out of range
@@ -409,8 +409,8 @@ pub fun top_level_decl(a: *ast.Ast, i: u32) id.DeclId {
 # sid: symbol id to look up
 # ret: some(*Symbol) into rr.symbols, or none
 pub fun symbol(rr: *rslv.ResolveResult, sid: rslv.SymbolId) opt[*rslv.Symbol] {
-    if (sid >= rr.symbol_count) { ret opt[*rslv.Symbol].none{}; }
-    ret opt[*rslv.Symbol].some{?rr.symbols[sid]};
+    if (rslv.symbol_index(sid) >= rr.symbol_count) { ret opt[*rslv.Symbol].none{}; }
+    ret opt[*rslv.Symbol].some{?rr.symbols[rslv.symbol_index(sid)]};
 }
 
 # the full declaration span of a local symbol's decl, or none
@@ -419,11 +419,11 @@ pub fun symbol(rr: *rslv.ResolveResult, sid: rslv.SymbolId) opt[*rslv.Symbol] {
 # a:   the Ast owning the decl
 # sym: the symbol whose decl span is wanted
 # ret: some(span) of the decl, or none
-pub fun decl_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
-    if (sym.decl == id.DECL_NIL) { ret opt[token.Span].none{}; }
+pub fun decl_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
+    if (id.decl_is_nil(sym.decl)) { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
-    ret opt[token.Span].some{d_opt.some.span};
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{d_opt.some.span};
 }
 
 # the span of a local symbol's declared name identifier (the
@@ -434,10 +434,10 @@ pub fun decl_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 # a:   the Ast owning the decl
 # sym: the symbol whose name span is wanted
 # ret: some(span) of the name identifier, or none
-pub fun decl_name_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
-    if (sym.decl == id.DECL_NIL) { ret opt[token.Span].none{}; }
+pub fun decl_name_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
+    if (id.decl_is_nil(sym.decl)) { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
     ret decl_name_span(d_opt.some);
 }
 
@@ -449,7 +449,7 @@ pub fun decl_name_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 # a:   the Ast owning the symbol's declaration
 # sym: the symbol whose definition span is wanted
 # ret: some(span) of the binding name, or none
-pub fun definition_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
+pub fun definition_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
     if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) {
         ret binding_name_span(a, sym);
     }
@@ -458,16 +458,16 @@ pub fun definition_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 
 # the name identifier span of a decl node, or none for a decl
 # without a single name (use / fwd / comptime / error)
-pub fun decl_name_span(d: *decl.Decl) opt[token.Span] {
-    if (d.kind == decl.DECL_KIND_FUN)  { ret opt[token.Span].some{d.data.fun_.name}; }
-    if (d.kind == decl.DECL_KIND_REC)  { ret opt[token.Span].some{d.data.rec_.name}; }
-    if (d.kind == decl.DECL_KIND_UNI)  { ret opt[token.Span].some{d.data.uni_.name}; }
-    if (d.kind == decl.DECL_KIND_TAG)  { ret opt[token.Span].some{d.data.tag_.name}; }
-    if (d.kind == decl.DECL_KIND_DEF)  { ret opt[token.Span].some{d.data.def_.name}; }
-    if (d.kind == decl.DECL_KIND_VAL)  { ret opt[token.Span].some{d.data.bind.name}; }
-    if (d.kind == decl.DECL_KIND_VAR)  { ret opt[token.Span].some{d.data.bind.name}; }
-    if (d.kind == decl.DECL_KIND_TEST) { ret opt[token.Span].some{d.data.test_.name}; }
-    ret opt[token.Span].none{};
+pub fun decl_name_span(d: *decl.Decl) opt[src.Span] {
+    if (d.kind == decl.DECL_KIND_FUN)  { ret opt[src.Span].some{d.data.fun_.name}; }
+    if (d.kind == decl.DECL_KIND_REC)  { ret opt[src.Span].some{d.data.rec_.name}; }
+    if (d.kind == decl.DECL_KIND_UNI)  { ret opt[src.Span].some{d.data.uni_.name}; }
+    if (d.kind == decl.DECL_KIND_TAG)  { ret opt[src.Span].some{d.data.tag_.name}; }
+    if (d.kind == decl.DECL_KIND_DEF)  { ret opt[src.Span].some{d.data.def_.name}; }
+    if (d.kind == decl.DECL_KIND_VAL)  { ret opt[src.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_VAR)  { ret opt[src.Span].some{d.data.bind.name}; }
+    if (d.kind == decl.DECL_KIND_TEST) { ret opt[src.Span].some{d.data.test_.name}; }
+    ret opt[src.Span].none{};
 }
 
 # the byte span of a local symbol's declaration header - the
@@ -479,24 +479,24 @@ pub fun decl_name_span(d: *decl.Decl) opt[token.Span] {
 # a:   the Ast owning the decl
 # sym: the symbol whose signature span is wanted
 # ret: some(span) of the header text, or none
-pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) opt[token.Span] {
+pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) opt[src.Span] {
     if (sym.kind == rslv.SYM_GENERIC) { ret binding_name_span(a, sym); }
     if (sym.kind == rslv.SYM_PARAM)   { ret param_signature_span(a, sym); }
 
-    if (sym.decl == id.DECL_NIL) { ret opt[token.Span].none{}; }
+    if (id.decl_is_nil(sym.decl)) { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
 
-    if (d.kind == decl.DECL_KIND_FUN && d.data.fun_.body != id.STMT_NIL) {
+    if (d.kind == decl.DECL_KIND_FUN && !id.stmt_is_nil(d.data.fun_.body)) {
         val so: opt[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
         if (sel so.some) {
             val body_off: usize = so.some.span.offset;
             if (body_off > d.span.offset) {
-                var sp: token.Span;
+                var sp: src.Span;
                 sp.offset = d.span.offset;
                 sp.len    = body_off - d.span.offset;
-                ret opt[token.Span].some{sp};
+                ret opt[src.Span].some{sp};
             }
         }
     }
@@ -504,7 +504,7 @@ pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) op
     # summary, not a source viewer: a 13-field record renders as a wall that
     # buries the one line the reader asked about. trim to the header.
     if (d.kind == decl.DECL_KIND_REC || d.kind == decl.DECL_KIND_UNI) {
-        val ho: opt[token.Span] = header_span(file, d.span, '{');
+        val ho: opt[src.Span] = header_span(file, d.span, '{');
         if (sel ho.some) { ret ho; }
     }
 
@@ -512,18 +512,18 @@ pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) op
     # its type is what hover is for, and that ends at the `=`
     if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
         if (spans_multiple_lines(file, d.span)) {
-            val ho: opt[token.Span] = header_span(file, d.span, '=');
+            val ho: opt[src.Span] = header_span(file, d.span, '=');
             if (sel ho.some) { ret ho; }
         }
     }
 
-    ret opt[token.Span].some{d.span};
+    ret opt[src.Span].some{d.span};
 }
 
 # the leading part of `span` up to the first `stop` byte, trailing whitespace
 # removed, or none when `stop` does not occur
-fun header_span(file: *src.SourceFile, span: token.Span, stop: u8) opt[token.Span] {
-    if (file == nil || file.text == nil) { ret opt[token.Span].none{}; }
+fun header_span(file: *src.SourceFile, span: src.Span, stop: u8) opt[src.Span] {
+    if (file == nil || file.text == nil) { ret opt[src.Span].none{}; }
     val text: str   = file.text;
     var i:    usize = span.offset;
     val end:  usize = span.offset + span.len;
@@ -531,19 +531,19 @@ fun header_span(file: *src.SourceFile, span: token.Span, stop: u8) opt[token.Spa
         if (text[i] == stop) {
             var n: usize = i - span.offset;
             for (n > 0 && is_space(text[span.offset + n - 1])) { n = n - 1; }
-            if (n == 0) { ret opt[token.Span].none{}; }
-            var out: token.Span;
+            if (n == 0) { ret opt[src.Span].none{}; }
+            var out: src.Span;
             out.offset = span.offset;
             out.len    = n;
-            ret opt[token.Span].some{out};
+            ret opt[src.Span].some{out};
         }
         i = i + 1;
     }
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # whether `span` covers a line break
-fun spans_multiple_lines(file: *src.SourceFile, span: token.Span) bool {
+fun spans_multiple_lines(file: *src.SourceFile, span: src.Span) bool {
     if (file == nil || file.text == nil) { ret false; }
     val text: str   = file.text;
     var i:    usize = span.offset;
@@ -562,28 +562,28 @@ fun is_space(c: u8) bool {
 # the `name: type` span of a parameter symbol - from its
 # binding name through the end of its type annotation - for hover. falls back
 # to just the name span when the type node is unavailable. none for a non-param
-fun param_signature_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
-    val no: opt[token.Span] = binding_name_span(a, sym);
-    if (sel no.none) { ret opt[token.Span].none{}; }
-    val name: token.Span = no.some;
+fun param_signature_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
+    val no: opt[src.Span] = binding_name_span(a, sym);
+    if (sel no.none) { ret opt[src.Span].none{}; }
+    val name: src.Span = no.some;
 
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[token.Span].some{name}; }
+    if (sel d_opt.none) { ret opt[src.Span].some{name}; }
     val d: *decl.Decl = d_opt.some;
-    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret opt[token.Span].some{name}; }
+    if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret opt[src.Span].some{name}; }
 
-    val tn: *decl.TypedName = ?a.typed_names[d.data.fun_.params_start + sym.slot];
-    if (tn.ty == id.TYPE_NIL) { ret opt[token.Span].some{name}; }
+    val tn: *decl.TypedName = ?a.typed_names.data[d.data.fun_.params_start + sym.slot];
+    if (id.type_is_nil(tn.ty)) { ret opt[src.Span].some{name}; }
     val to: opt[*atype.Type] = ast.get_type(a, tn.ty);
-    if (sel to.none) { ret opt[token.Span].some{name}; }
-    val tspan: token.Span = to.some.span;
+    if (sel to.none) { ret opt[src.Span].some{name}; }
+    val tspan: src.Span = to.some.span;
 
     val end: usize = tspan.offset + tspan.len;
-    if (end <= name.offset) { ret opt[token.Span].some{name}; }
-    var sp: token.Span;
+    if (end <= name.offset) { ret opt[src.Span].some{name}; }
+    var sp: src.Span;
     sp.offset = name.offset;
     sp.len    = end - name.offset;
-    ret opt[token.Span].some{sp};
+    ret opt[src.Span].some{sp};
 }
 
 # the first-class doc-block span the parser attached to a local
@@ -597,14 +597,14 @@ fun param_signature_span(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 # a:   the Ast owning the decl
 # sym: the symbol whose doc block is wanted
 # ret: some(span) covering the doc block within the file text, or none
-pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
-    if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) { ret opt[token.Span].none{}; }
-    if (sym.decl == id.DECL_NIL)                                    { ret opt[token.Span].none{}; }
+pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
+    if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) { ret opt[src.Span].none{}; }
+    if (id.decl_is_nil(sym.decl))                                   { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
-    if (d.doc.len == 0) { ret opt[token.Span].none{}; }
-    ret opt[token.Span].some{d.doc};
+    if (d.doc.len == 0) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{d.doc};
 }
 
 # the description span of the component in the record / union doc
@@ -619,17 +619,17 @@ pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[token.Span] {
 # doc:        the record / union declaration's `Decl.doc` span
 # field_name: the field's declared-name span in `source`
 # ret:        some(description span) for the matching component, or none
-pub fun field_doc_desc(source: str, doc: token.Span, field_name: token.Span) opt[token.Span] {
-    if (doc.len == 0 || field_name.len == 0) { ret opt[token.Span].none{}; }
+pub fun field_doc_desc(source: str, doc: src.Span, field_name: src.Span) opt[src.Span] {
+    if (doc.len == 0 || field_name.len == 0) { ret opt[src.Span].none{}; }
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
     var c:  fedoc.DocComponent;
     for (fedoc.component_next(?it, ?c)) {
         if (same_source_span_equal(source, c.name_span, field_name)) {
-            if (c.desc_span.len == 0) { ret opt[token.Span].none{}; }
-            ret opt[token.Span].some{c.desc_span};
+            if (c.desc_span.len == 0) { ret opt[src.Span].none{}; }
+            ret opt[src.Span].some{c.desc_span};
         }
     }
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # the description a doc block gives for one of a declaration's named parts
@@ -647,24 +647,24 @@ pub fun field_doc_desc(source: str, doc: token.Span, field_name: token.Span) opt
 # name:       the binding's name as resolution knows it
 # is_generic: true to read the bracket form `# [T]:`
 # ret:        some(description span) for the matching component, or none
-pub fun component_desc_named(source: str, doc: token.Span, name: str, is_generic: bool) opt[token.Span] {
-    if (doc.len == 0 || name == nil) { ret opt[token.Span].none{}; }
+pub fun component_desc_named(source: str, doc: src.Span, name: str, is_generic: bool) opt[src.Span] {
+    if (doc.len == 0 || name == nil) { ret opt[src.Span].none{}; }
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
     var c:  fedoc.DocComponent;
     for (fedoc.component_next(?it, ?c)) {
-        val ident: token.Span = component_ident(source, c.name_span, is_generic);
+        val ident: src.Span = component_ident(source, c.name_span, is_generic);
         if (ident.len == 0) { cnt; }
         if (ident_names(source, ident, name)) {
-            if (c.desc_span.len == 0) { ret opt[token.Span].none{}; }
-            ret opt[token.Span].some{c.desc_span};
+            if (c.desc_span.len == 0) { ret opt[src.Span].none{}; }
+            ret opt[src.Span].some{c.desc_span};
         }
     }
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # whether component identifier `ident` names the binding `name`, ignoring a
 # leading `$` on either side
-fun ident_names(source: str, ident: token.Span, name: str) bool {
+fun ident_names(source: str, ident: src.Span, name: str) bool {
     val s:  *u8   = source::*u8;
     val n:  *u8   = name::*u8;
     var io: usize = ident.offset;
@@ -692,7 +692,7 @@ fun ident_names(source: str, ident: token.Span, name: str) bool {
 # the single source text `source`. the same-file analogue of `span_bytes_equal`,
 # used to match a doc component's name against a field name (both spans into the
 # declaring module's source)
-fun same_source_span_equal(source: str, a: token.Span, b: token.Span) bool {
+fun same_source_span_equal(source: str, a: src.Span, b: src.Span) bool {
     if (a.len != b.len) { ret false; }
     var i: usize = 0;
     for (i < a.len) {
@@ -772,12 +772,12 @@ pub fun lsp_completion_kind(kind: rslv.SymKind) i64 {
 # eid:    expr id to test
 # target: the symbol every reference must resolve to
 # ret:    some(name span) when eid references target, or none
-pub fun expr_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, target: rslv.SymbolId) opt[token.Span] {
-    if (rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret opt[token.Span].none{}; }
-    if (rr.expr_resolved[eid] != target)                      { ret opt[token.Span].none{}; }
+pub fun expr_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, target: rslv.SymbolId) opt[src.Span] {
+    if (rr.expr_resolved == nil || id.expr_index(eid) >= rr.expr_count)  { ret opt[src.Span].none{}; }
+    if (!rslv.symbol_same(rr.expr_resolved[id.expr_index(eid)], target)) { ret opt[src.Span].none{}; }
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret opt[token.Span].none{}; }
-    ret opt[token.Span].some{name_span_of_expr(eo.some)};
+    if (sel eo.none) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{name_span_of_expr(eo.some)};
 }
 
 # the name span of type `tid` when it resolves to `target`, or
@@ -788,9 +788,9 @@ pub fun expr_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, targ
 # tid:    type id to test
 # target: the symbol every reference must resolve to
 # ret:    some(name span) when tid references target, or none
-pub fun type_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, tid: id.TypeId, target: rslv.SymbolId) opt[token.Span] {
-    if (rr.type_resolved == nil || tid::u32 >= rr.type_count) { ret opt[token.Span].none{}; }
-    if (rr.type_resolved[tid] != target)                      { ret opt[token.Span].none{}; }
+pub fun type_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, tid: id.TypeId, target: rslv.SymbolId) opt[src.Span] {
+    if (rr.type_resolved == nil || id.type_index(tid) >= rr.type_count)  { ret opt[src.Span].none{}; }
+    if (!rslv.symbol_same(rr.type_resolved[id.type_index(tid)], target)) { ret opt[src.Span].none{}; }
     ret type_name_span(a, tid);
 }
 
@@ -805,9 +805,9 @@ pub fun type_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, tid: id.TypeId, targ
 # sid: symbol id to test
 # ret: true when the symbol is a top-level completion candidate
 pub fun completion_candidate(rr: *rslv.ResolveResult, sid: rslv.SymbolId) bool {
-    if (sid >= rr.symbol_count) { ret false; }
-    val sym: *rslv.Symbol = ?rr.symbols[sid];
-    if (sym.name == intern.STR_NIL)   { ret false; }
+    if (rslv.symbol_index(sid) >= rr.symbol_count) { ret false; }
+    val sym: *rslv.Symbol = ?rr.symbols[rslv.symbol_index(sid)];
+    if (intern.str_is_nil(sym.name))  { ret false; }
     if (sym.kind == rslv.SYM_PARAM)   { ret false; }
     if (sym.kind == rslv.SYM_GENERIC) { ret false; }
     if (sym.kind == rslv.SYM_TEST)    { ret false; }
@@ -824,11 +824,11 @@ pub fun completion_candidate(rr: *rslv.ResolveResult, sid: rslv.SymbolId) bool {
 # did:    decl id to test
 # target: the symbol the decl must declare
 # ret:    some(name span) when did declares target, or none
-pub fun decl_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId) opt[token.Span] {
-    if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret opt[token.Span].none{}; }
-    if (rr.decl_symbol[did] != target)                      { ret opt[token.Span].none{}; }
+pub fun decl_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId) opt[src.Span] {
+    if (rr.decl_symbol == nil || id.decl_index(did) >= rr.decl_count)  { ret opt[src.Span].none{}; }
+    if (!rslv.symbol_same(rr.decl_symbol[id.decl_index(did)], target)) { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
     ret decl_name_span(d_opt.some);
 }
 
@@ -841,7 +841,7 @@ pub fun decl_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, targ
 # file: the source file backing the path span
 # path: byte span covering the dotted import path
 # ret:  the leaf segment span
-pub fun import_leaf_span(file: *src.SourceFile, path: token.Span) token.Span {
+pub fun import_leaf_span(file: *src.SourceFile, path: src.Span) src.Span {
     val s:     *u8   = file.text::*u8;
     val start: usize = path.offset;
     val end:   usize = path.offset + path.len;
@@ -855,7 +855,7 @@ pub fun import_leaf_span(file: *src.SourceFile, path: token.Span) token.Span {
         }
         i = i + 1;
     }
-    var out: token.Span;
+    var out: src.Span;
     if (!found) {
         out.offset = path.offset;
         out.len    = path.len;
@@ -878,15 +878,15 @@ pub fun import_leaf_span(file: *src.SourceFile, path: token.Span) token.Span {
 # target: the symbol the import must bind
 # file:   the source file backing the import path
 # ret:    some(leaf span) when did imports target, or none
-pub fun import_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId, file: *src.SourceFile) opt[token.Span] {
-    if (rr.decl_symbol == nil || did::u32 >= rr.decl_count) { ret opt[token.Span].none{}; }
-    if (rr.decl_symbol[did] != target)                      { ret opt[token.Span].none{}; }
+pub fun import_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId, file: *src.SourceFile) opt[src.Span] {
+    if (rr.decl_symbol == nil || id.decl_index(did) >= rr.decl_count)  { ret opt[src.Span].none{}; }
+    if (!rslv.symbol_same(rr.decl_symbol[id.decl_index(did)], target)) { ret opt[src.Span].none{}; }
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret opt[token.Span].none{}; }
+    if (sel d_opt.none) { ret opt[src.Span].none{}; }
     val d: *decl.Decl = d_opt.some;
-    if (d.kind == decl.DECL_KIND_USE) { ret opt[token.Span].some{import_leaf_span(file, d.data.use_.path)}; }
-    if (d.kind == decl.DECL_KIND_FWD) { ret opt[token.Span].some{import_leaf_span(file, d.data.fwd_.path)}; }
-    ret opt[token.Span].none{};
+    if (d.kind == decl.DECL_KIND_USE) { ret opt[src.Span].some{import_leaf_span(file, d.data.use_.path)}; }
+    if (d.kind == decl.DECL_KIND_FWD) { ret opt[src.Span].some{import_leaf_span(file, d.data.fwd_.path)}; }
+    ret opt[src.Span].none{};
 }
 
 # true when the bytes of `span` in `file` exactly equal the
@@ -898,7 +898,7 @@ pub fun import_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, ta
 # span: byte span to compare
 # name: identifier text to match
 # ret:  true on an exact byte match
-pub fun span_text_equals(file: *src.SourceFile, span: token.Span, name: str) bool {
+pub fun span_text_equals(file: *src.SourceFile, span: src.Span, name: str) bool {
     if (name == nil) { ret false; }
     val nlen: usize = str_len(name);
     if (span.len != nlen) { ret false; }
@@ -918,7 +918,7 @@ pub fun span_text_equals(file: *src.SourceFile, span: token.Span, name: str) boo
 # ---
 # e:   the expression
 # ret: its name span
-pub fun name_span_of_expr(e: *expr.Expr) token.Span {
+pub fun name_span_of_expr(e: *expr.Expr) src.Span {
     if (e.kind == expr.EXPR_KIND_MEMBER) { ret e.data.member.name; }
     ret text_span_of_expr(e);
 }
@@ -931,15 +931,15 @@ pub fun name_span_of_expr(e: *expr.Expr) token.Span {
 # ---
 # e:   the expression
 # ret: some(its token) for the seven token-backed kinds, none for any other
-pub fun token_span_of_expr(e: *expr.Expr) opt[token.Span] {
-    if (e.kind == expr.EXPR_KIND_IDENT)          { ret opt[token.Span].some{e.data.ident.tok}; }
-    if (e.kind == expr.EXPR_KIND_COMPTIME_IDENT) { ret opt[token.Span].some{e.data.comptime_ident.tok}; }
-    if (e.kind == expr.EXPR_KIND_LIT_INT)        { ret opt[token.Span].some{e.data.lit_int.tok}; }
-    if (e.kind == expr.EXPR_KIND_LIT_FLOAT)      { ret opt[token.Span].some{e.data.lit_float.tok}; }
-    if (e.kind == expr.EXPR_KIND_LIT_CHAR)       { ret opt[token.Span].some{e.data.lit_char.tok}; }
-    if (e.kind == expr.EXPR_KIND_LIT_STR)        { ret opt[token.Span].some{e.data.lit_str.tok}; }
-    if (e.kind == expr.EXPR_KIND_LIT_NIL)        { ret opt[token.Span].some{e.data.lit_nil.tok}; }
-    ret opt[token.Span].none{};
+pub fun token_span_of_expr(e: *expr.Expr) opt[src.Span] {
+    if (e.kind == expr.EXPR_KIND_IDENT)          { ret opt[src.Span].some{e.data.ident.tok}; }
+    if (e.kind == expr.EXPR_KIND_COMPTIME_IDENT) { ret opt[src.Span].some{e.data.comptime_ident.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_INT)        { ret opt[src.Span].some{e.data.lit_int.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_FLOAT)      { ret opt[src.Span].some{e.data.lit_float.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_CHAR)       { ret opt[src.Span].some{e.data.lit_char.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_STR)        { ret opt[src.Span].some{e.data.lit_str.tok}; }
+    if (e.kind == expr.EXPR_KIND_LIT_NIL)        { ret opt[src.Span].some{e.data.lit_nil.tok}; }
+    ret opt[src.Span].none{};
 }
 
 # the span an expression's own text occupies: its token for a name or a
@@ -947,20 +947,20 @@ pub fun token_span_of_expr(e: *expr.Expr) opt[token.Span] {
 # ---
 # e:   the expression
 # ret: the token when there is one, else the expression's span
-pub fun text_span_of_expr(e: *expr.Expr) token.Span {
-    val to: opt[token.Span] = token_span_of_expr(e);
+pub fun text_span_of_expr(e: *expr.Expr) src.Span {
+    val to: opt[src.Span] = token_span_of_expr(e);
     if (sel to.some) { ret to.some; }
     ret e.span;
 }
 
 # the name span of a named type node, or none when the type at
 # `tid` is not a named reference (a pointer / array / fun type wrapping it)
-fun type_name_span(a: *ast.Ast, tid: id.TypeId) opt[token.Span] {
+fun type_name_span(a: *ast.Ast, tid: id.TypeId) opt[src.Span] {
     val t_opt: opt[*atype.Type] = ast.get_type(a, tid);
-    if (sel t_opt.none) { ret opt[token.Span].none{}; }
+    if (sel t_opt.none) { ret opt[src.Span].none{}; }
     val t: *atype.Type = t_opt.some;
-    if (t.kind == atype.TYPE_KIND_NAMED) { ret opt[token.Span].some{t.data.named.name}; }
-    ret opt[token.Span].none{};
+    if (t.kind == atype.TYPE_KIND_NAMED) { ret opt[src.Span].some{t.data.named.name}; }
+    ret opt[src.Span].none{};
 }
 
 # a record / union field a cursor position references, before the field
@@ -977,7 +977,7 @@ fun type_name_span(a: *ast.Ast, tid: id.TypeId) opt[token.Span] {
 # name_span: byte span of the referenced field-name token (`.bar` / `bar`)
 pub rec FieldRef {
     host:      id.ExprId;
-    name_span: token.Span;
+    name_span: src.Span;
 }
 
 # the record / union field a byte offset references through a member
@@ -994,7 +994,7 @@ pub rec FieldRef {
 # ret:    some(FieldRef) on a field-name position, or none
 pub fun field_ref_at(a: *ast.Ast, offset: usize) opt[FieldRef] {
     val eid: id.ExprId = ast.offset_to_expr(a, offset);
-    if (eid == id.EXPR_NIL) { ret opt[FieldRef].none{}; }
+    if (id.expr_is_nil(eid)) { ret opt[FieldRef].none{}; }
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
     if (sel eo.none) { ret opt[FieldRef].none{}; }
     val e: *expr.Expr = eo.some;
@@ -1012,7 +1012,7 @@ pub fun field_ref_at(a: *ast.Ast, offset: usize) opt[FieldRef] {
         val len:   u32 = e.data.struct_lit.fields_len;
         var i:     u32 = 0;
         for (i < len) {
-            val fi: *expr.FieldInit = ?a.field_inits[start + i];
+            val fi: *expr.FieldInit = ?a.field_inits.data[start + i];
             if (ast.span_contains(fi.name, offset)) {
                 var fr: FieldRef;
                 fr.host      = eid;
@@ -1041,17 +1041,17 @@ pub fun field_ref_at(a: *ast.Ast, offset: usize) opt[FieldRef] {
 # query_file:   the SourceFile backing the referencing token
 # query:        byte span of the referenced field name
 # ret:          some(field name span in `decl_a`), or none
-pub fun field_decl_span(decl_a: *ast.Ast, decl_file: *src.SourceFile, fields_start: u32, fields_len: u32, query_file: *src.SourceFile, query: token.Span) opt[token.Span] {
-    if (query.len == 0) { ret opt[token.Span].none{}; }
+pub fun field_decl_span(decl_a: *ast.Ast, decl_file: *src.SourceFile, fields_start: u32, fields_len: u32, query_file: *src.SourceFile, query: src.Span) opt[src.Span] {
+    if (query.len == 0) { ret opt[src.Span].none{}; }
     var i: u32 = 0;
     for (i < fields_len) {
-        val tn: *decl.TypedName = ?decl_a.typed_names[fields_start + i];
+        val tn: *decl.TypedName = ?decl_a.typed_names.data[fields_start + i];
         if (span_bytes_equal(decl_file, tn.name, query_file, query)) {
-            ret opt[token.Span].some{tn.name};
+            ret opt[src.Span].some{tn.name};
         }
         i = i + 1;
     }
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # the name span of the rec / uni field whose own declaration
@@ -1064,14 +1064,14 @@ pub fun field_decl_span(decl_a: *ast.Ast, decl_file: *src.SourceFile, fields_sta
 # fields_len:   number of fields
 # offset:       byte offset into the declaring module's source
 # ret:          some(field name span) when the offset is on a field name, or none
-pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32, offset: usize) opt[token.Span] {
+pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32, offset: usize) opt[src.Span] {
     var i: u32 = 0;
     for (i < fields_len) {
-        val tn: *decl.TypedName = ?decl_a.typed_names[fields_start + i];
-        if (ast.span_contains(tn.name, offset)) { ret opt[token.Span].some{tn.name}; }
+        val tn: *decl.TypedName = ?decl_a.typed_names.data[fields_start + i];
+        if (ast.span_contains(tn.name, offset)) { ret opt[src.Span].some{tn.name}; }
         i = i + 1;
     }
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # the cross-module identity of a record / union field - the nominal
@@ -1087,12 +1087,12 @@ pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32,
 # decl_file:  SourceFile backing the declaring module (the field-name bytes)
 # field_name: byte span of the field's declared name in `decl_file`
 pub rec FieldKey {
-    origin:     sess.ModuleId;
+    origin:     sess.StableModuleId;
     decl:       id.DeclId;
     file:       src.FileId;
     name:       intern.StrId;
     decl_file:  *src.SourceFile;
-    field_name: token.Span;
+    field_name: src.Span;
 }
 
 # the field-name span of expr `eid` in module (`a`, `sr`) when
@@ -1108,7 +1108,7 @@ pub rec FieldKey {
 # the host type is read from `sr` (the module's SemaResult) and peeled through the
 # session type interner `ti`, so a field reached through `*T` or a generic instance
 # of the record matches the same key. pure over (`a`, `sr`, `ti`) - the caller
-# walks `[0, a.expr_len)` feeding the spans this returns to a sink
+# walks `[0, a.exprs.len)` feeding the spans this returns to a sink
 # ---
 # a:   the module's parsed Ast
 # sr:  the module's SemaResult (per-expr typing)
@@ -1117,32 +1117,32 @@ pub rec FieldKey {
 # qf:  the SourceFile backing `a` (the referenced name bytes)
 # key: the field identity to match
 # ret: some(name span) when `eid` references the keyed field, or none
-pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) opt[token.Span] {
+pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) opt[src.Span] {
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret opt[token.Span].none{}; }
+    if (sel eo.none) { ret opt[src.Span].none{}; }
     val e: *expr.Expr = eo.some;
 
     if (e.kind == expr.EXPR_KIND_MEMBER) {
-        if (!host_matches(sr, ti, e.data.member.object, key))                         { ret opt[token.Span].none{}; }
-        if (!span_bytes_equal(qf, e.data.member.name, key.decl_file, key.field_name)) { ret opt[token.Span].none{}; }
-        ret opt[token.Span].some{e.data.member.name};
+        if (!host_matches(sr, ti, e.data.member.object, key))                         { ret opt[src.Span].none{}; }
+        if (!span_bytes_equal(qf, e.data.member.name, key.decl_file, key.field_name)) { ret opt[src.Span].none{}; }
+        ret opt[src.Span].some{e.data.member.name};
     }
 
     if (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
-        if (!host_matches(sr, ti, eid, key)) { ret opt[token.Span].none{}; }
+        if (!host_matches(sr, ti, eid, key)) { ret opt[src.Span].none{}; }
         val start: u32 = e.data.struct_lit.fields_start;
         val len:   u32 = e.data.struct_lit.fields_len;
         var i:     u32 = 0;
         for (i < len) {
-            val fi: *expr.FieldInit = ?a.field_inits[start + i];
+            val fi: *expr.FieldInit = ?a.field_inits.data[start + i];
             if (span_bytes_equal(qf, fi.name, key.decl_file, key.field_name)) {
-                ret opt[token.Span].some{fi.name};
+                ret opt[src.Span].some{fi.name};
             }
             i = i + 1;
         }
     }
 
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # whether host expression `eid`'s type peels to the keyed record's
@@ -1155,13 +1155,13 @@ fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, k
     val no:  opt[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
     if (sel no.none) { ret false; }
     val n: mtypes.Nominal = no.some;
-    ret n.file == key.file && n.name == key.name;
+    ret src.file_same(n.file, key.file) && intern.str_same(n.name, key.name);
 }
 
 # write into `out` (up to `cap` spans) every site naming the
 # keyed field in module (`a`, `sr`) and return the count. the spans are, in walk
 # order: every member-access / struct-literal init whose host type peels to the
-# keyed record (`field_ref_span_at` over `[0, a.expr_len)`), and - when `declaring`
+# keyed record (`field_ref_span_at` over `[0, a.exprs.len)`), and - when `declaring`
 # (this module declares the record) - the field declaration's own name span, then
 # (when `want_doc` and the record's `doc` block carries a matching component) that
 # component's name token. this is the complete edit set a field rename applies to
@@ -1181,11 +1181,11 @@ fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, k
 # out:       array of at least `cap` Span slots
 # cap:       capacity of `out`
 # ret:       number of spans written
-pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, qf: *src.SourceFile, key: FieldKey, declaring: bool, want_doc: bool, decl_src: str, doc: token.Span, out: *token.Span, cap: usize) usize {
+pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, qf: *src.SourceFile, key: FieldKey, declaring: bool, want_doc: bool, decl_src: str, doc: src.Span, out: *src.Span, cap: usize) usize {
     var n:  usize = 0;
     var ei: usize = 0;
-    for (ei < a.expr_len && n < cap) {
-        val so: opt[token.Span] = field_ref_span_at(a, sr, ti, ei::id.ExprId, qf, key);
+    for (ei < a.exprs.len && n < cap) {
+        val so: opt[src.Span] = field_ref_span_at(a, sr, ti, id.expr(ei::u32), qf, key);
         if (sel so.some) {
             out[n] = so.some;
             n      = n + 1;
@@ -1196,7 +1196,7 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInt
         out[n] = key.field_name;
         n      = n + 1;
         if (want_doc && doc.len != 0 && n < cap) {
-            val co: opt[token.Span] = doc_component_name_span(decl_src, doc, key.decl_file, key.field_name, false);
+            val co: opt[src.Span] = doc_component_name_span(decl_src, doc, key.decl_file, key.field_name, false);
             if (sel co.some) {
                 out[n] = co.some;
                 n      = n + 1;
@@ -1223,16 +1223,16 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInt
 # query:      byte span of the field / param / generic binding name
 # is_generic: true to match / rewrite the bracket form `# [T]:`
 # ret:        some(span to rewrite) for the matching component, or none
-pub fun doc_component_name_span(source: str, doc: token.Span, qf: *src.SourceFile, query: token.Span, is_generic: bool) opt[token.Span] {
-    if (doc.len == 0 || query.len == 0) { ret opt[token.Span].none{}; }
+pub fun doc_component_name_span(source: str, doc: src.Span, qf: *src.SourceFile, query: src.Span, is_generic: bool) opt[src.Span] {
+    if (doc.len == 0 || query.len == 0) { ret opt[src.Span].none{}; }
     var it: fedoc.DocComponentIter = fedoc.component_iter(source, doc);
     var c:  fedoc.DocComponent;
     for (fedoc.component_next(?it, ?c)) {
-        val ident: token.Span = component_ident(source, c.name_span, is_generic);
+        val ident: src.Span = component_ident(source, c.name_span, is_generic);
         if (ident.len == 0)                               { cnt; }
-        if (span_bytes_equal_2(source, ident, qf, query)) { ret opt[token.Span].some{ident}; }
+        if (span_bytes_equal_2(source, ident, qf, query)) { ret opt[src.Span].some{ident}; }
     }
-    ret opt[token.Span].none{};
+    ret opt[src.Span].none{};
 }
 
 # the identifier token within a component name span - the whole
@@ -1240,21 +1240,21 @@ pub fun doc_component_name_span(source: str, doc: token.Span, qf: *src.SourceFil
 # head. an empty span when a generic head has no `[...]` enclosed single-word
 # identifier. the narrowing `doc_component_name_span` applies so a generic rename
 # rewrites `T` inside `[T]` without disturbing the brackets
-fun component_ident(source: str, name: token.Span, is_generic: bool) token.Span {
+fun component_ident(source: str, name: src.Span, is_generic: bool) src.Span {
     if (!is_generic)  { ret name; }
     if (name.len < 3) { ret empty_span(); }
     val lo: usize = name.offset;
     val hi: usize = name.offset + name.len;
     if (source[lo] != '[' || source[hi - 1] != ']') { ret empty_span(); }
-    var sp: token.Span;
+    var sp: src.Span;
     sp.offset = lo + 1;
     sp.len    = (hi - 1) - (lo + 1);
     ret sp;
 }
 
 # a zero-length span, the "absent" marker for component_ident
-fun empty_span() token.Span {
-    var s: token.Span;
+fun empty_span() src.Span {
+    var s: src.Span;
     s.offset = 0;
     s.len    = 0;
     ret s;
@@ -1264,7 +1264,7 @@ fun empty_span() token.Span {
 # identical bytes. a cross-source compare where one side is a raw `str` (a doc
 # block lives in the declaring module's source) and the other a SourceFile (the
 # binding name) - bridging `same_source_span_equal` and `span_bytes_equal`
-fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
+fun span_bytes_equal_2(source: str, sa: src.Span, fb: *src.SourceFile, sb: src.Span) bool {
     if (sa.len != sb.len) { ret false; }
     val b: *u8   = fb.text::*u8;
     var i: usize = 0;
@@ -1285,7 +1285,7 @@ fun span_bytes_equal_2(source: str, sa: token.Span, fb: *src.SourceFile, sb: tok
 # fb:  source file backing span `sb`
 # sb:  byte span in `fb`
 # ret: true on an exact byte-for-byte match
-pub fun span_bytes_equal(fa: *src.SourceFile, sa: token.Span, fb: *src.SourceFile, sb: token.Span) bool {
+pub fun span_bytes_equal(fa: *src.SourceFile, sa: src.Span, fb: *src.SourceFile, sb: src.Span) bool {
     if (sa.len != sb.len) { ret false; }
     val a: *u8   = fa.text::*u8;
     val b: *u8   = fb.text::*u8;
@@ -1300,8 +1300,8 @@ pub fun span_bytes_equal(fa: *src.SourceFile, sa: token.Span, fb: *src.SourceFil
 # a Span over `[offset, offset + len)`. the test builder for field-name /
 # query spans into a stub SourceFile
 #[testing]
-fun span_at(offset: usize, len: usize) token.Span {
-    var sp: token.Span;
+fun span_at(offset: usize, len: usize) src.Span {
+    var sp: src.Span;
     sp.offset = offset;
     sp.len    = len;
     ret sp;
@@ -1312,10 +1312,9 @@ fun span_at(offset: usize, len: usize) token.Span {
 #[testing]
 fun stub_file(text: str) src.SourceFile {
     var f: src.SourceFile;
-    f.path        = nil;
-    f.text        = text;
-    f.line_starts = nil;
-    f.line_len    = 0;
+    f.path  = nil;
+    f.text  = text;
+    f.lines = src.Lines{starts: nil, len: 0, n: 0};
     ret f;
 }
 
@@ -1336,22 +1335,22 @@ test field_decl_span_matches_a_field_across_two_sources {
     var pa: Allocator;
     page.make(?pa);
     # the declaring "module" file holds the record fields
-    var da:    ast.Ast = ast.init(?pa, 0::src.FileId);
+    var da:    ast.Ast = ast.init(?pa, src.file_id(0));
     val start: u32     = add_field(?da, 0, 4); # "name"
     add_field(?da, 5, 3); # "age"
     var df: src.SourceFile = stub_file("name age");
     # the referencing buffer file holds a member access "p.age"
     var qf: src.SourceFile = stub_file("p.age");
 
-    var fail: bool            = false;
-    val o:    opt[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
+    var fail: bool          = false;
+    val o:    opt[src.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
     if (sel o.some) {
-        val sp: token.Span = o.some;
+        val sp: src.Span = o.some;
         if (sp.offset != 5 || sp.len != 3) { fail = true; }
     }
     or { fail = true; }
     # "a" names no field
-    val unknown: opt[token.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 1));
+    val unknown: opt[src.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 1));
     if (sel unknown.some) { fail = true; }
 
     ast.dnit(?da);
@@ -1361,29 +1360,29 @@ test field_decl_span_matches_a_field_across_two_sources {
 
 test field_doc_desc_finds_the_matching_component_s_description {
     # the doc block and the rec body share one source, so the field-name query
-    # span and the component name span both point into `src` - the same-file
+    # span and the component name span both point into `text` - the same-file
     # match field_doc_desc performs in `field_hover_markdown`.
-    #             0         1         2         3         4         5         6         7         8         9
-    #             0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456
-    val src: str = "# a point\n# ---\n# x: the horizontal coordinate\n# y: the vertical coordinate\nrec P { x: i32; y: i32; }";
-    var doc: token.Span;
+    #              0         1         2         3         4         5         6         7         8         9
+    #              0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456
+    val text: str = "# a point\n# ---\n# x: the horizontal coordinate\n# y: the vertical coordinate\nrec P { x: i32; y: i32; }";
+    var doc:  src.Span;
     doc.offset = 0;
     doc.len    = 75; # through the end of the `# y: ...` component, before the rec body
     # the rec-body field names: "x" at offset 84, "y" at offset 92.
 
     var fail: bool = false;
     # "y" field -> the "y" component description
-    val oy: opt[token.Span] = field_doc_desc(src, doc, span_at(92, 1));
+    val oy: opt[src.Span] = field_doc_desc(text, doc, span_at(92, 1));
     if (sel oy.some) {
-        val sp: token.Span = oy.some;
-        if (!region_eq(src, sp, "the vertical coordinate")) { fail = true; }
+        val sp: src.Span = oy.some;
+        if (!region_eq(text, sp, "the vertical coordinate")) { fail = true; }
     }
     or { fail = true; }
     # "x" field -> the "x" component description
-    val ox: opt[token.Span] = field_doc_desc(src, doc, span_at(84, 1));
+    val ox: opt[src.Span] = field_doc_desc(text, doc, span_at(84, 1));
     if (sel ox.some) {
-        val sp: token.Span = ox.some;
-        if (!region_eq(src, sp, "the horizontal coordinate")) { fail = true; }
+        val sp: src.Span = ox.some;
+        if (!region_eq(text, sp, "the horizontal coordinate")) { fail = true; }
     }
     or { fail = true; }
 
@@ -1393,7 +1392,7 @@ test field_doc_desc_finds_the_matching_component_s_description {
 
 # true when `span` of `source` equals the byte content of `expect`
 #[testing]
-fun region_eq(source: str, span: token.Span, expect: str) bool {
+fun region_eq(source: str, span: src.Span, expect: str) bool {
     val n: usize = str_len(expect);
     if (span.len != n) { ret false; }
     var i: usize = 0;
@@ -1409,10 +1408,10 @@ fun region_eq(source: str, span: token.Span, expect: str) bool {
 #[testing]
 fun fk(origin: u32, decl: u32, decl_file: *src.SourceFile, off: usize, len: usize) FieldKey {
     var k: FieldKey;
-    k.origin     = origin::sess.ModuleId;
-    k.decl       = decl::id.DeclId;
-    k.file       = origin::src.FileId;
-    k.name       = decl::intern.StrId;
+    k.origin     = lmodule.stable_id(origin);
+    k.decl       = id.decl(decl);
+    k.file       = src.file_id(origin);
+    k.name       = intern.str_id(decl);
     k.decl_file  = decl_file;
     k.field_name = span_at(off, len);
     ret k;
@@ -1506,13 +1505,13 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
 test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     var pa: Allocator;
     page.make(?pa);
-    var a:     ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var a:     ast.Ast        = ast.init(?pa, src.file_id(0));
     var ti:    type.TypeInterner;
     val sel_9: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_9.err) { ret 1; }
     # the record P is declared in module 2, decl 4; its field "x" lives at offset
     # 8 of the declaring source. the buffer text "p.x" carries the member access
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(2), type.TYPE_REC);
+    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
     val recp:  type.TypeId    = recp_r.ok;
     var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
@@ -1522,18 +1521,18 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     val recv: id.ExprId       = add_ident(?a, 0, 1);
     val mem:  id.ExprId       = add_member(?a, recv, 2, 1);
     var sr:   sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[recv] = recp;
+    sr.expr_type[id.expr_index(recv)] = recp;
 
-    val key:  FieldKey        = fk(2, 4, ?declf, 8, 1);
-    var fail: bool            = false;
-    val o:    opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
+    val key:  FieldKey      = fk(2, 4, ?declf, 8, 1);
+    var fail: bool          = false;
+    val o:    opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
     if (sel o.some) {
-        val sp: token.Span = o.some;
+        val sp: src.Span = o.some;
         if (sp.offset != 2 || sp.len != 1) { fail = true; }
     }
     or { fail = true; }
     # the receiver IDENT itself is not a member access - no field span.
-    val sel_10: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, recv, ?buf, key);
+    val sel_10: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, recv, ?buf, key);
     if (sel sel_10.some) { fail = true; }
 
     free_sema(?pa, ?sr);
@@ -1546,11 +1545,11 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
 test field_ref_span_at_matches_a_struct_literal_field_init {
     var pa: Allocator;
     page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var a:      ast.Ast        = ast.init(?pa, src.file_id(0));
     var ti:     type.TypeInterner;
     val sel_13: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_13.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 1::intern.StrId, t_owner(3), type.TYPE_REC);
+    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(1), t_owner(3), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
     val recp:  type.TypeId    = recp_r.ok;
     var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
@@ -1559,13 +1558,13 @@ test field_ref_span_at_matches_a_struct_literal_field_init {
     # expr 0 = the struct literal itself, typed P; its single init names "x"@3
     val lit: id.ExprId       = add_struct_lit(?a, 3, 1);
     var sr:  sema.SemaResult = mk_sema(?pa, 1);
-    sr.expr_type[lit] = recp;
+    sr.expr_type[id.expr_index(lit)] = recp;
 
-    val key:  FieldKey        = fk(3, 1, ?declf, 8, 1);
-    var fail: bool            = false;
-    val o:    opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
+    val key:  FieldKey      = fk(3, 1, ?declf, 8, 1);
+    var fail: bool          = false;
+    val o:    opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
     if (sel o.some) {
-        val sp: token.Span = o.some;
+        val sp: src.Span = o.some;
         if (sp.offset != 3 || sp.len != 1) { fail = true; }
     }
     or { fail = true; }
@@ -1580,11 +1579,11 @@ test field_ref_span_at_matches_a_struct_literal_field_init {
 test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     var pa: Allocator;
     page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var a:      ast.Ast        = ast.init(?pa, src.file_id(0));
     var ti:     type.TypeInterner;
     val sel_14: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_14.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(2), type.TYPE_REC);
+    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
     val recp:  type.TypeId    = recp_r.ok;
     var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
@@ -1593,19 +1592,19 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     val recv: id.ExprId       = add_ident(?a, 0, 1);
     val mem:  id.ExprId       = add_member(?a, recv, 2, 1);
     var sr:   sema.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[recv] = recp;
+    sr.expr_type[id.expr_index(recv)] = recp;
 
     var fail: bool = false;
     # right record, wrong field name ("y" vs the access "x"): no match
-    var decly:  src.SourceFile  = stub_file("y");
-    val sel_15: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1));
+    var decly:  src.SourceFile = stub_file("y");
+    val sel_15: opt[src.Span]  = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1));
     if (sel sel_15.some) { fail = true; }
     # right field name, wrong record identity (decl 9): no match.
-    val sel_16: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1));
+    val sel_16: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1));
     if (sel sel_16.some) { fail = true; }
     # receiver untyped (TYPE_NIL): no match.
-    sr.expr_type[recv] = type.TYPE_NIL;
-    val sel_17: opt[token.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?declf, 8, 1));
+    sr.expr_type[id.expr_index(recv)] = type.TYPE_NIL;
+    val sel_17: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?declf, 8, 1));
     if (sel sel_17.some) { fail = true; }
 
     free_sema(?pa, ?sr);
@@ -1618,11 +1617,11 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
 test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     var pa: Allocator;
     page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, 0::src.FileId);
+    var a:      ast.Ast        = ast.init(?pa, src.file_id(0));
     var ti:     type.TypeInterner;
     val sel_18: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_18.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(0), type.TYPE_REC);
+    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(0), type.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
     val recp: type.TypeId = recp_r.ok;
 
@@ -1630,7 +1629,7 @@ test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     # the doc `# x:` component name is at offset 18 (after "# a point\n# ---\n# ")
     val declsrc: str            = "# a point\n# ---\n# x: the abscissa\nrec P { x: i32; y: i32; }";
     var declf:   src.SourceFile = stub_file(declsrc);
-    var doc:     token.Span;
+    var doc:     src.Span;
     doc.offset = 0;
     doc.len    = 33; # through the `# x: ...` component, before the rec body
     # the field "x" name in the rec body sits at offset 42 (within `rec P { x`)
@@ -1644,12 +1643,12 @@ test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     val m2:  id.ExprId       = add_member(?a, r2, 6, 1); # "q.x" name @6
     val lit: id.ExprId       = add_struct_lit(?a, 11, 1); # "P{ x" name @11
     var sr:  sema.SemaResult = mk_sema(?pa, 5);
-    sr.expr_type[r1]  = recp;
-    sr.expr_type[r2]  = recp;
-    sr.expr_type[lit] = recp;
+    sr.expr_type[id.expr_index(r1)]  = recp;
+    sr.expr_type[id.expr_index(r2)]  = recp;
+    sr.expr_type[id.expr_index(lit)] = recp;
 
     val key: FieldKey = fk(0, 4, ?declf, xoff, 1);
-    var out: [8]token.Span;
+    var out: [8]src.Span;
 
     var fail: bool = false;
     # rename over the declaring module: two members, one init, the decl, the doc
@@ -1671,7 +1670,7 @@ test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     # a module that does not declare the record contributes its body sites only
     if (collect_field_sites(?a, ?sr, ?ti, ?buf, key, false, true, declsrc, doc, ?out[0], 8) != 3) { fail = true; }
     # a record with no doc block has no doc component to rename
-    var no_doc: token.Span;
+    var no_doc: src.Span;
     no_doc.offset = 0;
     no_doc.len    = 0;
     if (collect_field_sites(?a, ?sr, ?ti, ?buf, key, true, true, declsrc, no_doc, ?out[0], 8) != 4) { fail = true; }
@@ -1685,15 +1684,15 @@ test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
 
 test doc_component_name_span_rewrites_a_plain_field_param_component {
     val txt: str = "# sums\n# ---\n# a: the addend\n# b: the augend\n";
-    var doc: token.Span;
+    var doc: src.Span;
     doc.offset = 0;
     doc.len    = str_len(txt);
     var qf: src.SourceFile = stub_file("b");
 
-    var fail: bool            = false;
-    val o:    opt[token.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
+    var fail: bool          = false;
+    val o:    opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
     if (sel o.some) {
-        val sp: token.Span = o.some;
+        val sp: src.Span = o.some;
         if (!region_eq(txt, sp, "b")) { fail = true; }
         if (sp.len != 1)              { fail = true; }
         # it must be the component head "b", not the "b" inside "the augend".
@@ -1707,16 +1706,16 @@ test doc_component_name_span_rewrites_a_plain_field_param_component {
 
 test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
     val txt: str = "# a box\n# ---\n# [T]: the element\n# v: the value\n";
-    var doc: token.Span;
+    var doc: src.Span;
     doc.offset = 0;
     doc.len    = str_len(txt);
     var qf: src.SourceFile = stub_file("T");
 
     var fail: bool = false;
     # generic match: the inner "T" only, brackets preserved
-    val o: opt[token.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), true);
+    val o: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), true);
     if (sel o.some) {
-        val sp: token.Span = o.some;
+        val sp: src.Span = o.some;
         if (!region_eq(txt, sp, "T")) { fail = true; }
         if (sp.len != 1)              { fail = true; }
         # the byte before the matched span is the '[' and after is the ']'.
@@ -1724,7 +1723,7 @@ test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
     }
     or { fail = true; }
     # the same query in non-generic mode must NOT match "[T]" (it is not "T").
-    val sel_22: opt[token.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
+    val sel_22: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
     if (sel sel_22.some) { fail = true; }
 
     if (fail) { ret 1; }
@@ -1735,8 +1734,8 @@ test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
 #[testing]
 fun t_owner(file: u32) type.TypeOwner {
     var o: type.TypeOwner;
-    o.module = file;
-    o.file   = file::src.FileId;
+    o.module = lmodule.stable_id(file);
+    o.file   = src.file_id(file);
     ret o;
 }
 
@@ -1744,45 +1743,45 @@ test symbol_denotes_matches_a_use_imported_binding_by_canonical_name {
     var syms: [4]rslv.Symbol;
     # the declaration itself, in the module that declares it
     syms[0].kind   = rslv.SYM_FUN;
-    syms[0].origin = 3::sess.ModuleId;
-    syms[0].decl   = 7::id.DeclId;
-    syms[0].canon  = 11::intern.StrId;
+    syms[0].origin = lmodule.stable_id(3);
+    syms[0].decl   = id.decl(7);
+    syms[0].canon  = intern.str_id(11);
     # a `use` binding of it: the referent's origin, no decl of its own
     syms[1].kind            = rslv.SYM_IMPORTED;
     syms[1].definition_kind = rslv.SYM_FUN;
-    syms[1].origin          = 3::sess.ModuleId;
+    syms[1].origin          = lmodule.stable_id(3);
     syms[1].decl            = id.DECL_NIL;
-    syms[1].canon           = 11::intern.StrId;
+    syms[1].canon           = intern.str_id(11);
     # a record sharing the canonical name, which the kind has to separate
     syms[2].kind            = rslv.SYM_IMPORTED;
     syms[2].definition_kind = rslv.SYM_REC;
-    syms[2].origin          = 3::sess.ModuleId;
+    syms[2].origin          = lmodule.stable_id(3);
     syms[2].decl            = id.DECL_NIL;
-    syms[2].canon           = 11::intern.StrId;
+    syms[2].canon           = intern.str_id(11);
     # that name imported from a different module
     syms[3].kind            = rslv.SYM_IMPORTED;
     syms[3].definition_kind = rslv.SYM_FUN;
-    syms[3].origin          = 4::sess.ModuleId;
+    syms[3].origin          = lmodule.stable_id(4);
     syms[3].decl            = id.DECL_NIL;
-    syms[3].canon           = 11::intern.StrId;
+    syms[3].canon           = intern.str_id(11);
 
     var rr: rslv.ResolveResult;
     rr.symbols      = ?syms[0];
     rr.symbol_count = 4;
 
-    val org:  sess.ModuleId = 3::sess.ModuleId;
-    val dcl:  id.DeclId     = 7::id.DeclId;
-    val cnon: intern.StrId  = 11::intern.StrId;
+    val org:  sess.StableModuleId = lmodule.stable_id(3);
+    val dcl:  id.DeclId           = id.decl(7);
+    val cnon: intern.StrId        = intern.str_id(11);
 
     var fail: bool = false;
-    if (!symbol_denotes(?rr, 0, org, dcl, cnon, rslv.SYM_FUN))              { fail = true; }
-    if (!symbol_denotes(?rr, 1, org, dcl, cnon, rslv.SYM_FUN))              { fail = true; }
-    if (symbol_denotes(?rr, 2, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
-    if (symbol_denotes(?rr, 3, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
-    if (symbol_denotes(?rr, rslv.SYMBOL_NIL, org, dcl, cnon, rslv.SYM_FUN)) { fail = true; }
-    if (symbol_denotes(?rr, 9, org, dcl, cnon, rslv.SYM_FUN))               { fail = true; }
+    if (!symbol_denotes(?rr, rslv.symbol_id(0), org, dcl, cnon, rslv.SYM_FUN)) { fail = true; }
+    if (!symbol_denotes(?rr, rslv.symbol_id(1), org, dcl, cnon, rslv.SYM_FUN)) { fail = true; }
+    if (symbol_denotes(?rr, rslv.symbol_id(2), org, dcl, cnon, rslv.SYM_FUN))  { fail = true; }
+    if (symbol_denotes(?rr, rslv.symbol_id(3), org, dcl, cnon, rslv.SYM_FUN))  { fail = true; }
+    if (symbol_denotes(?rr, rslv.SYMBOL_NIL, org, dcl, cnon, rslv.SYM_FUN))    { fail = true; }
+    if (symbol_denotes(?rr, rslv.symbol_id(9), org, dcl, cnon, rslv.SYM_FUN))  { fail = true; }
     # the canonical name does not rescue a symbol that carries another decl
-    if (symbol_denotes(?rr, 0, org, 8::id.DeclId, cnon, rslv.SYM_FUN)) { fail = true; }
-    if (fail)                                                          { ret 1; }
+    if (symbol_denotes(?rr, rslv.symbol_id(0), org, id.decl(8), cnon, rslv.SYM_FUN)) { fail = true; }
+    if (fail)                                                                        { ret 1; }
     ret 0;
 }

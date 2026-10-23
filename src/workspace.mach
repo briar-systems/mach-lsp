@@ -23,10 +23,10 @@ use std.types.string.str_len;
 use std.allocator.Allocator;
 
 use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.token;
 use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use lmodule: mach.lang.module;
+use sess:    mach.lang.session;
+use src:     mach.lang.source;
 
 use mls.features;
 use mls.json;
@@ -83,7 +83,7 @@ fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
     val n:       u32   = project.module_count(root);
     var mi:      u32   = 0;
     for (mi < n && emitted < MAX_RESULTS) {
-        val mid: sess.ModuleId           = mi::sess.ModuleId;
+        val mid: sess.StableModuleId     = project.module_id_at(root, mi);
         val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
         if (sel mvo.some) {
             val mv: project.ModuleView = mvo.some;
@@ -103,7 +103,7 @@ fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
 
 # append every matching symbol `mid` declares, returning the new count
 fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
-    mid: sess.ModuleId, mv: project.ModuleView, uri: str, fqn: str,
+    mid: sess.StableModuleId, mv: project.ModuleView, uri: str, fqn: str,
     query: str, tier: u8, start_count: usize) usize {
     var emitted: usize = start_count;
     var i:       u32   = 0;
@@ -112,12 +112,12 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
         # only declarations this module owns: an imported symbol is reported by
         # the module that declares it, so a name appears once per declaration
         # rather than once per importer
-        if (sym.origin == mid && features.completion_candidate(mv.rr, i)) {
-            val no: opt[str] = intern.lookup(?root.s.interner, sym.name);
+        if (lmodule.stable_same(sym.origin, mid) && features.completion_candidate(mv.rr, rslv.symbol_id(i))) {
+            val no: opt[str] = intern.get(?root.s.interner, sym.name);
             if (sel no.some) {
                 val name: str = no.some;
                 if (match_tier(query, name) == tier) {
-                    val spo: opt[token.Span] = features.decl_name_span_of(mv.a, sym);
+                    val spo: opt[src.Span] = features.decl_name_span_of(mv.a, sym);
                     if (sel spo.some) {
                         if (push_symbol(b, mv.text, uri, spo.some, name,
                             features.lsp_symbol_kind(sym.kind), fqn, emitted > 0)) {
@@ -138,7 +138,7 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
 # identically-named symbols distinguishable - and roots with colliding FQNs are
 # explicitly supported, so this is not cosmetic. a declaration whose name
 # span cannot be reported in the client's buffer is left out
-fun push_symbol(b: *json.Buf, text: positions.Text, uri: str, span: token.Span,
+fun push_symbol(b: *json.Buf, text: positions.Text, uri: str, span: src.Span,
     name: str, kind: i64, container: str, comma: bool) bool {
     if (!positions.maps(text, span)) { ret false; }
     if (comma)                       { json.buf_push_byte(b, ','); }

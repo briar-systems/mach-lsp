@@ -18,7 +18,8 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-use mach.lang.build.outcome;
+use A: std.allocator;
+
 use mach.lang.editor;
 use mach.lang.fail;
 use mach.lang.fe.ast;
@@ -41,7 +42,7 @@ use mls.project;
 # sr:       semantic result, or nil when the document has none
 # a:        parsed Ast
 # rr:       resolve side tables
-# own:      the document's own module id
+# own:      the identity the document's own symbols carry as their origin
 # own_fid:  the document's own source file id
 # root:     the project root that governs it, or nil for a standalone buffer
 # stale:    the snapshot predates this document's text; `text` maps between them
@@ -52,7 +53,7 @@ pub rec Analyzed {
     sr:       *sema.SemaResult;
     a:        *ast.Ast;
     rr:       *rslv.ResolveResult;
-    own:      sess.ModuleId;
+    own:      sess.StableModuleId;
     own_fid:  src.FileId;
     root:     *project.Root;
     stale:    bool;
@@ -103,11 +104,22 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     out.interner = ?es.s.interner;
     out.text     = positions.text_of(fo.some);
     out.root     = nil;
-    out.own      = doc.file_id::sess.ModuleId;
+    out.own      = buffer_module(es, doc.file_id);
     out.own_fid  = doc.file_id;
     out.stale    = false;
     out.current  = true;
     ret true;
+}
+
+# the identity a standalone buffer's symbols carry as their origin. the editor
+# names a standalone buffer's module by the buffer's path; nil when the editor
+# has not analyzed the buffer
+fun buffer_module(es: *editor.EditorSession, fid: src.FileId) sess.StableModuleId {
+    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, fid);
+    if (sel fo.none) { ret sess.STABLE_MODULE_NIL; }
+    val name: res[intern.StrId, A.Error] = intern.add(?es.s.interner, fo.some.path);
+    if (sel name.err) { ret sess.STABLE_MODULE_NIL; }
+    ret sess.stable_module_id_lookup(es.s, name.ok);
 }
 
 # resolve `uri` to its current analysis whether or not the document is open
@@ -136,9 +148,9 @@ pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *do
 
     val root: *project.Root = project.root_for_loaded(ws, uri);
     if (root == nil) { ret false; }
-    val mo: opt[sess.ModuleId] = project.module_for_uri(ws, root, uri);
+    val mo: opt[sess.StableModuleId] = project.module_for_uri(ws, root, uri);
     if (sel mo.none) { ret false; }
-    val mid:  sess.ModuleId           = mo.some;
+    val mid:  sess.StableModuleId     = mo.some;
     val mv_o: opt[project.ModuleView] = project.module_view(ws, root, mid);
     if (sel mv_o.none) { ret false; }
     val mv: project.ModuleView = mv_o.some;
@@ -172,10 +184,10 @@ pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.Ana
     out.a  = nil;
     out.rr = nil;
     out.sr = nil;
-    var req: editor.AnalysisRequest                   = editor.analysis_request(fid, phase);
-    val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
+    var req: editor.AnalysisRequest                = editor.analysis_request(fid, phase);
+    val ar:  res[editor.AnalysisResult, fail.Fail] = editor.analyze(es, ?req);
     if (sel ar.err) {
-        var f: outcome.Fail = ar.err;
+        var f: fail.Fail = ar.err;
         editor.fail_dnit(es, ?f);
         ret false;
     }
@@ -227,7 +239,7 @@ pub fun syntax_of(es: *editor.EditorSession, doc: *documents.Document, out: *Ana
     out.sr       = nil;
     out.a        = tree;
     out.rr       = nil;
-    out.own      = sess.MODULE_NIL;
+    out.own      = sess.STABLE_MODULE_NIL;
     out.own_fid  = doc.file_id;
     out.root     = nil;
     out.stale    = false;

@@ -30,7 +30,6 @@ use std.allocator.Allocator;
 
 use diag: mach.lang.diagnostic;
 use mach.lang.editor;
-use mach.lang.fe.token;
 use sess:    mach.lang.session;
 use src:     mach.lang.source;
 use sj:      std.data.json;
@@ -39,6 +38,7 @@ use strutil: std.text.string;
 use mls.analysis;
 use mls.documents;
 use mls.json;
+use mls.notes;
 use mls.positions;
 use mls.project;
 use mls.render;
@@ -107,7 +107,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
     var i:       usize = 0;
     for (i < s.diags.items.len) {
         val dg: *diag.Diagnostic = ?s.diags.items.data[i];
-        if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
+        if (src.file_same(dg.loc.file, v.file_id) && overlaps(dg.loc.span, lo, hi)) {
             var f: usize = 0;
             for (f < dg.fixes.len) {
                 if (push_action(?b, ws, alloc, ?s.sources, v.text, uri, dg, ?dg.fixes.data[f], emitted > 0)) {
@@ -141,7 +141,7 @@ fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources
     json.buf_push(b, ",\"diagnostics\":[{\"range\":");
     render.span_range(b, text, dg.loc.span);
     json.buf_push(b, ",\"severity\":");
-    json.buf_push_i64(b, severity_of(dg.severity));
+    json.buf_push_i64(b, notes.lsp_severity(dg));
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     json.buf_push_quoted(b, dg.message);
     json.buf_push(b, "}]");
@@ -194,7 +194,7 @@ fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources:
 
 # the source file an edit addresses, or nil
 fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
-    val fo: opt[*src.SourceFile] = src.get(sources, ed.loc.file_id);
+    val fo: opt[*src.SourceFile] = src.get(sources, ed.loc.file);
     if (sel fo.none) { ret nil; }
     ret fo.some;
 }
@@ -204,7 +204,7 @@ fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
 # Touching rather than containing: a client asks for actions at a cursor, which
 # is a zero-length range, and a fix for the error under that cursor must be
 # offered even though nothing is selected.
-fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
+fun overlaps(span: src.Span, lo: usize, hi: usize) bool {
     val start: usize = span.offset;
     var end:   usize = span.offset + span.len;
     if (span.len == 0) { end = start; }
@@ -235,12 +235,4 @@ fun wants_quickfix(params: *sj.Value, alloc: *Allocator) bool {
         i = i + 1;
     }
     ret false;
-}
-
-# the LSP severity for a compiler severity
-fun severity_of(sev: diag.Severity) i64 {
-    if (sev == diag.SEVERITY_ERROR)   { ret 1; }
-    if (sev == diag.SEVERITY_WARNING) { ret 2; }
-    if (sev == diag.SEVERITY_INFO)    { ret 3; }
-    ret 4;
 }

@@ -26,8 +26,8 @@ use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.stmt;
-use mach.lang.fe.token;
-use sj: std.data.json;
+use src: mach.lang.source;
+use sj:  std.data.json;
 
 use mls.analysis;
 use mls.documents;
@@ -85,7 +85,7 @@ pub fun folding_range(es: *editor.EditorSession, alloc: *Allocator, docs: *docum
 # run ends at the first declaration of another kind, which is the shape a
 # module's import block has.
 fun collect(e: *Emitter, a: *ast.Ast) {
-    var run:    token.Span;
+    var run:    src.Span;
     var in_run: bool = false;
     val n:      u32  = features.top_level_count(a);
     var i:      u32  = 0;
@@ -154,7 +154,7 @@ rec Emitter {
 # kind:  the FoldingRangeKind, or nil for a plain region
 # brace: the span ends at a closing brace, reported as `endCharacter` so the
 #        brace stays in view
-fun push(e: *Emitter, span: token.Span, kind: str, brace: bool) {
+fun push(e: *Emitter, span: src.Span, kind: str, brace: bool) {
     if (span.len == 0) { ret; }
     val so: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset));
     val eo: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset + span.len - 1));
@@ -183,16 +183,16 @@ fun push(e: *Emitter, span: token.Span, kind: str, brace: bool) {
 }
 
 # the span from the start of `a` to the end of `b`
-fun join(a: token.Span, b: token.Span) token.Span {
-    var s: token.Span;
+fun join(a: src.Span, b: src.Span) src.Span {
+    var s: src.Span;
     s.offset = a.offset;
     s.len    = b.offset + b.len - a.offset;
     ret s;
 }
 
 # an empty span at `offset`
-fun point(offset: usize) token.Span {
-    var s: token.Span;
+fun point(offset: usize) src.Span {
+    var s: src.Span;
     s.offset = offset;
     s.len    = 0;
     ret s;

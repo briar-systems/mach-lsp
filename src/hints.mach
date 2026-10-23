@@ -36,7 +36,6 @@ use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.stmt;
 use rslv: mach.lang.fe.resolve;
 use mach.lang.fe.sema.typename;
-use mach.lang.fe.token;
 use sess: mach.lang.session;
 use src:  mach.lang.source;
 use mach.lang.type;
@@ -88,8 +87,8 @@ pub fun inlay_hints(ws: *project.Workspace, es: *editor.EditorSession, alloc: *A
 
     var emitted: usize = 0;
     var ei:      usize = 0;
-    for (ei < an.a.expr_len && emitted < MAX_HINTS) {
-        emitted = push_call_hints(?b, ws, an, uri, ei::id.ExprId, lo, hi, emitted, alloc);
+    for (ei < an.a.exprs.len && emitted < MAX_HINTS) {
+        emitted = push_call_hints(?b, ws, an, uri, id.expr(ei::u32), lo, hi, emitted, alloc);
         ei      = ei + 1;
     }
 
@@ -111,7 +110,7 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
     val e: *aexpr.Expr = eo.some;
     if (e.kind != aexpr.EXPR_KIND_CALL) { ret count; }
     val nargs: u32 = e.data.call.args_len;
-    if (nargs == 0 || an.a.expr_ids == nil) { ret count; }
+    if (nargs == 0 || an.a.expr_ids.data == nil) { ret count; }
 
     # the callee's parameter names live in its declaration, which is reached
     # through the same pivot definition uses
@@ -129,11 +128,11 @@ fun push_call_hints(b: *json.Buf, ws: *project.Workspace, an: analysis.Analyzed,
     var emitted: usize = count;
     var i:       u32   = 0;
     for (i < nargs && i < d.data.fun_.params_len && emitted < MAX_HINTS) {
-        val arg: id.ExprId        = an.a.expr_ids[(e.data.call.args_start + i)::usize];
+        val arg: id.ExprId        = an.a.expr_ids.data[(e.data.call.args_start + i)::usize];
         val ao:  opt[*aexpr.Expr] = ast.get_expr(an.a, arg);
         if (sel ao.some) {
-            val arg_span: token.Span = features.text_span_of_expr(ao.some);
-            val at:       usize      = arg_span.offset;
+            val arg_span: src.Span = features.text_span_of_expr(ao.some);
+            val at:       usize    = arg_span.offset;
             if (at >= lo && at <= hi && wants_hint(ao.some)) {
                 val pname: str = param_name(site_a, site_f, d.data.fun_.params_start + i, alloc);
                 if (pname != nil) {
@@ -194,17 +193,17 @@ fun callee_file(ws: *project.Workspace, an: analysis.Analyzed, uri: str, callee:
 
 # the symbol the callee expression binds
 fun callee_symbol(an: analysis.Analyzed, callee: id.ExprId) opt[*rslv.Symbol] {
-    if (an.rr == nil || an.rr.expr_resolved == nil)               { ret opt[*rslv.Symbol].none{}; }
-    if (callee == id.EXPR_NIL || callee::u32 >= an.rr.expr_count) { ret opt[*rslv.Symbol].none{}; }
-    val sid: rslv.SymbolId = an.rr.expr_resolved[callee];
-    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret opt[*rslv.Symbol].none{}; }
-    ret opt[*rslv.Symbol].some{?an.rr.symbols[sid]};
+    if (an.rr == nil || an.rr.expr_resolved == nil)                          { ret opt[*rslv.Symbol].none{}; }
+    if (id.expr_is_nil(callee) || id.expr_index(callee) >= an.rr.expr_count) { ret opt[*rslv.Symbol].none{}; }
+    val sid: rslv.SymbolId = an.rr.expr_resolved[id.expr_index(callee)];
+    if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= an.rr.symbol_count) { ret opt[*rslv.Symbol].none{}; }
+    ret opt[*rslv.Symbol].some{?an.rr.symbols[rslv.symbol_index(sid)]};
 }
 
 # the declared name of the parameter in `typed_names` slot `slot`
 fun param_name(a: *ast.Ast, file: positions.Text, slot: u32, alloc: *Allocator) str {
-    if (a.typed_names == nil) { ret nil; }
-    val tn: *decl.TypedName = ?a.typed_names[slot::usize];
+    if (a.typed_names.data == nil) { ret nil; }
+    val tn: *decl.TypedName = ?a.typed_names.data[slot::usize];
     if (tn.name.len == 0) { ret nil; }
     ret positions.span_text(file, tn.name, alloc);
 }
@@ -227,7 +226,7 @@ fun wants_hint(e: *aexpr.Expr) bool {
 
 # whether the argument's own text already spells the parameter name, making the
 # hint pure noise
-fun names_itself(file: *src.SourceFile, span: token.Span, name: str) bool {
+fun names_itself(file: *src.SourceFile, span: src.Span, name: str) bool {
     if (span.len != str_len(name)) { ret false; }
     var i: usize = 0;
     for (i < span.len) {
@@ -245,11 +244,11 @@ fun names_itself(file: *src.SourceFile, span: token.Span, name: str) bool {
 # The hint describes the argument, so an argument the client has since edited is
 # not labelled: nothing is written, and false returned, unless the whole
 # argument is carried into the client's buffer.
-fun push_hint(b: *json.Buf, t: positions.Text, arg: token.Span, text: str, comma: bool) bool {
-    val lo: opt[token.Span] = positions.live_span(t, arg, false);
+fun push_hint(b: *json.Buf, t: positions.Text, arg: src.Span, text: str, comma: bool) bool {
+    val lo: opt[src.Span] = positions.live_span(t, arg, false);
     if (sel lo.none) { ret false; }
     if (comma)       { json.buf_push_byte(b, ','); }
-    var at: token.Span;
+    var at: src.Span;
     at.offset = arg.offset;
     at.len    = 0;
     json.buf_push(b, "{\"position\":");
@@ -276,7 +275,7 @@ fun is_placeholder(text: str) bool {
 
 # the `start` of a zero-length span, which is the hint's anchor. the caller has
 # checked that the span maps
-fun push_position(b: *json.Buf, t: positions.Text, span: token.Span) {
+fun push_position(b: *json.Buf, t: positions.Text, span: src.Span) {
     val ro: opt[positions.LspRange] = positions.span_range(t, span);
     if (sel ro.none) { ret; }
     val r: positions.LspRange = ro.some;

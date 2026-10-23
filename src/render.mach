@@ -29,7 +29,6 @@ use std.types.string.str;
 use std.allocator.Allocator;
 
 use mach.lang.fe.ast.decl;
-use mach.lang.fe.token;
 use src: mach.lang.source;
 
 use mls.json;
@@ -86,7 +85,7 @@ pub fun range(b: *json.Buf, r: positions.LspRange) {
 # t:    the text the span indexes
 # span: byte span to convert
 # ret:  whether a range was written
-pub fun span_range(b: *json.Buf, t: positions.Text, span: token.Span) bool {
+pub fun span_range(b: *json.Buf, t: positions.Text, span: src.Span) bool {
     val ro: opt[positions.LspRange] = positions.span_range(t, span);
     if (sel ro.none) { ret false; }
     range(b, ro.some);
@@ -95,7 +94,7 @@ pub fun span_range(b: *json.Buf, t: positions.Text, span: token.Span) bool {
 
 # as `span_range`, for a range that surrounds what it describes; see
 # `positions.maps_around`
-pub fun span_range_around(b: *json.Buf, t: positions.Text, span: token.Span) bool {
+pub fun span_range_around(b: *json.Buf, t: positions.Text, span: src.Span) bool {
     val ro: opt[positions.LspRange] = positions.span_range_around(t, span);
     if (sel ro.none) { ret false; }
     range(b, ro.some);
@@ -109,7 +108,7 @@ pub fun span_range_around(b: *json.Buf, t: positions.Text, span: token.Span) boo
 # uri:  document URI of `t`
 # span: byte span to report
 # ret:  whether a location was written; nothing is when the span does not map
-pub fun location(b: *json.Buf, t: positions.Text, uri: str, span: token.Span) bool {
+pub fun location(b: *json.Buf, t: positions.Text, uri: str, span: src.Span) bool {
     val ro: opt[positions.LspRange] = positions.span_range(t, span);
     if (sel ro.none) { ret false; }
     json.buf_push(b, "{\"uri\":");
@@ -127,7 +126,7 @@ pub fun location(b: *json.Buf, t: positions.Text, uri: str, span: token.Span) bo
 # span:     byte span to replace
 # new_text: replacement text, quoted and escaped here
 # ret:      whether an edit was written; nothing is when the span does not map
-pub fun text_edit(b: *json.Buf, t: positions.Text, span: token.Span, new_text: str) bool {
+pub fun text_edit(b: *json.Buf, t: positions.Text, span: src.Span, new_text: str) bool {
     val ro: opt[positions.LspRange] = positions.span_range(t, span);
     if (sel ro.none) { ret false; }
     json.buf_push(b, "{\"range\":");
@@ -246,25 +245,25 @@ pub fun reply_empty_edit(alloc: *Allocator, id_raw: str) {
 
 use std.allocator.page;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 # a SourceFile over `text` with a real line index
 #
-# `src.position` binary-searches `line_starts` and reads `line_starts[lo - 1]`,
+# `src.position` binary-searches `lines.starts` and reads `lines.starts[lo - 1]`,
 # so a stub without one is a nil dereference rather than a degenerate result.
 # `starts` must hold the byte offset of every line, `0` first.
 #[testing]
 fun stub_file(text: str, starts: *usize, nlines: usize) src.SourceFile {
     var f: src.SourceFile;
-    f.path        = "stub.mach";
-    f.text        = text;
-    f.line_starts = starts;
-    f.line_len    = nlines;
+    f.path  = "stub.mach";
+    f.text  = text;
+    f.lines = src.Lines{starts: starts, len: nlines, n: str_len(text)};
     ret f;
 }
 
 #[testing]
-fun span_at(offset: usize, len: usize) token.Span {
-    var s: token.Span;
+fun span_at(offset: usize, len: usize) src.Span {
+    var s: src.Span;
     s.offset = offset;
     s.len    = len;
     ret s;

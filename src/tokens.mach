@@ -37,8 +37,7 @@ use mach.lang.editor;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.token;
+use rslv:    mach.lang.fe.resolve;
 use src:     mach.lang.source;
 use sj:      std.data.json;
 use strutil: std.text.string;
@@ -409,11 +408,11 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     var n: usize = 0;
 
     var di: usize = 0;
-    for (di < an.a.decl_len && n < cap) {
-        val d_opt: opt[*decl.Decl] = ast.get_decl(an.a, di::id.DeclId);
+    for (di < an.a.decls.len && n < cap) {
+        val d_opt: opt[*decl.Decl] = ast.get_decl(an.a, id.decl(di::u32));
         if (sel d_opt.some) {
-            val d:   *decl.Decl      = d_opt.some;
-            val nso: opt[token.Span] = features.decl_name_span(d);
+            val d:   *decl.Decl    = d_opt.some;
+            val nso: opt[src.Span] = features.decl_name_span(d);
             if (sel nso.some) {
                 n = push(out, n, cap, w, nso.some,
                     decl_token_type(d.kind), M_DECLARATION);
@@ -424,11 +423,11 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     }
 
     var ei: usize = 0;
-    for (ei < an.a.expr_len && n < cap) {
-        val so: opt[rslv.SymbolId] = expr_symbol(an, ei::id.ExprId);
+    for (ei < an.a.exprs.len && n < cap) {
+        val so: opt[rslv.SymbolId] = expr_symbol(an, id.expr(ei::u32));
         if (sel so.some) {
-            val sid: rslv.SymbolId   = so.some;
-            val spo: opt[token.Span] = features.expr_ref_span(an.a, an.rr, ei::id.ExprId, sid);
+            val sid: rslv.SymbolId = so.some;
+            val spo: opt[src.Span] = features.expr_ref_span(an.a, an.rr, id.expr(ei::u32), sid);
             if (sel spo.some) {
                 n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
             }
@@ -437,11 +436,11 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     }
 
     var ti: usize = 0;
-    for (ti < an.a.type_len && n < cap) {
-        val so: opt[rslv.SymbolId] = type_symbol(an, ti::id.TypeId);
+    for (ti < an.a.types.len && n < cap) {
+        val so: opt[rslv.SymbolId] = type_symbol(an, id.type(ti::u32));
         if (sel so.some) {
-            val sid: rslv.SymbolId   = so.some;
-            val spo: opt[token.Span] = features.type_ref_span(an.a, an.rr, ti::id.TypeId, sid);
+            val sid: rslv.SymbolId = so.some;
+            val spo: opt[src.Span] = features.type_ref_span(an.a, an.rr, id.type(ti::u32), sid);
             if (sel spo.some) {
                 n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
             }
@@ -485,16 +484,16 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, w: Window, out: *Tok, 
 
     var g: u32 = 0;
     for (g < gen_len && n < cap) {
-        if (an.a.generic_names != nil) {
-            n = push(out, n, cap, w, an.a.generic_names[(gen_start + g)::usize],
+        if (an.a.generic_names.data != nil) {
+            n = push(out, n, cap, w, an.a.generic_names.data[(gen_start + g)::usize],
                 T_TYPE_PARAMETER, M_DECLARATION);
         }
         g = g + 1;
     }
     var f: u32 = 0;
     for (f < fields_len && n < cap) {
-        if (an.a.typed_names != nil) {
-            val tn: *decl.TypedName = ?an.a.typed_names[(fields_start + f)::usize];
+        if (an.a.typed_names.data != nil) {
+            val tn: *decl.TypedName = ?an.a.typed_names.data[(fields_start + f)::usize];
             n = push(out, n, cap, w, tn.name, member_type, M_DECLARATION);
         }
         f = f + 1;
@@ -503,16 +502,16 @@ fun collect_members(an: analysis.Analyzed, d: *decl.Decl, w: Window, out: *Tok, 
 }
 
 fun expr_symbol(an: analysis.Analyzed, eid: id.ExprId) opt[rslv.SymbolId] {
-    if (an.rr.expr_resolved == nil || eid::u32 >= an.rr.expr_count) { ret none_sym(); }
-    val sid: rslv.SymbolId = an.rr.expr_resolved[eid];
-    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
+    if (an.rr.expr_resolved == nil || id.expr_index(eid) >= an.rr.expr_count) { ret none_sym(); }
+    val sid: rslv.SymbolId = an.rr.expr_resolved[id.expr_index(eid)];
+    if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= an.rr.symbol_count) { ret none_sym(); }
     ret some_sym(sid);
 }
 
 fun type_symbol(an: analysis.Analyzed, tid: id.TypeId) opt[rslv.SymbolId] {
-    if (an.rr.type_resolved == nil || tid::u32 >= an.rr.type_count) { ret none_sym(); }
-    val sid: rslv.SymbolId = an.rr.type_resolved[tid];
-    if (sid == rslv.SYMBOL_NIL || sid >= an.rr.symbol_count) { ret none_sym(); }
+    if (an.rr.type_resolved == nil || id.type_index(tid) >= an.rr.type_count) { ret none_sym(); }
+    val sid: rslv.SymbolId = an.rr.type_resolved[id.type_index(tid)];
+    if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= an.rr.symbol_count) { ret none_sym(); }
     ret some_sym(sid);
 }
 
@@ -526,7 +525,7 @@ fun none_sym() opt[rslv.SymbolId] {
 
 # the legend index for a resolved symbol
 fun symbol_token_type(an: analysis.Analyzed, sid: rslv.SymbolId) i64 {
-    val sym: *rslv.Symbol = ?an.rr.symbols[sid];
+    val sym: *rslv.Symbol = ?an.rr.symbols[rslv.symbol_index(sid)];
     if (sym.kind == rslv.SYM_FUN)     { ret T_FUNCTION; }
     if (sym.kind == rslv.SYM_REC)     { ret T_TYPE; }
     if (sym.kind == rslv.SYM_UNI)     { ret T_TYPE; }
@@ -549,7 +548,7 @@ fun decl_token_type(kind: decl.DeclKind) i64 {
     ret T_VARIABLE;
 }
 
-fun push(out: *Tok, count: usize, cap: usize, w: Window, span: token.Span, kind: i64, mods: i64) usize {
+fun push(out: *Tok, count: usize, cap: usize, w: Window, span: src.Span, kind: i64, mods: i64) usize {
     if (count >= cap || span.len == 0) { ret count; }
     if (!touches(w, span))             { ret count; }
     out[count].offset = span.offset;
@@ -560,7 +559,7 @@ fun push(out: *Tok, count: usize, cap: usize, w: Window, span: token.Span, kind:
 }
 
 # whether a token has any byte inside the window
-fun touches(w: Window, span: token.Span) bool {
+fun touches(w: Window, span: src.Span) bool {
     if (span.offset >= w.hi)            { ret false; }
     if (span.offset + span.len <= w.lo) { ret false; }
     ret true;
@@ -610,10 +609,10 @@ fun encode(t: positions.Text, toks: *Tok, n: usize, out: *i64) usize {
     var written:   usize = 0;
     var i:         usize = 0;
     for (i < n) {
-        var span: token.Span;
+        var span: src.Span;
         span.offset = toks[i].offset;
         span.len    = toks[i].len;
-        val lo: opt[token.Span] = positions.live_span(t, span, false);
+        val lo: opt[src.Span] = positions.live_span(t, span, false);
         if (sel lo.none) {
             i = i + 1;
             cnt;

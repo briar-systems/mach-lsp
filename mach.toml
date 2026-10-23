@@ -2,7 +2,7 @@
 id = "mls"
 version = "2.1.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 mach = "^6"
 
 [target.linux-x86_64]
@@ -37,31 +37,27 @@ abi = "aapcs64"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.mls]
 kind = "bin"
 entry = "bin/main.mach"
-out = "bin/mls{artifact.suffix}"
+out = "{project.work}/bin/mls{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+ref = "branch/dev"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v6.8.0"
+ref = "branch/dev"
