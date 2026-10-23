@@ -29,18 +29,16 @@ use std.allocator.reallocate;
 use mem: std.memory;
 
 use mach.lang.diagnostic;
+use mach.lang.editor;
 use mach.lang.fail;
-use mach.lang.fe.ast;
 use mach.lang.fe.lexer;
-use mach.lang.fe.parser;
-use mach.lang.fe.parser.state;
 use mach.lang.fe.token;
 use src: mach.lang.source;
 
 # the spans one file's rename rewrites, in the order they were found
 pub rec Spans {
     alloc: *Allocator;
-    items: *token.Span;
+    items: *src.Span;
     len:   usize;
     cap:   usize;
 }
@@ -50,7 +48,7 @@ pub fun spans_init(alloc: *Allocator) Spans {
 }
 
 pub fun spans_dnit(s: *Spans) {
-    if (s.items != nil) { deallocate[token.Span](s.alloc, s.items, s.cap); }
+    if (s.items != nil) { deallocate[src.Span](s.alloc, s.items, s.cap); }
     s.items = nil;
     s.len   = 0;
     s.cap   = 0;
@@ -62,17 +60,17 @@ pub fun spans_clear(s: *Spans) {
 }
 
 # ret: false when memory ran out
-pub fun spans_push(s: *Spans, span: token.Span) bool {
+pub fun spans_push(s: *Spans, span: src.Span) bool {
     if (s.len == s.cap) {
         var cap: usize = s.cap * 2;
         if (cap == 0) { cap = 16; }
         if (s.items == nil) {
-            val r: res[*token.Span, allocator.Error] = allocate[token.Span](s.alloc, cap);
+            val r: res[*src.Span, allocator.Error] = allocate[src.Span](s.alloc, cap);
             if (sel r.err) { ret false; }
             s.items = r.ok;
         }
         or {
-            val r: res[*token.Span, allocator.Error] = reallocate[token.Span](s.alloc, s.items, s.cap, cap);
+            val r: res[*src.Span, allocator.Error] = reallocate[src.Span](s.alloc, s.items, s.cap, cap);
             if (sel r.err) { ret false; }
             s.items = r.ok;
         }
@@ -112,7 +110,7 @@ pub fun apply(alloc: *Allocator, text: str, spans: *Spans, name: str) str {
     var from: usize = 0;
     var i:    usize = 0;
     for (i < spans.len) {
-        val s: token.Span = spans.items[i];
+        val s: src.Span = spans.items[i];
         if (s.offset >= from && s.offset + s.len <= n) {
             size = size + (s.offset - from) + repl;
             from = s.offset + s.len;
@@ -128,7 +126,7 @@ pub fun apply(alloc: *Allocator, text: str, spans: *Spans, name: str) str {
     from = 0;
     i    = 0;
     for (i < spans.len) {
-        val s: token.Span = spans.items[i];
+        val s: src.Span = spans.items[i];
         if (s.offset >= from && s.offset + s.len <= n) {
             copy(out, ?at, text, from, s.offset - from);
             copy(out, ?at, name, 0, repl);
@@ -156,8 +154,8 @@ fun copy(out: *u8, at: *usize, from: str, offset: usize, len: usize) {
 fun sort(s: *Spans) {
     var i: usize = 1;
     for (i < s.len) {
-        val cur: token.Span = s.items[i];
-        var j:   usize      = i;
+        val cur: src.Span = s.items[i];
+        var j:   usize    = i;
         for (j > 0 && s.items[j - 1].offset > cur.offset) {
             s.items[j] = s.items[j - 1];
             j          = j - 1;
@@ -173,92 +171,27 @@ pub val SHAPE_CHANGED:   u8 = 1;
 pub val SHAPE_UNCHECKED: u8 = 2;
 
 # whether `after` parses to the same tree as `before`, node for node, with no
-# more errors. a file that does not lex or parse before cannot be checked
+# more errors. a file whose parse is not accepted before cannot be checked
 pub fun shape(alloc: *Allocator, before: str, after: str) u8 {
-    var bd:  diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
-    var ad:  diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
-    var b:   Parse                      = parse(alloc, before, ?bd);
-    var a:   Parse                      = parse(alloc, after, ?ad);
-    var out: u8                         = SHAPE_UNCHECKED;
-    if (b.ok) {
+    var b: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, before);
+    if (sel b.err) { ret SHAPE_UNCHECKED; }
+    var out: u8 = SHAPE_UNCHECKED;
+    if (sel b.ok.failure.none && fail.is_accepted(b.ok.status)) {
         out = SHAPE_CHANGED;
-        if (a.ok && diagnostic.error_count(?ad) <= diagnostic.error_count(?bd)
-            && (a.accepted || !b.accepted) && same_nodes(?b.tree, ?a.tree)) {
-            out = SHAPE_SAME;
+        var a: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, after);
+        if (sel a.ok) {
+            if (sel a.ok.failure.none && fail.is_accepted(a.ok.status)
+                && diagnostic.error_count(a.ok.diagnostics) <= diagnostic.error_count(b.ok.diagnostics)) {
+                val same: res[bool, fail.Fail] = editor.same_shape(?b.ok, ?a.ok);
+                if (sel same.ok) {
+                    if (same.ok) { out = SHAPE_SAME; }
+                }
+            }
+            editor.analysis_dnit(?a.ok);
         }
     }
-    parse_dnit(alloc, ?b);
-    parse_dnit(alloc, ?a);
-    diagnostic.store_dnit(?bd);
-    diagnostic.store_dnit(?ad);
+    editor.analysis_dnit(?b.ok);
     ret out;
-}
-
-rec Parse {
-    ok:       bool;
-    accepted: bool;
-    stream:   lexer.TokenStream;
-    tree:     ast.Ast;
-}
-
-fun parse(alloc: *Allocator, text: str, diags: *diagnostic.DiagnosticStore) Parse {
-    var p: Parse;
-    p.ok       = false;
-    p.accepted = false;
-    val lexed: res[lexer.TokenStream, fail.Fail] = lexer.tokenize(text, alloc, src.FILE_NIL);
-    if (sel lexed.err) { ret p; }
-    p.stream = lexed.ok;
-    if (p.stream.error_len != 0) {
-        lexer.dnit(?p.stream, alloc);
-        ret p;
-    }
-    p.tree = ast.init(alloc, src.FILE_NIL);
-    val checked: res[fail.PhaseStatus, state.ParseFail] = parser.parse(?p.stream, ?p.tree, diags);
-    if (sel checked.err) {
-        ast.dnit(?p.tree);
-        lexer.dnit(?p.stream, alloc);
-        ret p;
-    }
-    p.ok       = true;
-    p.accepted = fail.is_accepted(checked.ok);
-    ret p;
-}
-
-fun parse_dnit(alloc: *Allocator, p: *Parse) {
-    if (!p.ok) { ret; }
-    ast.dnit(?p.tree);
-    lexer.dnit(?p.stream, alloc);
-    p.ok = false;
-}
-
-fun same_nodes(x: *ast.Ast, y: *ast.Ast) bool {
-    if (x.expr_len != y.expr_len || x.stmt_len != y.stmt_len || x.decl_len != y.decl_len
-        || x.type_len != y.type_len || x.module_len != y.module_len
-        || x.typed_name_len != y.typed_name_len || x.tag_case_len != y.tag_case_len
-        || x.field_init_len != y.field_init_len || x.generic_name_len != y.generic_name_len) {
-        ret false;
-    }
-    var i: usize = 0;
-    for (i < x.expr_len) {
-        if (x.exprs[i].kind != y.exprs[i].kind) { ret false; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < x.stmt_len) {
-        if (x.stmts[i].kind != y.stmts[i].kind) { ret false; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < x.decl_len) {
-        if (x.decls[i].kind != y.decls[i].kind || x.decls[i].flags != y.decls[i].flags) { ret false; }
-        i = i + 1;
-    }
-    i = 0;
-    for (i < x.type_len) {
-        if (x.types[i].kind != y.types[i].kind) { ret false; }
-        i = i + 1;
-    }
-    ret true;
 }
 
 use std.allocator.page;
@@ -285,9 +218,9 @@ test spans_apply_in_order_once_each {
     var pa: Allocator;
     page.make(?pa);
     var s: Spans = spans_init(?pa);
-    spans_push(?s, token.Span{offset: 8, len: 3});
-    spans_push(?s, token.Span{offset: 0, len: 3});
-    spans_push(?s, token.Span{offset: 8, len: 3});
+    spans_push(?s, src.Span{offset: 8, len: 3});
+    spans_push(?s, src.Span{offset: 0, len: 3});
+    spans_push(?s, src.Span{offset: 8, len: 3});
     val out:  str  = apply(?pa, "foo(); (foo);", ?s, "barbaz");
     var fail: bool = out == nil || !str_equals(out, "barbaz(); (barbaz);");
     applied_free(?pa, out);
