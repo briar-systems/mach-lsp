@@ -79,8 +79,8 @@ rec Lines {
 # ret:     false when memory ran out; `out` is then empty
 pub fun compute(alloc: *Allocator, old: *src.SourceFile, old_len: usize, new: *src.SourceFile, new_len: usize, out: *Windows) bool {
     out.len = 0;
-    val a: Lines = Lines{text: old.text, len: old_len, starts: old.line_starts, count: old.line_len};
-    val b: Lines = Lines{text: new.text, len: new_len, starts: new.line_starts, count: new.line_len};
+    val a: Lines = Lines{text: old.text, len: old_len, starts: old.lines.starts, count: old.lines.len};
+    val b: Lines = Lines{text: new.text, len: new_len, starts: new.lines.starts, count: new.lines.len};
 
     # equal leading and trailing lines never take part in the comparison
     var lo: usize = 0;
@@ -309,12 +309,11 @@ fun t_file(pa: *Allocator, text: str) src.SourceFile {
         i = i + 1;
     }
     var f: src.SourceFile;
-    f.present     = true;
-    f.revision    = 0;
-    f.path        = "t.mach";
-    f.text        = text;
-    f.line_starts = starts;
-    f.line_len    = lines;
+    f.present  = true;
+    f.revision = 0;
+    f.path     = "t.mach";
+    f.text     = text;
+    f.lines    = src.Lines{starts: starts, len: lines, n: n};
     ret f;
 }
 

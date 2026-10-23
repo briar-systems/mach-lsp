@@ -31,8 +31,8 @@ use mach.lang.editor;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
-use mach.lang.fe.token;
-use sj: std.data.json;
+use src: mach.lang.source;
+use sj:  std.data.json;
 
 use mls.analysis;
 use mls.documents;
@@ -100,14 +100,14 @@ fun push_chain(b: *json.Buf, an: analysis.Analyzed, pos: *sj.Value, alloc: *Allo
         push_cursor(b, line, ch);
         ret;
     }
-    val sa: res[*token.Span, allocator.Error] = allocate[token.Span](alloc, count);
+    val sa: res[*src.Span, allocator.Error] = allocate[src.Span](alloc, count);
     if (sel sa.err) {
         push_cursor(b, line, ch);
         ret;
     }
-    val spans: *token.Span = sa.ok;
-    val n:     usize       = collect(an.a, offset, spans, count);
-    sort.sort_by[token.Span](spans, n, outer_first);
+    val spans: *src.Span = sa.ok;
+    val n:     usize     = collect(an.a, offset, spans, count);
+    sort.sort_by[src.Span](spans, n, outer_first);
     val depth: usize = nest(spans, n);
 
     # the innermost step is the value; each outer step is its `parent`
@@ -124,7 +124,7 @@ fun push_chain(b: *json.Buf, an: analysis.Analyzed, pos: *sj.Value, alloc: *Allo
         json.buf_push_byte(b, '}');
         open = open - 1;
     }
-    deallocate[token.Span](alloc, spans, count);
+    deallocate[src.Span](alloc, spans, count);
 }
 
 # an empty SelectionRange at the requested position
@@ -151,13 +151,13 @@ fun push_cursor(b: *json.Buf, line: i64, ch: i64) {
 # out:    where to write spans, or nil to count
 # cap:    how many `out` holds
 # ret:    the number of spans holding the cursor
-fun collect(a: *ast.Ast, offset: usize, out: *token.Span, cap: usize) usize {
+fun collect(a: *ast.Ast, offset: usize, out: *src.Span, cap: usize) usize {
     var n: usize = 0;
     var i: usize = 0;
-    for (i < a.decl_len) {
-        val d: *decl.Decl = ?a.decls[i];
+    for (i < a.decls.len) {
+        val d: *decl.Decl = ?a.decls.data[i];
         n = push(out, n, cap, d.span, offset);
-        val nso: opt[token.Span] = features.decl_name_span(d);
+        val nso: opt[src.Span] = features.decl_name_span(d);
         if (sel nso.some) { n = push(out, n, cap, nso.some, offset); }
         if (d.kind == decl.DECL_KIND_USE) {
             n = push(out, n, cap, d.data.use_.alias, offset);
@@ -170,68 +170,68 @@ fun collect(a: *ast.Ast, offset: usize, out: *token.Span, cap: usize) usize {
         i = i + 1;
     }
     i = 0;
-    for (i < a.stmt_len) {
-        n = push(out, n, cap, a.stmts[i].span, offset);
+    for (i < a.stmts.len) {
+        n = push(out, n, cap, a.stmts.data[i].span, offset);
         i = i + 1;
     }
     i = 0;
-    for (i < a.expr_len) {
-        val e: *expr.Expr = ?a.exprs[i];
+    for (i < a.exprs.len) {
+        val e: *expr.Expr = ?a.exprs.data[i];
         n = push(out, n, cap, e.span, offset);
         if (e.kind == expr.EXPR_KIND_MEMBER) { n = push(out, n, cap, e.data.member.name, offset); }
-        val tso: opt[token.Span] = features.token_span_of_expr(e);
+        val tso: opt[src.Span] = features.token_span_of_expr(e);
         if (sel tso.some) { n = push(out, n, cap, tso.some, offset); }
         i = i + 1;
     }
     i = 0;
-    for (i < a.type_len) {
-        n = push(out, n, cap, a.types[i].span, offset);
+    for (i < a.types.len) {
+        n = push(out, n, cap, a.types.data[i].span, offset);
         i = i + 1;
     }
     i = 0;
-    for (i < a.typed_name_len) {
-        n = push(out, n, cap, a.typed_names[i].name, offset);
+    for (i < a.typed_names.len) {
+        n = push(out, n, cap, a.typed_names.data[i].name, offset);
         i = i + 1;
     }
     i = 0;
-    for (i < a.tag_case_len) {
-        n = push(out, n, cap, a.tag_cases[i].name, offset);
+    for (i < a.tag_cases.len) {
+        n = push(out, n, cap, a.tag_cases.data[i].name, offset);
         i = i + 1;
     }
     i = 0;
-    for (i < a.field_init_len) {
-        n = push(out, n, cap, a.field_inits[i].name, offset);
+    for (i < a.field_inits.len) {
+        n = push(out, n, cap, a.field_inits.data[i].name, offset);
         i = i + 1;
     }
     i = 0;
-    for (i < a.generic_name_len) {
-        n = push(out, n, cap, a.generic_names[i], offset);
+    for (i < a.generic_names.len) {
+        n = push(out, n, cap, a.generic_names.data[i], offset);
         i = i + 1;
     }
     i = 0;
-    for (i < a.decorator_len) {
-        n = push(out, n, cap, a.decorators[i].name, offset);
+    for (i < a.decorators.len) {
+        n = push(out, n, cap, a.decorators.data[i].name, offset);
         i = i + 1;
     }
     ret n;
 }
 
 # record `span` when it holds `offset`, counting past `cap`
-fun push(out: *token.Span, n: usize, cap: usize, span: token.Span, offset: usize) usize {
+fun push(out: *src.Span, n: usize, cap: usize, span: src.Span, offset: usize) usize {
     if (!holds(span, offset))  { ret n; }
     if (n < cap && out != nil) { out[n] = span; }
     ret n + 1;
 }
 
 # whether `span` holds a cursor at `offset`, its end included
-fun holds(span: token.Span, offset: usize) bool {
+fun holds(span: src.Span, offset: usize) bool {
     if (span.len == 0)        { ret false; }
     if (offset < span.offset) { ret false; }
     ret offset <= span.offset + span.len;
 }
 
 # longest first; among equal lengths the earlier start, so equal spans are adjacent
-fun outer_first(x: *token.Span, y: *token.Span) i64 {
+fun outer_first(x: *src.Span, y: *src.Span) i64 {
     if (x.len > y.len)       { ret -1; }
     if (x.len < y.len)       { ret 1; }
     if (x.offset < y.offset) { ret -1; }
@@ -248,13 +248,13 @@ fun outer_first(x: *token.Span, y: *token.Span) i64 {
 # spans: sorted longest first
 # n:     how many
 # ret:   the chain's length; the chain occupies `spans[0 .. ret)`
-fun nest(spans: *token.Span, n: usize) usize {
+fun nest(spans: *src.Span, n: usize) usize {
     if (n == 0) { ret 0; }
     var w: usize = 1;
     var i: usize = 1;
     for (i < n) {
-        val outer: token.Span = spans[w - 1];
-        val inner: token.Span = spans[i];
+        val outer: src.Span = spans[w - 1];
+        val inner: src.Span = spans[i];
         i = i + 1;
         if (inner.offset == outer.offset && inner.len == outer.len) { cnt; }
         if (inner.offset < outer.offset)                            { cnt; }

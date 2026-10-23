@@ -27,7 +27,7 @@ use strutil: std.text.string;
 use mach.lang.editor;
 use src: mach.lang.source;
 
-use mach.lang.build.outcome;
+use lalloc: mach.lang.alloc;
 use mach.lang.fail;
 use std.allocator;
 
@@ -301,12 +301,12 @@ fun ensure_slot(st: *Store) res[*Document, str] {
     if (new_len == 0) { new_len = 8; }
     if (st.docs == nil) {
         val r: res[*Document, allocator.Error] = allocate[Document](st.alloc, new_len);
-        if (sel r.err) { ret res[*Document, str].err{outcome.alloc_text(r.err)}; }
+        if (sel r.err) { ret res[*Document, str].err{lalloc.text(r.err)}; }
         st.docs = r.ok;
     }
     or {
         val r: res[*Document, allocator.Error] = reallocate[Document](st.alloc, st.docs, st.len, new_len);
-        if (sel r.err) { ret res[*Document, str].err{outcome.alloc_text(r.err)}; }
+        if (sel r.err) { ret res[*Document, str].err{lalloc.text(r.err)}; }
         st.docs = r.ok;
     }
 
@@ -316,7 +316,7 @@ fun ensure_slot(st: *Store) res[*Document, str] {
         nb.uri      = nil;
         nb.path     = nil;
         nb.text     = nil;
-        nb.file_id  = 0::src.FileId;
+        nb.file_id  = src.file_id(0);
         nb.revision = 0;
         nb.version  = 0 - 1;
         nb.in_use   = false;

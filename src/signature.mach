@@ -26,9 +26,8 @@ use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
 use atype: mach.lang.fe.ast.type;
 use rslv:  mach.lang.fe.resolve;
-use mach.lang.fe.token;
-use src: mach.lang.source;
-use sj:  std.data.json;
+use src:   mach.lang.source;
+use sj:    std.data.json;
 
 use mls.analysis;
 use mls.documents;
@@ -175,14 +174,14 @@ fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
 
 # `name: Type` for the parameter in `typed_names` slot `slot`
 fun push_param_text(b: *json.Buf, a: *ast.Ast, file: positions.Text, slot: u32, alloc: *Allocator) {
-    if (a.typed_names == nil) { ret; }
-    val tn:    *decl.TypedName = ?a.typed_names[slot::usize];
+    if (a.typed_names.data == nil) { ret; }
+    val tn:    *decl.TypedName = ?a.typed_names.data[slot::usize];
     val pname: str             = positions.span_text(file, tn.name, alloc);
     if (pname != nil) {
         json.buf_push(b, pname);
         json.free_str(pname, alloc);
     }
-    if (tn.ty != id.TYPE_NIL) {
+    if (!id.type_is_nil(tn.ty)) {
         val to: opt[*atype.Type] = ast.get_type(a, tn.ty);
         if (sel to.some) {
             val tt: str = positions.span_text(file, to.some.span, alloc);
@@ -197,7 +196,7 @@ fun push_param_text(b: *json.Buf, a: *ast.Ast, file: positions.Text, slot: u32, 
 
 # the declared return type as written, or nil when there is none
 fun return_type_text(a: *ast.Ast, file: positions.Text, d: *decl.Decl, alloc: *Allocator) str {
-    if (d.data.fun_.return_type == id.TYPE_NIL) { ret nil; }
+    if (id.type_is_nil(d.data.fun_.return_type)) { ret nil; }
     val to: opt[*atype.Type] = ast.get_type(a, d.data.fun_.return_type);
     if (sel to.none) { ret nil; }
     ret positions.span_text(file, to.some.span, alloc);
@@ -205,7 +204,7 @@ fun return_type_text(a: *ast.Ast, file: positions.Text, d: *decl.Decl, alloc: *A
 
 # the function's own name as written
 fun decl_name_text(file: positions.Text, d: *decl.Decl, alloc: *Allocator) str {
-    val nso: opt[token.Span] = features.decl_name_span(d);
+    val nso: opt[src.Span] = features.decl_name_span(d);
     if (sel nso.none) { ret nil; }
     ret positions.span_text(file, nso.some, alloc);
 }
