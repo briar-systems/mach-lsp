@@ -51,7 +51,6 @@ use std.types.string.str_equals;
 
 use std.allocator.Allocator;
 
-use std.process.env;
 use std.process.exec;
 use std.sync.atomic;
 use std.sync.mutex;
@@ -331,7 +330,7 @@ fun start_worker(self: str, to: *usize, from: *usize) i64 {
     argv[1] = WORKER_FLAG::*u8;
     argv[2] = nil;
 
-    # the worker inherits this process's environment. Handing it nil gives the
+    # the worker inherits this process's environment. Handing it an empty list gives the
     # child an EMPTY environment, which silently drops everything a tool reads
     # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
     # until something that depends on one of them stops working.
@@ -339,7 +338,7 @@ fun start_worker(self: str, to: *usize, from: *usize) i64 {
     # the worker's stderr is inherited, which std spells INVALID_HANDLE. passing
     # stderr asks for dup3(2, 2), which aarch64 and riscv64 reject, and the child
     # then dies before exec
-    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
+    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], os.Environment.inherit{},
         child_in, child_out, os.INVALID_HANDLE);
     os.close(child_in);
     os.close(child_out);
