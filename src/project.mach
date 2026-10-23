@@ -33,7 +33,6 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.string.str_starts_with;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -2612,8 +2611,8 @@ fun module_for_norm(root: *Root, norm: str) opt[u32] {
 }
 
 # whether loaded module `mid` in `root` belongs to the user's
-# own editable project rather than a vendored dependency. False when the whole
-# root is vendored; otherwise true iff the module FQN begins with the project id.
+# own editable project rather than a dependency. False when the whole root is
+# vendored; otherwise the snapshot's own root-membership answer.
 # ---
 # w:    the workspace
 # root: the root governing the request, or nil
@@ -2623,15 +2622,9 @@ pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.StableModuleId) 
     val mo: opt[u32] = module_index(root, mid);
     if (sel mo.none)   { ret false; }
     if (root.vendored) { ret false; }
-    val fqn_r: res[str, fail.Fail] = editor.project_module_fqn(?root.snap, mo.some);
-    if (sel fqn_r.err) { ret false; }
-    val pid:  str   = editor.project_id(?root.snap);
-    val fqn:  str   = fqn_r.ok;
-    val plen: usize = str_len(pid);
-    val flen: usize = str_len(fqn);
-    if (flen < plen || !str_starts_with(fqn, pid)) { ret false; }
-    if (flen == plen)                              { ret true; }
-    ret fqn[plen] == '.';
+    val r: res[bool, fail.Fail] = editor.project_module_is_root(?root.snap, mo.some);
+    if (sel r.err) { ret false; }
+    ret r.ok;
 }
 
 # the project root governing `uri` - the nearest ancestor of its
