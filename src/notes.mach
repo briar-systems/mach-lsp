@@ -30,11 +30,9 @@ use src:   mach.lang.source;
 use mls.json;
 use mls.transport;
 
-# the LSP severity scale
+# the LSP severities a compiler diagnostic maps to; its kind is an error or a warning
 pub val LSP_ERROR:   i64 = 1;
 pub val LSP_WARNING: i64 = 2;
-pub val LSP_INFO:    i64 = 3;
-pub val LSP_HINT:    i64 = 4;
 
 # the most notes one root carries; a load records a handful at most
 val MAX_NOTES: usize = 16;
@@ -59,12 +57,10 @@ pub rec Notes {
     len:   usize;
 }
 
-# the compiler severity on the LSP scale
-pub fun lsp_severity(sev: diag.Severity) i64 {
-    if (sev == diag.SEVERITY_ERROR)   { ret LSP_ERROR; }
-    if (sev == diag.SEVERITY_WARNING) { ret LSP_WARNING; }
-    if (sev == diag.SEVERITY_INFO)    { ret LSP_INFO; }
-    ret LSP_HINT;
+# the diagnostic's level, its kind's, on the LSP scale
+pub fun lsp_severity(d: *diag.Diagnostic) i64 {
+    if (diag.is_error(d)) { ret LSP_ERROR; }
+    ret LSP_WARNING;
 }
 
 # the LSP tag a diagnostic kind carries, or 0 for none. an unused import
@@ -101,7 +97,7 @@ pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore) Notes {
     var i: usize = 0;
     for (store != nil && i < store.items.len) {
         val d: *diag.Diagnostic = ?store.items.data[i];
-        if (d.loc.file_id == src.FILE_NIL) { add(alloc, ?n, lsp_severity(d.severity), d.kind, d.message); }
+        if (src.file_is_nil(d.loc.file)) { add(alloc, ?n, lsp_severity(d), d.kind, d.message); }
         i = i + 1;
     }
     ret n;
@@ -178,12 +174,12 @@ test capture_keeps_only_the_diagnostics_with_no_file_in_order_with_their_kind {
     var pa: Allocator;
     page.make(?pa);
     var store: diag.DiagnosticStore = diag.store_init(?pa);
-    var span:  mach_token.Span;
+    var span:  src.Span;
     span.offset = 0;
     span.len    = 0;
-    diag.record_warning(?store, dkind.DECL_DEPRECATED, src.FILE_NIL, span, "no range");
-    diag.record_warning(?store, dkind.IMPORT_UNUSED, 3::src.FileId, span, "in a file");
-    diag.record_error(?store, dkind.MANIFEST_INVALID_VALUE, src.FILE_NIL, span, "refused");
+    diag.record(?store, dkind.DECL_DEPRECATED, src.FILE_NIL, span, "no range");
+    diag.record(?store, dkind.IMPORT_UNUSED, src.file_id(3), span, "in a file");
+    diag.record(?store, dkind.MANIFEST_INVALID_VALUE, src.FILE_NIL, span, "refused");
     var n:    Notes = capture(?pa, ?store);
     var same: Notes = capture(?pa, ?store);
     var none: Notes = empty();
@@ -211,5 +207,4 @@ test capture_keeps_only_the_diagnostics_with_no_file_in_order_with_their_kind {
     ret 0;
 }
 
-use mach_token: mach.lang.fe.token;
 use std.allocator.page;

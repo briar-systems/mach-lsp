@@ -22,12 +22,10 @@ use std.collections.vector.Vector;
 
 use std.allocator.page;
 
-use mach.lang.build.outcome;
 use diag: mach.lang.diagnostic;
 use mach.lang.editor;
 use ferr: mach.lang.fail;
-use mach.lang.fe.token;
-use src: mach.lang.source;
+use src:  mach.lang.source;
 
 use mls.documents;
 use mls.json;
@@ -128,7 +126,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var i:       usize = 0;
     var written: usize = 0;
     for (list != nil && i < list.items.len && written < MAX_DIAGNOSTICS) {
-        if (list.items.data[i].loc.file_id == own) {
+        if (src.file_same(list.items.data[i].loc.file, own)) {
             if (push_entry(?b, ?at, ?list.items.data[i], alloc, written > 0)) { written = written + 1; }
         }
         i = i + 1;
@@ -164,12 +162,12 @@ fun text_for(at: *Locator, fid: src.FileId) positions.Text {
 # cleared and false returned
 fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: editor.AnalysisPhase,
     alloc: *Allocator, out: *editor.AnalysisResult) bool {
-    var req: editor.AnalysisRequest                   = editor.analysis_request(d.file_id, phase);
-    val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
+    var req: editor.AnalysisRequest                = editor.analysis_request(d.file_id, phase);
+    val ar:  res[editor.AnalysisResult, ferr.Fail] = editor.analyze(es, ?req);
     if (sel ar.err) {
-        var f: outcome.Fail = ar.err;
+        var f: ferr.Fail = ar.err;
         trace.log("diagnostics: standalone analysis failed: ");
-        trace.log(outcome.describe(f));
+        trace.log(ferr.describe(f));
         trace.log("\n");
         editor.fail_dnit(es, ?f);
         clear(alloc, d.uri);
@@ -185,7 +183,7 @@ fun count_for(list: *diag.DiagnosticStore, fid: src.FileId) usize {
     var n: usize = 0;
     var i: usize = 0;
     for (i < list.items.len) {
-        if (list.items.data[i].loc.file_id == fid) { n = n + 1; }
+        if (src.file_same(list.items.data[i].loc.file, fid)) { n = n + 1; }
         i = i + 1;
     }
     ret n;
@@ -219,12 +217,12 @@ pub fun clear(alloc: *Allocator, uri: str) {
 # secondary locations become `relatedInformation`, so the client can jump to them
 fun push_entry(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocator, comma: bool) bool {
     var r: positions.LspRange;
-    if (!range_for(text_for(at, d.loc.file_id), d.loc.span, ?r)) { ret false; }
-    if (comma)                                                   { json.buf_push_byte(b, ','); }
+    if (!range_for(text_for(at, d.loc.file), d.loc.span, ?r)) { ret false; }
+    if (comma)                                                { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"range\":");
     render.range(b, r);
     json.buf_push(b, ",\"severity\":");
-    json.buf_push_i64(b, notes.lsp_severity(d.severity));
+    json.buf_push_i64(b, notes.lsp_severity(d));
     notes.push_kind(b, d.kind);
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     push_message(b, d);
@@ -238,7 +236,7 @@ fun push_entry(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocato
 # A diagnostic's claim is about the bytes it covers, so a span touching the
 # edited window is not carried, even one that encloses it. An unresolvable file
 # degrades to the start of the document rather than dropping the diagnostic.
-fun range_for(t: positions.Text, span: token.Span, out: *positions.LspRange) bool {
+fun range_for(t: positions.Text, span: src.Span, out: *positions.LspRange) bool {
     out.start_line = 0;
     out.start_char = 0;
     out.end_line   = 0;
@@ -289,7 +287,7 @@ fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Alloca
     var r:       usize = 0;
     for (r < d.related.len) {
         val rel: *diag.Related  = ?d.related.data[r];
-        val t:   positions.Text = text_for(at, rel.loc.file_id);
+        val t:   positions.Text = text_for(at, rel.loc.file);
         var rng: positions.LspRange;
         if (t.file != nil && range_for(t, rel.loc.span, ?rng)) {
             val u: str = uris.of_path(alloc, t.file.path);
@@ -314,12 +312,11 @@ fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Alloca
 
 # --- shaping ---
 
-# an otherwise-empty error diagnostic over file 0 at [0,1)
+# an otherwise-empty diagnostic over no file at [0,1)
 #[testing]
 fun stub_diag(message: str) diag.Diagnostic {
     var d: diag.Diagnostic;
-    d.severity        = diag.SEVERITY_ERROR;
-    d.loc.file_id     = 0::src.FileId;
+    d.loc.file        = src.FILE_NIL;
     d.loc.span.offset = 0;
     d.loc.span.len    = 1;
     d.message         = message;
@@ -381,11 +378,11 @@ test a_secondary_location_renders_as_a_located_relatedinformation_entry {
     # add builds the line index and issues the first FileId as 1, since slot 0 is
     # the FILE_NIL sentinel
     var m:     src.SourceMap              = src.init(?pa);
-    val added: res[src.FileId, ferr.Fail] = src.add(?m, "file:///w/a.mach", "ab\ncd");
+    val added: res[src.FileId, src.Error] = src.add(?m, "file:///w/a.mach", "ab\ncd");
     if (sel added.err) { ret 1; }
 
     var rels: [1]diag.Related;
-    rels[0].loc.file_id     = added.ok;
+    rels[0].loc.file        = added.ok;
     rels[0].loc.span.offset = 0;
     rels[0].loc.span.len    = 2;
     rels[0].label           = "previous definition here";
@@ -413,7 +410,7 @@ test a_secondary_location_with_an_unresolvable_file_is_skipped {
     var m: src.SourceMap = src.init(?pa);
 
     var rels: [1]diag.Related;
-    rels[0].loc.file_id     = 9::src.FileId;
+    rels[0].loc.file        = src.file_id(9);
     rels[0].loc.span.offset = 0;
     rels[0].loc.span.len    = 1;
     rels[0].label           = "elsewhere";
