@@ -13,3 +13,6 @@
 [submodule "dep/mirl"]
 	path = dep/mirl
 	url = https://github.com/briar-systems/mirl
+[submodule "dep/yaml"]
+	path = dep/yaml
+	url = https://github.com/briar-systems/mach-yaml
