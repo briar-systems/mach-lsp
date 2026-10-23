@@ -31,8 +31,6 @@ use mem: std.memory;
 use mach.lang.diagnostic;
 use mach.lang.editor;
 use mach.lang.fail;
-use mach.lang.fe.lexer;
-use mach.lang.fe.token;
 use src: mach.lang.source;
 
 # the spans one file's rename rewrites, in the order they were found
@@ -83,20 +81,9 @@ pub fun spans_push(s: *Spans, span: src.Span) bool {
 
 # whether `name` is exactly one identifier token
 pub fun identifier(alloc: *Allocator, name: str) bool {
-    if (name == nil) { ret false; }
-    val n: usize = str_len(name);
-    if (n == 0) { ret false; }
-    val lexed: res[lexer.TokenStream, fail.Fail] = lexer.tokenize(name, alloc, src.FILE_NIL);
-    if (sel lexed.err) { ret false; }
-    var stream: lexer.TokenStream = lexed.ok;
-    var ok:     bool              = stream.error_len == 0 && stream.len >= 1;
-    if (ok) {
-        val t: token.Token = stream.tokens[0];
-        ok = t.kind == token.KIND_IDENT && t.span.offset == 0 && t.span.len == n;
-    }
-    if (ok && stream.len > 1) { ok = stream.tokens[1].kind == token.KIND_EOF; }
-    lexer.dnit(?stream, alloc);
-    ret ok;
+    val r: res[bool, fail.Fail] = editor.is_identifier(alloc, name);
+    if (sel r.err) { ret false; }
+    ret r.ok;
 }
 
 # `text` with every span replaced by `name`, owned, or nil when memory ran out.
