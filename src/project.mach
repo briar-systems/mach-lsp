@@ -853,6 +853,16 @@ fun capture_input(w: *Workspace, r: *Root) *BuildInput {
     ret in;
 }
 
+# whether the build handed the snapshot an open buffer for canonical `path`
+fun input_buffers(in: *BuildInput, path: str) bool {
+    var i: u32 = 0;
+    for (i < in.doc_count) {
+        if (in.docs[i].belongs && str_equals(in.docs[i].path, path)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # release an input that never reached a build, along with the stale snapshot
 # it carries, which nothing else would release
 fun free_build_input(in: *BuildInput) {
@@ -1020,7 +1030,7 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     val internal: opt[str] = fail.internal_text(snap.status);
     if (sel internal.some) { trace.logf("project: {} analyzed with an internal failure: {}", in.root_path, internal.some); }
 
-    val bpr: res[bool, str] = snapshot_mod_paths(alloc, sn, ?snap, o);
+    val bpr: res[bool, str] = snapshot_mod_paths(alloc, sn, in, ?snap, o);
     if (sel bpr.err) {
         o.message = dup_str(alloc, bpr.err);
         park_snapshot(o, ?snap);
@@ -1274,7 +1284,7 @@ pub fun pump(w: *Workspace, idle: bool) u8 {
 # are allocation-free compares. replacement is transactional: a failed
 # allocation or normalization rejects the new snapshot and preserves the last
 # successful path/fingerprint set for disk-change retry detection.
-fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, snap: *editor.ProjectSnapshot, o: *BuildOutput) res[bool, str] {
+fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, in: *BuildInput, snap: *editor.ProjectSnapshot, o: *BuildOutput) res[bool, str] {
     val n: u32 = editor.project_module_count(snap);
     if (n == 0) { ret res[bool, str].ok{true}; }
     val arr_r: res[*str, allocator.Error] = allocate[str](alloc, n::usize);
@@ -1336,7 +1346,7 @@ fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, snap: *editor.Proje
             free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
             ret res[bool, str].err{"project: failed to normalize loaded module path"};
         }
-        fingerprints[i] = verified_fingerprint(alloc, sn, fo.some, paths[i]);
+        fingerprints[i] = verified_fingerprint(alloc, in, fo.some, paths[i]);
         i               = i + 1;
     }
     o.mod_paths        = paths;
@@ -1643,12 +1653,12 @@ fun unknown_fingerprint() SourceFingerprint {
 # snapshot's own and never be rebuilt. So the stat comes first and the file is
 # then compared with what was analyzed, through the same read the loader uses: a
 # write that landed in between is a mismatch, recorded as unknown so the next
-# scan rebuilds it. An open document is analyzed from its overlay, whose bytes
-# the disk is not expected to hold, and is not compared.
-fun verified_fingerprint(alloc: *Allocator, sn: *sess.Session, file: *src.SourceFile, path: str) SourceFingerprint {
+# scan rebuilds it. An open document is analyzed from the buffer the build
+# handed the snapshot, whose bytes the disk is not expected to hold, and is not
+# compared.
+fun verified_fingerprint(alloc: *Allocator, in: *BuildInput, file: *src.SourceFile, path: str) SourceFingerprint {
     val fp: SourceFingerprint = file_fingerprint(path);
-    val ov: opt[str]          = sess.overlay_get(sn, file.path);
-    if (sel ov.some) { ret fp; }
+    if (input_buffers(in, path)) { ret fp; }
     val tr:   res[str, fs.FsError] = fs.read_string(alloc, path);
     var same: bool                 = false;
     if (sel tr.ok) {
