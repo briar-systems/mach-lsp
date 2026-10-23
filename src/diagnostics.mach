@@ -86,7 +86,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
             if (count_for(list, own) == 0) {
                 list = nil;
                 if (v.parse_ok) {
-                    list       = ?v.root.s.diags;
+                    list       = project.diagnostics_of(v.root);
                     at.sources = ?v.root.s.sources;
                     at.root    = v.root;
                     own        = v.file_id;
@@ -94,7 +94,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
             }
         }
         or {
-            list       = ?v.root.s.diags;
+            list       = project.diagnostics_of(v.root);
             at.sources = ?v.root.s.sources;
             at.root    = v.root;
             own        = v.file_id;
