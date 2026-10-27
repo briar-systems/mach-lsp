@@ -1,0 +1,72 @@
+# document formatting: an open buffer in mach's one canonical layout
+#
+# Syntax-only, like foldingRange: the buffer is formatted by the same
+# `fe.format.format_source` that `mach fmt` runs, so the editor and the command
+# never disagree on a layout. The answer is one edit replacing the whole buffer,
+# or none when the buffer is already canonical. A buffer that does not parse is
+# left as it is with no edits, since its parse diagnostics already say why.
+
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.result.res;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use std.allocator.Allocator;
+
+use mach.lang.diagnostic;
+use mach.lang.fail;
+use fe_format: mach.lang.fe.format;
+use src:       mach.lang.source;
+use sj:        std.data.json;
+
+use mls.documents;
+use mls.json;
+use mls.positions;
+use mls.render;
+
+# answer textDocument/formatting for an open document
+# ---
+# alloc:  request allocator
+# docs:   the open-document registry
+# id:     the request id
+# params: the request params, holding `textDocument` and `options`
+# uri:    the requested document
+pub fun formatting(alloc: *Allocator, docs: *documents.Store, id: *sj.Value, params: *sj.Value, uri: str) {
+    val id_raw: str = json.id_text(id, alloc);
+    if (id_raw == nil) { ret; }
+
+    val d: *documents.Document = documents.find(docs, uri);
+    if (d == nil) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+    val file: *src.SourceFile = documents.live_file(docs, d);
+    if (file == nil) {
+        render.reply_null(alloc, id_raw);
+        ret;
+    }
+
+    var diags:     diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    val formatted: res[str, fail.Fail]        = fe_format.format_source(alloc, file.text, d.file_id, ?diags);
+    diagnostic.store_dnit(?diags);
+    if (sel formatted.err) {
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
+    val output: str = formatted.ok;
+    if (str_equals(file.text, output)) {
+        str_free(alloc, output);
+        render.reply_empty_array(alloc, id_raw);
+        ret;
+    }
+
+    val t: positions.Text = positions.text_of(file);
+    var b: json.Buf       = json.buf_init(alloc);
+    render.result_begin(?b, id_raw);
+    json.buf_push_byte(?b, '[');
+    render.text_edit(?b, t, src.Span{offset: 0, len: t.len}, output);
+    json.buf_push_byte(?b, ']');
+    str_free(alloc, output);
+    render.send(?b, alloc, id_raw);
+}
