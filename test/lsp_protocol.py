@@ -490,8 +490,8 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -531,7 +531,7 @@ pub fun main() i32 {{
     definition = source / "defs.mach"
     main.write_text(text, encoding="utf-8")
     definition.write_text(
-        f'''$if ($project.target.os != "linux") {{ $error("wrong selected target"); }}
+        f'''$if ($project.target.sys != "linux") {{ $error("wrong selected target"); }}
 $if ($bin.name != "app") {{ $error("wrong selected artifact"); }}
 pub val answer: i32 = {value};
 pub val watched: i32 = {value};
@@ -563,8 +563,8 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -1073,8 +1073,8 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -1662,8 +1662,8 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -1903,15 +1903,15 @@ src = "src"
 out = "out"
 
 [target.spirv]
-isa = "spirv"
-os = "freestanding"
+arch = "spirv"
+sys = "freestanding"
 abi = "spirv"
 env = "vulkan1.0"
 
 [target.linux-x86_64]
 default = true
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -2692,8 +2692,8 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -3886,8 +3886,8 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
@@ -4450,23 +4450,23 @@ src = "src"
 out = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [target.linux-arm64]
-isa = "aarch64"
-os = "linux"
+arch = "aarch64"
+sys = "linux"
 abi = "aapcs64"
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os = "darwin"
+arch = "x86_64"
+sys = "darwin"
 abi = "sysv64"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os = "darwin"
+arch = "aarch64"
+sys = "darwin"
 abi = "aapcs64"
 
 [dep.std]
