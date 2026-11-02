@@ -26,9 +26,71 @@ env:
   PROFILE: ${{ inputs.profile || 'debug' }}
 
 jobs:
+  # the compiler is mach at the dep/mach gitlink, so the two never drift. it is
+  # cached by that ref as soon as it is built, so a slow build never loses it
+  compiler:
+    name: compiler (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners || '["ubuntu-latest"]') }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - id: mach
+        run: echo "ref=$(git ls-tree HEAD dep/mach | awk '{ print $3 }')" >> "$GITHUB_OUTPUT"
+      - id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/mach-bin
+          key: mach-${{ runner.os }}-${{ runner.arch }}-${{ steps.mach.outputs.ref }}
+          lookup-only: true
+      - id: src
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          MACH_REF: ${{ steps.mach.outputs.ref }}
+        run: |
+          src=$RUNNER_TEMP/mach-src
+          git init --quiet "$src"
+          git -C "$src" remote add origin https://github.com/briar-systems/mach
+          git -C "$src" fetch --quiet --depth 1 origin "$MACH_REF"
+          git -C "$src" checkout --quiet FETCH_HEAD
+          echo "chain=$(sha256sum "$src/.github/bootstrap-chain" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      # mach's own bootstrap chain builds its tree from the last seed release.
+      # its steps are cached by the chain file, as mach's ci does
+      - id: chain
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/chain
+          key: chain-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.chain }}
+      - name: bootstrap mach
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          exe=
+          [ "$RUNNER_OS" = Windows ] && exe=.exe
+          (cd "$RUNNER_TEMP/mach-src" && GITHUB_ENV="$RUNNER_TEMP/mach.env" bash .github/scripts/bootstrap.sh)
+          mkdir -p "$RUNNER_TEMP/mach-bin"
+          cp "$(sed -n 's/^MACH=//p' "$RUNNER_TEMP/mach.env")" "$RUNNER_TEMP/mach-bin/mach$exe"
+      - if: steps.cache.outputs.cache-hit != 'true' && steps.chain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/chain
+          key: chain-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.chain }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/mach-bin
+          key: mach-${{ runner.os }}-${{ runner.arch }}-${{ steps.mach.outputs.ref }}
+
   # every runner builds every artifact for every target
   build:
     name: build (${{ matrix.runner }})
+    needs: [compiler]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -40,30 +102,13 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v6
-      # the compiler is mach at the dep/mach gitlink, so the two never drift
       - id: mach
         run: echo "ref=$(git ls-tree HEAD dep/mach | awk '{ print $3 }')" >> "$GITHUB_OUTPUT"
-      - id: cache
-        uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/mach-bin
           key: mach-${{ runner.os }}-${{ runner.arch }}-${{ steps.mach.outputs.ref }}
-      # mach's own bootstrap chain builds its tree from the last seed release
-      - name: bootstrap mach
-        if: steps.cache.outputs.cache-hit != 'true'
-        env:
-          MACH_REF: ${{ steps.mach.outputs.ref }}
-        run: |
-          exe=
-          [ "$RUNNER_OS" = Windows ] && exe=.exe
-          src=$RUNNER_TEMP/mach-src
-          git init --quiet "$src"
-          git -C "$src" remote add origin https://github.com/briar-systems/mach
-          git -C "$src" fetch --quiet --depth 1 origin "$MACH_REF"
-          git -C "$src" checkout --quiet FETCH_HEAD
-          (cd "$src" && GITHUB_ENV="$RUNNER_TEMP/mach.env" bash .github/scripts/bootstrap.sh)
-          mkdir -p "$RUNNER_TEMP/mach-bin"
-          cp "$(sed -n 's/^MACH=//p' "$RUNNER_TEMP/mach.env")" "$RUNNER_TEMP/mach-bin/mach$exe"
+          fail-on-cache-miss: true
       - run: echo "$RUNNER_TEMP/mach-bin" >> "$GITHUB_PATH"
       - run: mach dep pull .
       - if: strategy.job-index == 0
@@ -72,7 +117,7 @@ jobs:
 
   gate:
     if: always()
-    needs: [build]
+    needs: [compiler, build]
     runs-on: ubuntu-latest
     steps:
       - run: exit ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 1 || 0 }}
