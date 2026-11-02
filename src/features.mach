@@ -39,6 +39,7 @@ use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
 use mach.lang.fe.ast.stmt;
 use atype: mach.lang.fe.ast.type;
+use mach.lang.fe.literal;
 use fedoc: mach.lang.fe.doc;
 use rslv:  mach.lang.fe.resolve;
 use mach.lang.fe.sema;
@@ -940,6 +941,21 @@ pub fun token_span_of_expr(e: *expr.Expr) opt[src.Span] {
     if (e.kind == expr.EXPR_KIND_LIT_STR)        { ret opt[src.Span].some{e.data.lit_str.tok}; }
     if (e.kind == expr.EXPR_KIND_LIT_NIL)        { ret opt[src.Span].some{e.data.lit_nil.tok}; }
     ret opt[src.Span].none{};
+}
+
+# the token of a multiline string, the run of lines led by `\\` that mach's lexer
+# reads as one string literal, or none for any other expression
+# ---
+# a:    the tree
+# text: the source the tree's spans index
+# eid:  the expression
+pub fun multiline_string(a: *ast.Ast, text: str, eid: id.ExprId) opt[src.Span] {
+    val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
+    if (sel eo.none)                         { ret opt[src.Span].none{}; }
+    if (eo.some.kind != expr.EXPR_KIND_LIT_STR) { ret opt[src.Span].none{}; }
+    val tok: src.Span = eo.some.data.lit_str.tok;
+    if (text == nil || !literal.str_multiline(src.span_view(text, tok))) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{tok};
 }
 
 # the span an expression's own text occupies: its token for a name or a
