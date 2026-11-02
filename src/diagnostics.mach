@@ -385,7 +385,7 @@ fun push_related_entry(b: *json.Buf, at: *Locator, loc: src.Location, label: str
     var rng: positions.LspRange;
     if (t.file == nil || !range_for(t, loc.span, ?rng)) { ret written; }
     val u: str = uris.of_path(alloc, t.file.path);
-    if (u == nil) { ret written; }
+    if (u == nil)     { ret written; }
     if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
     or                { json.buf_push_byte(b, ','); }
     json.buf_push(b, "{\"location\":{\"uri\":");

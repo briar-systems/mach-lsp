@@ -39,9 +39,9 @@ use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
 use mach.lang.fe.ast.stmt;
 use atype: mach.lang.fe.ast.type;
-use mach.lang.fe.literal;
 use fedoc: mach.lang.fe.doc;
-use rslv:  mach.lang.fe.resolve;
+use mach.lang.fe.literal;
+use rslv: mach.lang.fe.resolve;
 use mach.lang.fe.sema;
 use mach.lang.intern;
 use lmodule: mach.lang.module;
@@ -951,7 +951,7 @@ pub fun token_span_of_expr(e: *expr.Expr) opt[src.Span] {
 # eid:  the expression
 pub fun multiline_string(a: *ast.Ast, text: str, eid: id.ExprId) opt[src.Span] {
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none)                         { ret opt[src.Span].none{}; }
+    if (sel eo.none)                            { ret opt[src.Span].none{}; }
     if (eo.some.kind != expr.EXPR_KIND_LIT_STR) { ret opt[src.Span].none{}; }
     val tok: src.Span = eo.some.data.lit_str.tok;
     if (text == nil || !literal.str_multiline(src.span_view(text, tok))) { ret opt[src.Span].none{}; }
