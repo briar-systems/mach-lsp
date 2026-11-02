@@ -4,9 +4,15 @@
 # allocator, the compiler `session.Session` (SourceMap + DiagList), the
 # `editor.EditorSession` (per-buffer analysis), and the document registry that
 # binds LSP URIs to editor buffers. `run` reads framed messages until exit;
-# `dispatch` routes each by method. this slice implements the lifecycle and the
-# document-synchronization notifications that drive diagnostics; unimplemented
-# language-feature requests are answered with a `method not found` error.
+# `dispatch` routes each by method. it handles the lifecycle (initialize,
+# shutdown, exit), document synchronization (didOpen, didChange, didClose,
+# didSave), workspace configuration and watched-file notifications, and the
+# language-feature requests: hover, definition, typeDefinition, references,
+# rename, prepareRename, documentSymbol, completion, foldingRange, formatting,
+# selectionRange, documentHighlight, signatureHelp, inlayHint, semanticTokens
+# (full, range, full/delta), codeAction, call hierarchy (prepare, incoming,
+# outgoing) and workspace/symbol. any other request is answered with a
+# `method not found` error.
 
 use std.types.bool.bool;
 use std.types.bool.false;
