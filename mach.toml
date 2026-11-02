@@ -24,16 +24,19 @@ abi = "lp64d"
 arch = "x86_64"
 sys  = "windows"
 abi  = "win64"
+env  = "msvc"
 
 [target.darwin-x86_64]
 arch = "x86_64"
 sys = "darwin"
 abi = "sysv64"
+env = "macos"
 
 [target.darwin-aarch64]
 arch = "aarch64"
 sys = "darwin"
 abi = "aapcs64"
+env = "macos"
 
 [profile.debug]
 default = true
