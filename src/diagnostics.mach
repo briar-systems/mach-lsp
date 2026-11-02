@@ -131,12 +131,95 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         }
         i = i + 1;
     }
+    if (at.root == nil) { push_refusal(?b, ?at, ?result, own, alloc, written); }
     json.buf_push(?b, "]}}");
 
     val msg: str = json.buf_str(?b);
     if (msg != nil) { transport.send_message(msg, alloc); }
     json.buf_dnit(?b);
     editor.analysis_dnit(?result);
+}
+
+# the reason the buffer's project could not be loaded, shown on the buffer
+#
+# A buffer under a manifest that `mach check` refuses is analyzed standalone, and
+# the refusal rides the envelope's failure rather than the buffer's own
+# diagnostics: a reported one through diagnostics on other files, such as the
+# manifest, any other through its text. Each is put at the start of the buffer,
+# with the place it points at as related information, so a refused project never
+# reads as a clean file.
+# ---
+# b:       the diagnostics array being written
+# at:      where the result's file ids resolve
+# result:  the standalone envelope, zero when none ran
+# own:     the buffer's file id, whose diagnostics are already written
+# alloc:   message allocator
+# written: entries already in the array
+fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own: src.FileId, alloc: *Allocator, written: usize) {
+    if (result.alloc == nil)     { ret; }
+    if (sel result.failure.none) { ret; }
+    val f: ferr.Fail = result.failure.some;
+    var n: usize     = written;
+    if (!ferr.is_reported(f)) {
+        if (n >= MAX_DIAGNOSTICS) { ret; }
+        if (n > 0)                { json.buf_push_byte(b, ','); }
+        json.buf_push(b, "{\"range\":");
+        render.range(b, document_start());
+        json.buf_push(b, ",\"severity\":");
+        json.buf_push_i64(b, notes.LSP_ERROR);
+        notes.push_kind(b, ferr.kind_of(f));
+        json.buf_push(b, ",\"source\":\"mach\",\"message\":");
+        json.buf_push_quoted(b, result.message);
+        val po: opt[ferr.Place] = ferr.place_of(f);
+        if (sel po.some) { push_place(b, po.some, result.message, alloc); }
+        json.buf_push_byte(b, '}');
+        ret;
+    }
+    val list: *diag.DiagnosticStore = result.diagnostics;
+    if (list == nil) { ret; }
+    var i: usize = 0;
+    for (i < list.items.len && n < MAX_DIAGNOSTICS) {
+        val d: *diag.Diagnostic = ?list.items.data[i];
+        if (!src.file_same(d.loc.file, own)) {
+            if (n > 0) { json.buf_push_byte(b, ','); }
+            json.buf_push(b, "{\"range\":");
+            render.range(b, document_start());
+            json.buf_push(b, ",\"severity\":");
+            json.buf_push_i64(b, notes.lsp_severity(d));
+            notes.push_kind(b, d.kind);
+            json.buf_push(b, ",\"source\":\"mach\",\"message\":");
+            push_message(b, d);
+            push_related(b, at, d, alloc, true);
+            json.buf_push_byte(b, '}');
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the empty range at the start of a document
+fun document_start() positions.LspRange {
+    ret positions.LspRange{start_line: 0, start_char: 0, end_line: 0, end_char: 0};
+}
+
+# append `,"relatedInformation":[...]` holding the one place a failure points at
+fun push_place(b: *json.Buf, p: ferr.Place, label: str, alloc: *Allocator) {
+    if (!p.spanned) { ret; }
+    val u: str = uris.of_path(alloc, p.path);
+    if (u == nil) { ret; }
+    var rng: positions.LspRange;
+    rng.start_line = p.start.line - 1;
+    rng.start_char = p.start.col - 1;
+    rng.end_line   = p.end.line - 1;
+    rng.end_char   = p.end.col - 1;
+    json.buf_push(b, ",\"relatedInformation\":[{\"location\":{\"uri\":");
+    json.buf_push_quoted(b, u);
+    json.buf_push(b, ",\"range\":");
+    render.range(b, rng);
+    json.buf_push(b, "},\"message\":");
+    json.buf_push_quoted(b, label);
+    json.buf_push(b, "}]");
+    json.free_str(u, alloc);
 }
 
 # where a diagnostic's file ids resolve, and how their spans reach the client
@@ -226,7 +309,7 @@ fun push_entry(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocato
     notes.push_kind(b, d.kind);
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     push_message(b, d);
-    push_related(b, at, d, alloc);
+    push_related(b, at, d, alloc, false);
     json.buf_push_byte(b, '}');
     ret true;
 }
@@ -280,34 +363,40 @@ fun push_message(b: *json.Buf, d: *diag.Diagnostic) {
 # whose file id or URI cannot be resolved is skipped rather than emitted with a
 # wrong location; a nil label renders as an empty caption, which the protocol
 # requires as a string
-fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocator) {
-    if (d.related.len == 0) { ret; }
-
+# ---
+# lead: the diagnostic's own location goes first, captioned with its message, for
+#       a diagnostic shown somewhere other than where it points
+fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Allocator, lead: bool) {
     var written: usize = 0;
-    var r:       usize = 0;
+    if (lead) { written = push_related_entry(b, at, d.loc, d.message, alloc, written); }
+    var r: usize = 0;
     for (r < d.related.len) {
-        val rel: *diag.Related  = ?d.related.data[r];
-        val t:   positions.Text = text_for(at, rel.loc.file);
-        var rng: positions.LspRange;
-        if (t.file != nil && range_for(t, rel.loc.span, ?rng)) {
-            val u: str = uris.of_path(alloc, t.file.path);
-            if (u != nil) {
-                if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
-                or                { json.buf_push_byte(b, ','); }
-                json.buf_push(b, "{\"location\":{\"uri\":");
-                json.buf_push_quoted(b, u);
-                json.buf_push(b, ",\"range\":");
-                render.range(b, rng);
-                json.buf_push(b, "},\"message\":");
-                json.buf_push_quoted(b, rel.label);
-                json.buf_push_byte(b, '}');
-                written = written + 1;
-                json.free_str(u, alloc);
-            }
-        }
-        r = r + 1;
+        val rel: *diag.Related = ?d.related.data[r];
+        written = push_related_entry(b, at, rel.loc, rel.label, alloc, written);
+        r       = r + 1;
     }
     if (written > 0) { json.buf_push_byte(b, ']'); }
+}
+
+# append one relatedInformation entry, opening the array before the first; the
+# count of entries written so far, one more when this one was
+fun push_related_entry(b: *json.Buf, at: *Locator, loc: src.Location, label: str, alloc: *Allocator, written: usize) usize {
+    val t:   positions.Text = text_for(at, loc.file);
+    var rng: positions.LspRange;
+    if (t.file == nil || !range_for(t, loc.span, ?rng)) { ret written; }
+    val u: str = uris.of_path(alloc, t.file.path);
+    if (u == nil) { ret written; }
+    if (written == 0) { json.buf_push(b, ",\"relatedInformation\":["); }
+    or                { json.buf_push_byte(b, ','); }
+    json.buf_push(b, "{\"location\":{\"uri\":");
+    json.buf_push_quoted(b, u);
+    json.buf_push(b, ",\"range\":");
+    render.range(b, rng);
+    json.buf_push(b, "},\"message\":");
+    json.buf_push_quoted(b, label);
+    json.buf_push_byte(b, '}');
+    json.free_str(u, alloc);
+    ret written + 1;
 }
 
 # --- shaping ---
@@ -392,7 +481,7 @@ test a_secondary_location_renders_as_a_located_relatedinformation_entry {
 
     var b:  json.Buf = json.buf_init(?pa);
     var at: Locator  = Locator{w: nil, root: nil, sources: ?m};
-    push_related(?b, ?at, ?d, ?pa);
+    push_related(?b, ?at, ?d, ?pa, false);
 
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b),
@@ -420,7 +509,7 @@ test a_secondary_location_with_an_unresolvable_file_is_skipped {
 
     var b:  json.Buf = json.buf_init(?pa);
     var at: Locator  = Locator{w: nil, root: nil, sources: ?m};
-    push_related(?b, ?at, ?d, ?pa);
+    push_related(?b, ?at, ?d, ?pa, false);
 
     var fail: bool = false;
     if (!str_equals(json.buf_str(?b), "")) { fail = true; }
