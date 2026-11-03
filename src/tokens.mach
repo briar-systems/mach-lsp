@@ -25,6 +25,7 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.view.View;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
@@ -37,6 +38,7 @@ use mach.lang.editor;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
+use mach.lang.fe.literal;
 use rslv:    mach.lang.fe.resolve;
 use src:     mach.lang.source;
 use sj:      std.data.json;
@@ -53,7 +55,7 @@ use mls.render;
 use std.allocator;
 # the legend, in the order the client is told about it at initialize. an index
 # into this list is what a token's `tokenType` field carries
-pub val TOKEN_TYPES:     str = "\"namespace\",\"type\",\"function\",\"variable\",\"parameter\",\"property\",\"typeParameter\"";
+pub val TOKEN_TYPES:     str = "\"namespace\",\"type\",\"function\",\"variable\",\"parameter\",\"property\",\"typeParameter\",\"string\"";
 pub val TOKEN_MODIFIERS: str = "\"declaration\",\"readonly\"";
 
 val T_NAMESPACE:      i64 = 0;
@@ -63,6 +65,7 @@ val T_VARIABLE:       i64 = 3;
 val T_PARAMETER:      i64 = 4;
 val T_PROPERTY:       i64 = 5;
 val T_TYPE_PARAMETER: i64 = 6;
+val T_STRING:         i64 = 7;
 
 val M_NONE:        i64 = 0;
 val M_DECLARATION: i64 = 1;
@@ -399,10 +402,10 @@ fun release(m: *Memo, p: *Prior) {
 
 # gather every classifiable span in the window
 #
-# The four walks are independent: a declaration's own name comes from the decl
-# table, a reference from the expression or type side tables, and an import leaf
-# from the declaration's path. Nothing orders them, which is why the caller
-# sorts. The window is applied where every walk converges, in `push`, so no walk
+# The walks are independent: a declaration's own name comes from the decl
+# table, a reference from the expression or type side tables, an import leaf
+# from the declaration's path, and a multiline string from its literal. Nothing
+# orders them, which is why the caller sorts. The window is applied where every walk converges, in `push`, so no walk
 # can forget it.
 fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     var n: usize = 0;
@@ -435,6 +438,15 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
         ei = ei + 1;
     }
 
+    var text: str = nil;
+    if (an.text.file != nil) { text = an.text.file.text; }
+    var si: usize = 0;
+    for (si < an.a.exprs.len && n < cap) {
+        val mo: opt[src.Span] = features.multiline_string(an.a, text, id.expr(si::u32));
+        if (sel mo.some) { n = push_multiline(text, mo.some, w, out, n, cap); }
+        si = si + 1;
+    }
+
     var ti: usize = 0;
     for (ti < an.a.types.len && n < cap) {
         val so: opt[rslv.SymbolId] = type_symbol(an, id.type(ti::u32));
@@ -448,6 +460,24 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
         ti = ti + 1;
     }
 
+    ret n;
+}
+
+# a multiline string as one string: a token for each of its lines, from the line's
+# `\\` to its end, since a token cannot cross a line. the lines are mach's own,
+# read through the literal's line walk
+fun push_multiline(text: str, tok: src.Span, w: Window, out: *Tok, count: usize, cap: usize) usize {
+    val v:  View  = src.span_view(text, tok);
+    var n:  usize = count;
+    var at: usize = 0;
+    for (at < v.len && n < cap) {
+        val line: literal.MultilineLine = literal.multiline_line(v, at);
+        var span: src.Span;
+        span.offset = tok.offset + at;
+        span.len    = line.start + line.len - at;
+        n           = push(out, n, cap, w, span, T_STRING, M_NONE);
+        at          = line.next;
+    }
     ret n;
 }
 

@@ -10,7 +10,8 @@
 # `endCharacter` at the brace itself so a client that folds by character keeps
 # the brace in view. A doc comment folds as a `comment` and a run of `use` and
 # `fwd` lines as `imports`, so a client's fold-all-comments and fold-all-imports
-# commands find them. A range that would hide no line is not reported.
+# commands find them. A multiline string folds as one region, wherever it sits.
+# A range that would hide no line is not reported.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -111,6 +112,19 @@ fun collect(e: *Emitter, a: *ast.Ast) {
         push_body(e, a, d);
     }
     if (in_run) { push(e, run, KIND_IMPORTS, false); }
+    collect_strings(e, a);
+}
+
+# every multiline string, folded as the one string mach's lexer reads it as, from
+# its first `\\` line to its last
+fun collect_strings(e: *Emitter, a: *ast.Ast) {
+    if (e.text.file == nil) { ret; }
+    var i: usize = 0;
+    for (i < a.exprs.len) {
+        val so: opt[src.Span] = features.multiline_string(a, e.text.file.text, id.expr(i::u32));
+        if (sel so.some) { push(e, so.some, nil, false); }
+        i = i + 1;
+    }
 }
 
 # the brace-delimited body of a declaration, when it has one
