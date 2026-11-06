@@ -45,8 +45,14 @@ isolated. Files outside a project use the upstream single-file editor API.
 Diagnostics own the analysis rather than reporting whichever snapshot a previous
 request happened to leave behind: open and change drive the load, so what the
 editor shows matches `mach build` from the first notification and does not move
-because hover or definition was requested. Documents outside any project fall
-back to standalone parse diagnostics. Republishing is scoped to the root that
+because hover or definition was requested. Only a document outside any project,
+with no `mach.toml` above it, falls back to the standalone analysis, which runs
+to sema because it is the only answer there is. A document under a manifest that
+failed to load, for example because no declared target can be selected, shows
+the manifest error and its own parse diagnostics and no semantic ones, since a
+fallback that does not know the project would invent errors the project does not
+have. The manifest error is put at the start of the buffer, pointing at its
+place, and on `mach.toml`. Republishing is scoped to the root that
 changed, so an edit in one project does not emit a notification for every open
 buffer in another. Watch registration is
 considered active only after the client acknowledges it; `didSave`, watched-file
@@ -291,11 +297,13 @@ the log will then contain fragments of whatever you have open.
 
 `dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml`: mach pinned to a release tag
-(`ref = "tag/v<version>"`) and std selected by the version range that mach builds with
-(`^9.0`), and fetched by `mach dep pull .`. The committed gitlinks under `dep/`
-are the pins; there is no lockfile. std follows the release mach's own CI,
-because the server and the compiler it links share one std.
+declared as git dependencies in `mach.toml` following their `dev` branches
+(`ref = "branch/dev"`), and fetched by `mach dep pull .`. The committed gitlinks
+under `dep/` are the pins; there is no lockfile. The pinned versions are mach
+6.10.1 and std 9.5.0, with mach's own dependencies pinned beside them as a flat
+closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`, `dep/deflate`,
+`dep/zstd`). std is the one mach's own pin names, because the server and the
+compiler it links share one std.
 
 ### Compiler compatibility
 
@@ -307,9 +315,11 @@ A project states the compilers it builds with as `[project].mach` in its
 `mach.toml`, and its dependencies may state their own. When the linked release
 is outside any of those ranges, the project is not loaded. The server shows
 why, naming each unmet range and the dependency chain that states it, as an
-error on the root's `mach.toml` and in a message. A root manifest without the
-key is refused the same way, with the line to add. Both clear when the manifest
-is fixed.
+error on `mach.toml` and in a message. A root manifest without the key is
+refused the same way, with the line to add. Both clear when the manifest is
+fixed. A manifest error is shown at the line and with the code mach reports for
+it, in the manifest it points into. One mach reports no place for stays at the
+start of the root's `mach.toml`.
 
 So a project that requires a newer mach than the server links needs a newer
 server. A release that moves the linked mach says so in the changelog, naming
@@ -333,7 +343,7 @@ a new mls major.
 | `transport` | LSP base-protocol framing over stdin/stdout |
 | `json` | JSON-RPC reading over `std.data.json`, plus LSP payload assembly |
 | `documents` | live URI/path/text/version/revision ownership plus fallback `FileId` |
-| `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback |
+| `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback outside a project and parse diagnostics under a refused one |
 | `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point, including across a stale snapshot's edits |
 | `textdiff` | the windows where a snapshot's text and the client's buffer differ |
 | `parked` | requests held until their root's snapshot catches up |

@@ -5,12 +5,16 @@
 # states no compiler range or the compiler is outside a range the closure
 # states. Neither belongs to a document the client has open, so the
 # per-document publish never carries them. The server shows them on the root's
-# `mach.toml` instead, and publishes that list again whenever it changes,
-# including to empty, so a fixed manifest never keeps an old complaint.
+# `mach.toml` instead, at the start of the file unless mach placed them. A
+# refusal mach placed is shown where it points, with its code, which can be a
+# dependency's manifest rather than the root's. Each file's list is published
+# again whenever it changes, including to empty, so a fixed manifest never keeps
+# an old complaint.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
@@ -25,10 +29,14 @@ use strutil: std.text.string;
 
 use diag:  mach.lang.diagnostic;
 use dkind: mach.lang.diagnostic.kind;
+use ferr:  mach.lang.fail;
 use src:   mach.lang.source;
 
 use mls.json;
+use mls.positions;
+use mls.render;
 use mls.transport;
+use mls.uris;
 
 # the LSP severities a compiler diagnostic maps to; its kind is an error or a warning
 pub val LSP_ERROR:   i64 = 1;
@@ -41,11 +49,14 @@ val MAX_NOTES: usize = 16;
 pub val LSP_TAG_UNNECESSARY: i64 = 1;
 pub val LSP_TAG_DEPRECATED:  i64 = 2;
 
-# one note: an LSP severity, the compiler's diagnostic kind and owned text
+# one note: an LSP severity, the compiler's diagnostic kind, owned text, and the
+# owned uri of the file it is shown on with its range there
 pub rec Note {
     severity: i64;
     kind:     dkind.Kind;
     text:     str;
+    uri:      str;
+    range:    positions.LspRange;
 }
 
 # a root's notes, owned
@@ -91,27 +102,62 @@ pub fun empty() Notes {
     ret Notes{items: nil, len: 0};
 }
 
-# the diagnostics `store` holds against no file
-pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore) Notes {
+# the empty range at the start of a file
+pub fun file_start() positions.LspRange {
+    ret positions.LspRange{start_line: 0, start_char: 0, end_line: 0, end_char: 0};
+}
+
+# the client's range for a place in a file, whose lines and columns count from 1
+pub fun place_range(p: ferr.Place) positions.LspRange {
+    ret positions.LspRange{
+        start_line: p.start.line - 1,
+        start_char: p.start.col - 1,
+        end_line:   p.end.line - 1,
+        end_char:   p.end.col - 1,
+    };
+}
+
+# the diagnostics `store` holds against no file, shown on the root's manifest
+pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore, manifest: str) Notes {
     var n: Notes = empty();
     var i: usize = 0;
     for (store != nil && i < store.items.len) {
         val d: *diag.Diagnostic = ?store.items.data[i];
-        if (src.file_is_nil(d.loc.file)) { add(alloc, ?n, lsp_severity(d), d.kind, d.message); }
+        if (src.file_is_nil(d.loc.file)) { add(alloc, ?n, lsp_severity(d), d.kind, d.message, manifest, file_start()); }
         i = i + 1;
     }
     ret n;
 }
 
-# one error: the reason a load was refused
-pub fun refusal(alloc: *Allocator, text: str) Notes {
-    var n: Notes = empty();
-    add(alloc, ?n, LSP_ERROR, dkind.NONE, text);
+# one error: the reason a load was refused, with the failure's code, at the place
+# the failure points when it points at one and on the root's manifest otherwise
+# ---
+# f:        the failure, read only for its kind and place
+# text:     the reason
+# manifest: the uri of the root's manifest
+pub fun refusal(alloc: *Allocator, f: ferr.Fail, text: str, manifest: str) Notes {
+    var n:     Notes              = empty();
+    val k:     dkind.Kind         = ferr.kind_of(f);
+    val po:    opt[ferr.Place]    = ferr.place_of(f);
+    var range: positions.LspRange = file_start();
+    var at:    str                = nil;
+    if (sel po.some) {
+        if (po.some.spanned) {
+            at    = uris.of_path(alloc, po.some.path);
+            range = place_range(po.some);
+        }
+    }
+    if (at == nil) {
+        add(alloc, ?n, LSP_ERROR, k, text, manifest, file_start());
+        ret n;
+    }
+    add(alloc, ?n, LSP_ERROR, k, text, at, range);
+    strutil.str_free(alloc, at);
     ret n;
 }
 
-fun add(alloc: *Allocator, n: *Notes, severity: i64, kind: dkind.Kind, text: str) {
-    if (text == nil || n.len >= MAX_NOTES) { ret; }
+fun add(alloc: *Allocator, n: *Notes, severity: i64, kind: dkind.Kind, text: str, uri: str, range: positions.LspRange) {
+    if (text == nil || uri == nil || n.len >= MAX_NOTES) { ret; }
     if (n.items == nil) {
         val r: res[*Note, allocator.Error] = allocate[Note](alloc, MAX_NOTES);
         if (sel r.err) { ret; }
@@ -119,17 +165,29 @@ fun add(alloc: *Allocator, n: *Notes, severity: i64, kind: dkind.Kind, text: str
     }
     val dr: res[str, allocator.Error] = strutil.str_dup(alloc, text);
     if (sel dr.err) { ret; }
-    n.items[n.len] = Note{severity: severity, kind: kind, text: dr.ok};
+    val ur: res[str, allocator.Error] = strutil.str_dup(alloc, uri);
+    if (sel ur.err) {
+        strutil.str_free(alloc, dr.ok);
+        ret;
+    }
+    n.items[n.len] = Note{severity: severity, kind: kind, text: dr.ok, uri: ur.ok, range: range};
     n.len          = n.len + 1;
+}
+
+fun same_range(a: *positions.LspRange, b: *positions.LspRange) bool {
+    ret a.start_line == b.start_line && a.start_char == b.start_char
+        && a.end_line == b.end_line && a.end_char == b.end_char;
 }
 
 pub fun equal(a: *Notes, b: *Notes) bool {
     if (a.len != b.len) { ret false; }
     var i: usize = 0;
     for (i < a.len) {
-        if (a.items[i].severity != b.items[i].severity)    { ret false; }
-        if (a.items[i].kind != b.items[i].kind)            { ret false; }
-        if (!str_equals(a.items[i].text, b.items[i].text)) { ret false; }
+        if (a.items[i].severity != b.items[i].severity)        { ret false; }
+        if (a.items[i].kind != b.items[i].kind)                { ret false; }
+        if (!str_equals(a.items[i].text, b.items[i].text))     { ret false; }
+        if (!str_equals(a.items[i].uri, b.items[i].uri))       { ret false; }
+        if (!same_range(?a.items[i].range, ?b.items[i].range)) { ret false; }
         i = i + 1;
     }
     ret true;
@@ -139,29 +197,61 @@ pub fun dnit(alloc: *Allocator, n: *Notes) {
     var i: usize = 0;
     for (i < n.len) {
         strutil.str_free(alloc, n.items[i].text);
+        strutil.str_free(alloc, n.items[i].uri);
         i = i + 1;
     }
     if (n.items != nil) { deallocate[Note](alloc, n.items, MAX_NOTES); }
     @n = empty();
 }
 
-# publish `n` as the diagnostics of `uri`, the root's manifest, replacing
-# whatever was published there before
-pub fun publish(alloc: *Allocator, uri: str, n: *Notes) {
-    if (uri == nil) { ret; }
+# whether a note among the first `upto` of `n` is on `uri`
+fun names(n: *Notes, uri: str, upto: usize) bool {
+    var i: usize = 0;
+    for (i < upto) {
+        if (str_equals(n.items[i].uri, uri)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# publish `now` over `was`: every file `now` names gets its list, and a file only
+# `was` named gets an empty one, which is what takes its complaint away
+pub fun publish(alloc: *Allocator, was: *Notes, now: *Notes) {
+    var i: usize = 0;
+    for (i < now.len) {
+        if (!names(now, now.items[i].uri, i)) { publish_file(alloc, now.items[i].uri, now); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < was.len) {
+        val uri: str = was.items[i].uri;
+        if (!names(was, uri, i) && !names(now, uri, now.len)) { publish_file(alloc, uri, now); }
+        i = i + 1;
+    }
+}
+
+# publish the notes of `n` on `uri` as that file's diagnostics, replacing whatever
+# was published there before
+fun publish_file(alloc: *Allocator, uri: str, n: *Notes) {
     var b: json.Buf = json.buf_init(alloc);
     json.buf_push(?b, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":");
     json.buf_push_quoted(?b, uri);
     json.buf_push(?b, ",\"diagnostics\":[");
-    var i: usize = 0;
+    var written: usize = 0;
+    var i:       usize = 0;
     for (i < n.len) {
-        if (i > 0) { json.buf_push_byte(?b, ','); }
-        json.buf_push(?b, "{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":");
-        json.buf_push_i64(?b, n.items[i].severity);
-        push_kind(?b, n.items[i].kind);
-        json.buf_push(?b, ",\"source\":\"mach\",\"message\":");
-        json.buf_push_quoted(?b, n.items[i].text);
-        json.buf_push_byte(?b, '}');
+        if (str_equals(n.items[i].uri, uri)) {
+            if (written > 0) { json.buf_push_byte(?b, ','); }
+            json.buf_push(?b, "{\"range\":");
+            render.range(?b, n.items[i].range);
+            json.buf_push(?b, ",\"severity\":");
+            json.buf_push_i64(?b, n.items[i].severity);
+            push_kind(?b, n.items[i].kind);
+            json.buf_push(?b, ",\"source\":\"mach\",\"message\":");
+            json.buf_push_quoted(?b, n.items[i].text);
+            json.buf_push_byte(?b, '}');
+            written = written + 1;
+        }
         i = i + 1;
     }
     json.buf_push(?b, "]}}");
@@ -180,8 +270,8 @@ test capture_keeps_only_the_diagnostics_with_no_file_in_order_with_their_kind {
     diag.record(?store, dkind.DECL_DEPRECATED, src.FILE_NIL, span, "no range");
     diag.record(?store, dkind.IMPORT_UNUSED, src.file_id(3), span, "in a file");
     diag.record(?store, dkind.MANIFEST_INVALID_VALUE, src.FILE_NIL, span, "refused");
-    var n:    Notes = capture(?pa, ?store);
-    var same: Notes = capture(?pa, ?store);
+    var n:    Notes = capture(?pa, ?store, "file:///w/mach.toml");
+    var same: Notes = capture(?pa, ?store, "file:///w/mach.toml");
     var none: Notes = empty();
     var fail: bool  = false;
     if (n.len != 2)                                      { fail = true; }
