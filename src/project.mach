@@ -1002,6 +1002,10 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     # behind the diagnostics stay readable while the user types. the root set is
     # every artifact's closure with the open buffers' modules beside it, so a file
     # is checked in the artifact its entry reaches
+    val manifest: str = manifest_uri(alloc, in.root_path);
+    fin {
+        if (manifest != nil) { strutil.str_free(alloc, manifest); }
+    }
     var req: editor.ProjectRequest = editor.project_request(in.root_path, editor.PHASE_SEMA);
     req.buffers      = buffers;
     req.buffer_count = count;
@@ -1009,19 +1013,19 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     if (buffers != nil) { deallocate[editor.ProjectBuffer](alloc, buffers, in.doc_count::usize); }
     if (sel opened.err) {
         var f: fail.Fail = opened.err;
-        refuse(o, ?f);
+        refuse(o, ?f, manifest);
         fail.dnit(sn.alloc, f);
         ret;
     }
 
     var snap: editor.ProjectSnapshot = opened.ok;
-    o.manifest_notes = notes.capture(alloc, snap.diagnostics);
+    o.manifest_notes = notes.capture(alloc, snap.diagnostics, manifest);
     if (!snap.loaded) {
         o.message = dup_str(alloc, snapshot_message(?snap));
         if (sel snap.failure.some) {
             if (!fail.is_reported(snap.failure.some)) {
                 notes.dnit(alloc, ?o.manifest_notes);
-                o.manifest_notes = notes.refusal(alloc, o.message);
+                o.manifest_notes = notes.refusal(alloc, snap.failure.some, o.message, manifest);
             }
         }
         park_snapshot(o, ?snap);
@@ -1058,9 +1062,18 @@ fun snapshot_message(snap: *editor.ProjectSnapshot) str {
 
 # record why a load was refused: the text the server reports, and, unless the
 # detail already went to located diagnostics, a note for the manifest
-fun refuse(o: *BuildOutput, f: *lfail.Fail) {
+fun refuse(o: *BuildOutput, f: *lfail.Fail, manifest: str) {
     o.message = dup_str(o.alloc, fail_message(f));
-    if (!lfail.is_reported(@f)) { o.manifest_notes = notes.refusal(o.alloc, o.message); }
+    if (!lfail.is_reported(@f)) { o.manifest_notes = notes.refusal(o.alloc, @f, o.message, manifest); }
+}
+
+# the owned uri of the manifest at `root_path`, or nil
+fun manifest_uri(alloc: *Allocator, root_path: str) str {
+    val jr: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, root_path, "mach.toml");
+    if (sel jr.err) { ret nil; }
+    val uri: str = uris.of_path(alloc, jr.ok);
+    strutil.str_free(alloc, jr.ok);
+    ret uri;
 }
 
 # install a finished build as `r`'s serving snapshot, releasing the old one
@@ -1135,13 +1148,7 @@ fun show_notes(w: *Workspace, r: *Root, o: *BuildOutput) {
         notes.dnit(w.alloc, ?o.manifest_notes);
         ret;
     }
-    val jr: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, r.path, "mach.toml");
-    if (sel jr.ok) {
-        val uri: str = uris.of_path(w.alloc, jr.ok);
-        notes.publish(w.alloc, uri, ?o.manifest_notes);
-        if (uri != nil) { strutil.str_free(w.alloc, uri); }
-        strutil.str_free(w.alloc, jr.ok);
-    }
+    notes.publish(w.alloc, ?r.manifest_notes, ?o.manifest_notes);
     notes.dnit(w.alloc, ?r.manifest_notes);
     r.manifest_notes = o.manifest_notes;
     o.manifest_notes = notes.empty();

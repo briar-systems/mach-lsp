@@ -164,7 +164,7 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
         if (n >= MAX_DIAGNOSTICS) { ret; }
         if (n > 0)                { json.buf_push_byte(b, ','); }
         json.buf_push(b, "{\"range\":");
-        render.range(b, document_start());
+        render.range(b, notes.file_start());
         json.buf_push(b, ",\"severity\":");
         json.buf_push_i64(b, notes.LSP_ERROR);
         notes.push_kind(b, ferr.kind_of(f));
@@ -183,7 +183,7 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
         if (!src.file_same(d.loc.file, own)) {
             if (n > 0) { json.buf_push_byte(b, ','); }
             json.buf_push(b, "{\"range\":");
-            render.range(b, document_start());
+            render.range(b, notes.file_start());
             json.buf_push(b, ",\"severity\":");
             json.buf_push_i64(b, notes.lsp_severity(d));
             notes.push_kind(b, d.kind);
@@ -197,25 +197,15 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
     }
 }
 
-# the empty range at the start of a document
-fun document_start() positions.LspRange {
-    ret positions.LspRange{start_line: 0, start_char: 0, end_line: 0, end_char: 0};
-}
-
 # append `,"relatedInformation":[...]` holding the one place a failure points at
 fun push_place(b: *json.Buf, p: ferr.Place, label: str, alloc: *Allocator) {
     if (!p.spanned) { ret; }
     val u: str = uris.of_path(alloc, p.path);
     if (u == nil) { ret; }
-    var rng: positions.LspRange;
-    rng.start_line = p.start.line - 1;
-    rng.start_char = p.start.col - 1;
-    rng.end_line   = p.end.line - 1;
-    rng.end_char   = p.end.col - 1;
     json.buf_push(b, ",\"relatedInformation\":[{\"location\":{\"uri\":");
     json.buf_push_quoted(b, u);
     json.buf_push(b, ",\"range\":");
-    render.range(b, rng);
+    render.range(b, notes.place_range(p));
     json.buf_push(b, "},\"message\":");
     json.buf_push_quoted(b, label);
     json.buf_push(b, "}]");
