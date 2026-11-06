@@ -1421,15 +1421,17 @@ fun maybe_reload(w: *Workspace, r: *Root) {
 # A root with a snapshot is rebuilt by `pump` once a change marks it dirty. A
 # root without one is otherwise retried only when a request reaches it, so a
 # manifest fixed outside the editor would keep showing its refusal until then.
+# A retry that is refused again counts too: the reason its buffers show can move.
 # ---
-# ret: whether any root loaded
+# ret: whether any root was retried
 pub fun retry_failed(w: *Workspace) bool {
     var any: bool = false;
     var i:   u32  = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && r.s != nil && !r.loaded && r.dirty) {
-            if (try_load(w, r)) { any = true; }
+            try_load(w, r);
+            any = true;
         }
         i = i + 1;
     }

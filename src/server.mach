@@ -1209,7 +1209,12 @@ fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) 
         trace.log("server: newer input queued, deferring analysis\n");
         ret;
     }
-    srv.deferred = false;
+    # a burst may have deferred documents this one's root does not reach
+    if (srv.deferred) {
+        srv.deferred = false;
+        republish_all(srv);
+        ret;
+    }
     republish_root(srv, project.root_for(?srv.ws, doc.uri), doc);
 }
 
