@@ -41,7 +41,9 @@ use mls.uris;
 val MAX_DIAGNOSTICS: usize = 200;
 
 # publish compiler-owned diagnostics for a document's exact snapshot, falling
-# back to isolated editor diagnostics outside a project
+# back to isolated editor diagnostics outside a project; a document under a
+# manifest that failed to load shows the refusal and its own parse, never a
+# fallback analysis that knows nothing of the project
 #
 # The analysis is DRIVEN here rather than merely read. Publishing used to take
 # whatever snapshot a previous request happened to leave behind, so a file with
@@ -74,6 +76,8 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     var list:   *diag.DiagnosticStore = nil;
     var result: editor.AnalysisResult = editor.AnalysisResult{};
     result.alloc = nil;
+    var refused: editor.AnalysisResult = editor.AnalysisResult{};
+    refused.alloc = nil;
     var at:  Locator                        = Locator{w: w, root: nil, sources: nil};
     var own: src.FileId                     = d.file_id;
     val vr:  res[project.DocumentView, str] = project.document_view(w, d);
@@ -107,12 +111,25 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         # its way to replace, and running to sema would drag the whole import
         # closure through the analysis thread - the very cost moving the rebuild
         # off it was meant to remove. Parse is what the buffer can say about
-        # itself instantly; the post-swap republish carries the rest.
-        var phase: editor.AnalysisPhase = editor.PHASE_SEMA;
-        if (project.root_for_loaded(w, d.uri) != nil)  { phase = editor.PHASE_PARSE; }
+        # itself instantly; the post-swap republish carries the rest. Under a
+        # manifest that failed to load the authority is the project too, and
+        # what it says is the refusal, so a fallback's semantics would only
+        # contradict it: an `embed` it cannot see the artifact of reads as the
+        # error when the real one is that no target could be selected (#375).
+        val governed: bool                 = project.has_project(w, d.uri);
+        var phase:    editor.AnalysisPhase = editor.PHASE_SEMA;
+        if (governed)                                  { phase = editor.PHASE_PARSE; }
         if (!standalone(es, d, phase, alloc, ?result)) { ret; }
         list       = result.diagnostics;
         at.sources = ?es.s.sources;
+        # a parse never consults the project, so the refusal comes from a resolve,
+        # the first phase that does; what it says about the buffer goes unread
+        if (governed && project.root_for_loaded(w, d.uri) == nil) {
+            if (!standalone(es, d, editor.PHASE_RESOLVE, alloc, ?refused)) {
+                editor.analysis_dnit(?result);
+                ret;
+            }
+        }
     }
 
     var b: json.Buf = json.buf_init(alloc);
@@ -131,18 +148,22 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         }
         i = i + 1;
     }
-    if (at.root == nil) { push_refusal(?b, ?at, ?result, own, alloc, written); }
+    if (at.root == nil) {
+        if (refused.alloc != nil) { push_refusal(?b, ?at, ?refused, own, alloc, written); }
+        or                        { push_refusal(?b, ?at, ?result, own, alloc, written); }
+    }
     json.buf_push(?b, "]}}");
 
     val msg: str = json.buf_str(?b);
     if (msg != nil) { transport.send_message(msg, alloc); }
     json.buf_dnit(?b);
+    editor.analysis_dnit(?refused);
     editor.analysis_dnit(?result);
 }
 
 # the reason the buffer's project could not be loaded, shown on the buffer
 #
-# A buffer under a manifest that `mach check` refuses is analyzed standalone, and
+# A buffer under a manifest that `mach check` refuses is resolved standalone, and
 # the refusal rides the envelope's failure rather than the buffer's own
 # diagnostics: a reported one through diagnostics on other files, such as the
 # manifest, any other through its text. Each is put at the start of the buffer,
@@ -151,7 +172,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 # ---
 # b:       the diagnostics array being written
 # at:      where the result's file ids resolve
-# result:  the standalone envelope, zero when none ran
+# result:  the standalone envelope that consulted the project, zero when none ran
 # own:     the buffer's file id, whose diagnostics are already written
 # alloc:   message allocator
 # written: entries already in the array

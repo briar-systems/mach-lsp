@@ -45,8 +45,14 @@ isolated. Files outside a project use the upstream single-file editor API.
 Diagnostics own the analysis rather than reporting whichever snapshot a previous
 request happened to leave behind: open and change drive the load, so what the
 editor shows matches `mach build` from the first notification and does not move
-because hover or definition was requested. Documents outside any project fall
-back to standalone parse diagnostics. Republishing is scoped to the root that
+because hover or definition was requested. Only a document outside any project,
+with no `mach.toml` above it, falls back to the standalone analysis, which runs
+to sema because it is the only answer there is. A document under a manifest that
+failed to load, for example because no declared target can be selected, shows
+the manifest error and its own parse diagnostics and no semantic ones, since a
+fallback that does not know the project would invent errors the project does not
+have. The manifest error is put at the start of the buffer, pointing at its
+place, and on `mach.toml`. Republishing is scoped to the root that
 changed, so an edit in one project does not emit a notification for every open
 buffer in another. Watch registration is
 considered active only after the client acknowledges it; `didSave`, watched-file
@@ -337,7 +343,7 @@ a new mls major.
 | `transport` | LSP base-protocol framing over stdin/stdout |
 | `json` | JSON-RPC reading over `std.data.json`, plus LSP payload assembly |
 | `documents` | live URI/path/text/version/revision ownership plus fallback `FileId` |
-| `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback |
+| `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback outside a project and parse diagnostics under a refused one |
 | `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point, including across a stale snapshot's edits |
 | `textdiff` | the windows where a snapshot's text and the client's buffer differ |
 | `parked` | requests held until their root's snapshot catches up |
