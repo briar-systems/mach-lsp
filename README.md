@@ -320,8 +320,7 @@ A project states the compilers it builds with as `[project].mach` in its
 is outside any of those ranges, the project is not loaded. The server shows
 why, naming each unmet range and the dependency chain that states it, as an
 error on `mach.toml` and in a message. A root manifest without the key is
-refused the same way, with the line to add. Both clear when the manifest is
-fixed. A manifest error is shown at the line and with the code mach reports for
+refused the same way, naming the key. Both clear when the manifest is fixed. A manifest error is shown at the line and with the code mach reports for
 it, in the manifest it points into. One mach reports no place for stays at the
 start of the root's `mach.toml`.
 
