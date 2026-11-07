@@ -487,7 +487,7 @@ def write_project(parent: Path, project_id: str, value: int) -> tuple[Path, Path
 id = "{project_id}"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 arch = "x86_64"
@@ -495,11 +495,9 @@ sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -560,7 +558,7 @@ def write_vendored_project(parent: Path) -> tuple[Path, Path, str, str]:
 id = "vendorapp"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux]
 arch = "x86_64"
@@ -568,11 +566,9 @@ sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -592,7 +588,7 @@ path = "dep/vendorlib"
 id = "vendorlib"
 version = "0.1.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [artifact.lib]
 kind = "static"
@@ -1070,7 +1066,7 @@ def write_wide_project(parent: Path, project_id: str, modules: int) -> tuple[Pat
 id = "{project_id}"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 arch = "x86_64"
@@ -1078,11 +1074,9 @@ sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -1659,7 +1653,7 @@ def run_position_encoding(server: Path, timeout: float) -> None:
 id = "penc"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 arch = "x86_64"
@@ -1667,11 +1661,9 @@ sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -1900,7 +1892,7 @@ def run_embed_required_artifact(server: Path, timeout: float) -> None:
 id = "lessons"
 version = "0.1.0"
 src = "src"
-out = "out"
+work = "out"
 
 [target.spirv]
 arch = "spirv"
@@ -1916,11 +1908,10 @@ abi = "sysv64"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
 vectorize = false
-float_reassoc = false
 
 [artifact.hello]
 default = true
@@ -2689,7 +2680,7 @@ NAV_MANIFEST = f"""[project]
 id = "nav"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 arch = "x86_64"
@@ -2697,11 +2688,9 @@ sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -3883,7 +3872,7 @@ def write_std_backed_project(parent: Path) -> tuple[Path, str]:
 id = "stdapp"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux]
 arch = "x86_64"
@@ -3891,11 +3880,9 @@ sys = "linux"
 abi = "sysv64"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -4447,7 +4434,7 @@ def run_completion_dependency_alias_while_behind(server: Path, timeout: float) -
 id = "depalias"
 version = "0.1.0"
 src = "src"
-out = "out/{{target.name}}/{{profile.name}}"
+work = "out/{{target.name}}/{{profile.name}}"
 
 [target.linux-x86_64]
 arch = "x86_64"
@@ -4473,11 +4460,10 @@ abi = "aapcs64"
 path = "dep/std"
 
 [profile.debug]
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
 vectorize = false
-float_reassoc = false
 
 [artifact.app]
 kind = "bin"
@@ -5023,10 +5009,9 @@ def run_completion_fwd_reexport_members(server: Path, timeout: float) -> None:
         source.mkdir(parents=True)
         (project / "mach.toml").write_text(
             f'[project]\n{COMPILER_RANGE}\nid = "fwd"\nversion = "0.1.0"\nsrc = "src"\n'
-            'out = "out/{target.name}/{profile.name}"\n\n'
-            '[target.linux-x86_64]\nisa = "x86_64"\nos = "linux"\nabi = "sysv64"\n\n'
-            '[profile.debug]\nopt = 0\ndebug = true\nsimd = "scalarize"\n'
-            'vectorize = true\nfloat_reassoc = false\n\n'
+            'work = "out/{target.name}/{profile.name}"\n\n'
+            '[target.linux-x86_64]\narch = "x86_64"\nsys = "linux"\nabi = "sysv64"\n\n'
+            '[profile.debug]\noptimize = false\ndebug = true\nsimd = "scalarize"\n\n'
             '[artifact.app]\nkind = "bin"\nentry = "main.mach"\nout = "bin/app"\n'
             'targets = ["*"]\nlink = []\nneed = []\n',
             encoding="utf-8")
