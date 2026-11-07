@@ -48,7 +48,9 @@ use pathlib: std.types.path;
 use std.allocator.page;
 use mem: std.memory;
 
-use diag: mach.lang.diagnostic;
+use diag:     mach.lang.diagnostic;
+use dfront:   mach.lang.driver.frontend;
+use dproject: mach.lang.driver.project;
 use mach.lang.editor;
 use mach.lang.fe.ast;
 use adecl: mach.lang.fe.ast.decl;
@@ -1869,12 +1871,15 @@ fun module_sema(root: *Root, i: u32) *sema.SemaResult {
     ret r.ok;
 }
 
-# whether the snapshot's own parse of the module at index `i` was accepted
+# whether the snapshot's own parse of the module at index `i` was accepted. the
+# module's standing would not do: it also takes resolve and sema, and a module
+# that parsed with a name error is what a stale buffer carries diagnostics from
 fun module_parse_ok(root: *Root, i: u32) bool {
-    if (!module_live(root, i)) { ret false; }
-    val r: res[fail.PhaseStatus, fail.Fail] = editor.project_module_status(?root.snap, i);
-    if (sel r.err) { ret false; }
-    ret fail.is_accepted(r.ok);
+    if (module_ast(root, i) == nil) { ret false; }
+    val m:     *dproject.ModuleEntry    = dproject.module_at(?root.snap.project, i);
+    val shown: opt[dfront.ParsedModule] = dfront.parsed(?root.snap.project, m);
+    if (sel shown.none) { ret false; }
+    ret fail.is_accepted(shown.some.status);
 }
 
 # release a Site's URI when it owns one

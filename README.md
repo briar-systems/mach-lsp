@@ -300,10 +300,14 @@ surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
 declared as git dependencies in `mach.toml` following their `dev` branches
 (`ref = "branch/dev"`), and fetched by `mach dep pull .`. The committed gitlinks
 under `dep/` are the pins; there is no lockfile. The pinned versions are mach
-6.10.1 and std 9.5.0, with mach's own dependencies pinned beside them as a flat
-closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`, `dep/deflate`,
-`dep/zstd`). std is the one mach's own pin names, because the server and the
-compiler it links share one std.
+dev at `c8d19eb` and std 9.5.0 at `ffee015`, with mach's own dependencies pinned
+beside them as a flat closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`,
+`dep/deflate`, `dep/zstd`). std is the one mach's own pin names, because the
+server and the compiler it links share one std.
+
+That mach is the v7 language ahead of its release, so it still reports version
+6.10.1 and `[project].mach` stays `^6`. The source is on v7 spellings, which a
+6.x release refuses: build it with a compiler built from the `dep/mach` tree.
 
 ### Compiler compatibility
 
@@ -316,10 +320,10 @@ A project states the compilers it builds with as `[project].mach` in its
 is outside any of those ranges, the project is not loaded. The server shows
 why, naming each unmet range and the dependency chain that states it, as an
 error on `mach.toml` and in a message. A root manifest without the key is
-refused the same way, with the line to add. Both clear when the manifest is
-fixed. A manifest error is shown at the line and with the code mach reports for
-it, in the manifest it points into. One mach reports no place for stays at the
-start of the root's `mach.toml`.
+refused the same way, naming the key. Both clear when the manifest is fixed. A
+manifest error is shown at the line and with the code mach reports for it, in
+the manifest it points into. One mach reports no place for stays at the start of
+the root's `mach.toml`.
 
 So a project that requires a newer mach than the server links needs a newer
 server. A release that moves the linked mach says so in the changelog, naming
