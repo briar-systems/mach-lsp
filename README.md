@@ -300,10 +300,14 @@ surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
 declared as git dependencies in `mach.toml` following their `dev` branches
 (`ref = "branch/dev"`), and fetched by `mach dep pull .`. The committed gitlinks
 under `dep/` are the pins; there is no lockfile. The pinned versions are mach
-6.10.1 and std 9.5.0, with mach's own dependencies pinned beside them as a flat
-closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`, `dep/deflate`,
-`dep/zstd`). std is the one mach's own pin names, because the server and the
-compiler it links share one std.
+dev at `c8d19eb` and std 9.5.0 at `ffee015`, with mach's own dependencies pinned
+beside them as a flat closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`,
+`dep/deflate`, `dep/zstd`). std is the one mach's own pin names, because the
+server and the compiler it links share one std.
+
+That mach is the v7 language ahead of its release, so it still reports version
+6.10.1 and `[project].mach` stays `^6`. The source is on v7 spellings, which a
+6.x release refuses: build it with a compiler built from the `dep/mach` tree.
 
 ### Compiler compatibility
 
