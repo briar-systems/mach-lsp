@@ -584,11 +584,22 @@ path = "dep/vendorlib"
         encoding="utf-8",
     )
     (dep_root / "mach.toml").write_text(
-        """[project]
+        f"""[project]
+{COMPILER_RANGE}
 id = "vendorlib"
 version = "0.1.0"
 src = "src"
-work = "out/{target.name}/{profile.name}"
+work = "out/{{target.name}}/{{profile.name}}"
+
+[target.linux-x86_64]
+arch = "x86_64"
+sys = "linux"
+abi = "sysv64"
+
+[profile.debug]
+optimize = false
+debug = true
+simd = "scalarize"
 
 [artifact.lib]
 kind = "static"
@@ -1768,10 +1779,7 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
     as one that did. A stale complaint on a fixed file is the failure this
     guards.
     """
-    # the range the refusal tells the user to add is read from the refusal itself,
-    # since the compiler chooses it (the oldest release that reads the key, not the
-    # running one) and may change it across versions
-    admitted = ""
+    admitted = COMPILER_RANGE
     refused = 'mach = "^99"'
 
     def notes_for(session: LspSession, uri: str, want: Callable[[list[dict[str, Any]]], bool],
@@ -1818,12 +1826,8 @@ def run_manifest_notes(server: Path, timeout: float) -> None:
         finished = False
         try:
             open_doc(session, root, main, text)
-            found = notes_for(session, uri, one(1, "states no compiler range"),
-                              "the missing-range refusal on mach.toml")
-            suggested = re.search(r'mach = "([^"]+)"', found[0]["message"])
-            require(suggested is not None,
-                    f"the refusal does not name the line to add: {found[0]!r}")
-            admitted = f'mach = "{suggested.group(1)}"'
+            notes_for(session, uri, one(1, "missing required key 'mach'"),
+                      "the missing-range refusal on mach.toml")
 
             set_range(admitted)
             changed(session, uri)
@@ -1885,8 +1889,8 @@ def run_embed_required_artifact(server: Path, timeout: float) -> None:
     require" on a file whose artifact does require it, through a `need` glob.
     An output no artifact requires is still refused.
     """
-    # the default target selects the cell on every host: with two targets and
-    # neither matching the host, the manifest selects none and the root does not load
+    # the target matching the host selects the cell: with two targets and neither
+    # matching the host, the manifest selects none and the root does not load
     manifest = f"""[project]
 {COMPILER_RANGE}
 id = "lessons"
@@ -1896,12 +1900,11 @@ work = "out"
 
 [target.spirv]
 arch = "spirv"
-sys = "freestanding"
-abi = "spirv"
+sys = "vulkan"
+abi = "shader"
 env = "vulkan1.0"
 
 [target.linux-x86_64]
-default = true
 arch = "x86_64"
 sys = "linux"
 abi = "sysv64"
@@ -1911,7 +1914,6 @@ default = true
 optimize = false
 debug = true
 simd = "scalarize"
-vectorize = false
 
 [artifact.hello]
 default = true
@@ -1933,7 +1935,7 @@ need = ["artifact.shader-*"]
 [artifact.shader-vert]
 kind = "bin"
 entry = "shaders/vert.mach"
-out = "spv/vert{{artifact.suffix}}"
+out = "{{project.work}}/spv/vert{{artifact.suffix}}"
 targets = ["spirv"]
 link = []
 need = []
@@ -4463,7 +4465,6 @@ path = "dep/std"
 optimize = false
 debug = true
 simd = "scalarize"
-vectorize = false
 
 [artifact.app]
 kind = "bin"
