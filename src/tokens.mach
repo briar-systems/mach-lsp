@@ -34,6 +34,7 @@ use std.allocator.reallocate;
 use std.collections.sort;
 use std.types.string.str_equals;
 
+use sj: json.value;
 use mach.lang.editor;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
@@ -41,7 +42,6 @@ use mach.lang.fe.ast.id;
 use mach.lang.fe.literal;
 use rslv:    mach.lang.fe.resolve;
 use src:     mach.lang.source;
-use sj:      std.data.json;
 use strutil: std.text.string;
 
 use mls.analysis;

@@ -210,7 +210,7 @@ fun replace(st: *Store, d: *Document, path: str, text: str, version: i64) res[*D
 # ret: the buffer's source file, or nil
 pub fun live_file(st: *Store, d: *Document) *src.SourceFile {
     if (st == nil || d == nil) { ret nil; }
-    val fo: opt[*src.SourceFile] = src.get(?st.es.s.sources, d.file_id);
+    val fo: opt[*src.SourceFile] = src.get(st.es.s.sources, d.file_id);
     if (sel fo.some) { ret fo.some; }
     ret nil;
 }

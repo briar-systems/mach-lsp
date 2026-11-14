@@ -57,6 +57,7 @@ use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
 
+use sj: json.value;
 use mls.json;
 use mls.mirror;
 use mls.pending;
@@ -64,7 +65,6 @@ use mls.settings;
 use mls.sideband;
 use mls.trace;
 use mls.transport;
-use sj: std.data.json;
 
 # the argument that selects the worker role
 #

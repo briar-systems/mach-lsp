@@ -345,7 +345,7 @@ a new mls major.
 | `server` | lifecycle state, reading loop, and the analysis-thread dispatch |
 | `jobs` | bounded message queue feeding the single analysis thread |
 | `transport` | LSP base-protocol framing over stdin/stdout |
-| `json` | JSON-RPC reading over `std.data.json`, plus LSP payload assembly |
+| `json` | JSON-RPC reading over the `json` package, plus LSP payload assembly |
 | `documents` | live URI/path/text/version/revision ownership plus fallback `FileId` |
 | `diagnostics` | publish compiler snapshot diagnostics, with single-file fallback outside a project and parse diagnostics under a refused one |
 | `positions` | byte offset ⇄ LSP `(line, character)` (UTF-16 columns ⇄ bytes) and span text — the single conversion point, including across a stale snapshot's edits |

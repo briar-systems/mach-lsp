@@ -38,7 +38,7 @@ use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
 
-use sj: std.data.json;
+use sj: json.value;
 
 use mls.json;
 use mls.textedit;

@@ -33,6 +33,7 @@ use mach.lang.editor;
 use sess: mach.lang.session;
 use src:  mach.lang.source;
 
+use sj: json.value;
 use mls.actions;
 use mls.callhierarchy;
 use mls.diagnostics;
@@ -59,7 +60,6 @@ use mls.transport;
 use mls.uris;
 use mls.version;
 use mls.workspace;
-use sj: std.data.json;
 use std.process.exec;
 use std.sync.atomic;
 

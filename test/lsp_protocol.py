@@ -1933,7 +1933,7 @@ link = []
 need = ["artifact.shader-*"]
 
 [artifact.shader-vert]
-kind = "bin"
+kind = "module"
 entry = "shaders/vert.mach"
 out = "{{project.work}}/spv/vert{{artifact.suffix}}"
 targets = ["spirv"]
@@ -3844,9 +3844,9 @@ SYNTAX_ONLY_STD_MODULES = (
     "std.chrono.format", "std.chrono.time", "std.collections.bitset", "std.collections.deque",
     "std.collections.heap", "std.collections.map", "std.collections.set",
     "std.collections.slice", "std.collections.sort", "std.collections.vector",
-    "std.compress.gzip", "std.compress.inflate", "std.compress.zlib", "std.crypto.ct",
-    "std.crypto.hash.crc32", "std.crypto.hash.sha256", "std.crypto.hash.sha512",
-    "std.crypto.hash.keccak", "std.crypto.rand", "std.data.json", "std.data.toml",
+    "std.crypto.ct", "std.crypto.hash.fnv1a", "std.crypto.hash.siphash", "std.crypto.rand",
+    "std.encoding.leb128", "std.net.resolve", "std.net.tcp", "std.net.udp",
+    "std.sync.channel", "std.sync.thread", "std.text.utf8",
     "std.encoding.base64", "std.encoding.binary", "std.encoding.hex", "std.filesystem",
     "std.format", "std.input", "std.io.file", "std.io.reader", "std.io.writer",
     "std.log", "std.math", "std.math.bignum", "std.math.bits", "std.math.float",

@@ -20,6 +20,7 @@ use std.types.string.str;
 
 use std.allocator.Allocator;
 
+use sj: json.value;
 use mach.lang.editor;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
@@ -27,7 +28,6 @@ use mach.lang.fe.ast.id;
 use atype: mach.lang.fe.ast.type;
 use rslv:  mach.lang.fe.resolve;
 use src:   mach.lang.source;
-use sj:    std.data.json;
 
 use mls.analysis;
 use mls.documents;

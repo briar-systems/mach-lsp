@@ -37,7 +37,7 @@ use std.allocator;
 use std.allocator.Allocator;
 use std.process.env;
 
-use sj:      std.data.json;
+use sj:      json.value;
 use strutil: std.text.string;
 use pathlib: std.types.path;
 

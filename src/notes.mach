@@ -107,16 +107,6 @@ pub fun file_start() positions.LspRange {
     ret positions.LspRange{start_line: 0, start_char: 0, end_line: 0, end_char: 0};
 }
 
-# the client's range for a place in a file, whose lines and columns count from 1
-pub fun place_range(p: ferr.Place) positions.LspRange {
-    ret positions.LspRange{
-        start_line: p.start.line - 1,
-        start_char: p.start.col - 1,
-        end_line:   p.end.line - 1,
-        end_char:   p.end.col - 1,
-    };
-}
-
 # the diagnostics `store` holds against no file, shown on the root's manifest
 pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore, manifest: str) Notes {
     var n: Notes = empty();
@@ -133,18 +123,22 @@ pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore, manifest: str) 
 # the failure points when it points at one and on the root's manifest otherwise
 # ---
 # f:        the failure, read only for its kind and place
+# sources:  the source map the failure's place indexes
 # text:     the reason
 # manifest: the uri of the root's manifest
-pub fun refusal(alloc: *Allocator, f: ferr.Fail, text: str, manifest: str) Notes {
+pub fun refusal(alloc: *Allocator, f: ferr.Fail, sources: *src.SourceMap, text: str, manifest: str) Notes {
     var n:     Notes              = empty();
     val k:     dkind.Kind         = ferr.kind_of(f);
-    val po:    opt[ferr.Place]    = ferr.place_of(f);
+    val po:    opt[src.Location]  = ferr.place_of(f);
     var range: positions.LspRange = file_start();
     var at:    str                = nil;
     if (sel po.some) {
-        if (po.some.spanned) {
-            at    = uris.of_path(alloc, po.some.path);
-            range = place_range(po.some);
+        val fo: opt[*src.SourceFile] = src.get(sources, po.some.file);
+        if (sel fo.some) {
+            if (fo.some.present) {
+                at    = uris.of_path(alloc, fo.some.path);
+                range = positions.range_of(fo.some, po.some.span);
+            }
         }
     }
     if (at == nil) {

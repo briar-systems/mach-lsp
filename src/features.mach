@@ -41,13 +41,14 @@ use mach.lang.fe.ast.stmt;
 use atype: mach.lang.fe.ast.type;
 use fedoc: mach.lang.fe.doc;
 use mach.lang.fe.literal;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.sema;
+use rslv:         mach.lang.fe.resolve;
+use sema_product: mach.lang.fe.sema.product;
 use mach.lang.intern;
 use lmodule: mach.lang.module;
 use sess:    mach.lang.session;
 use src:     mach.lang.source;
 use mach.lang.type;
+use type_kind: mach.lang.type.kind;
 
 use mtypes: mls.types;
 
@@ -76,7 +77,7 @@ pub rec SymbolRef {
 # own:    this buffer's module id (Symbol.origin equals it for local symbols)
 # offset: byte offset into the buffer
 # ret:    some(SymbolRef) for a resolved position, or none
-pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
+pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
     val eid: id.ExprId = ast.offset_to_expr(a, offset);
     if (!id.expr_is_nil(eid) && rr.expr_resolved != nil && id.expr_index(eid) < rr.expr_count) {
         val sid: rslv.SymbolId = rr.expr_resolved[id.expr_index(eid)];
@@ -152,7 +153,7 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, f
 # file:   source file backing the import path, to locate the leaf
 # offset: cursor byte offset
 # ret:    some(ref) when the cursor is on an import path or alias, else none
-fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, did: id.DeclId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
+fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId, did: id.DeclId, file: *src.SourceFile, offset: usize) opt[SymbolRef] {
     if (file == nil)                                                  { ret opt[SymbolRef].none{}; }
     if (rr.decl_symbol == nil || id.decl_index(did) >= rr.decl_count) { ret opt[SymbolRef].none{}; }
     val sid: rslv.SymbolId = rr.decl_symbol[id.decl_index(did)];
@@ -185,7 +186,7 @@ fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableMod
 # parameter or generic binding name within decl `did`, or none. params and
 # generics carry no Decl node - their symbol is found by matching (decl, slot)
 # in the symbol table
-fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: sess.StableModuleId, did: id.DeclId, offset: usize) opt[SymbolRef] {
+fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId, did: id.DeclId, offset: usize) opt[SymbolRef] {
     val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
     if (sel d_opt.none) { ret opt[SymbolRef].none{}; }
     val d: *decl.Decl = d_opt.some;
@@ -290,7 +291,7 @@ pub fun binding_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
 
 # build a SymbolRef, flagging whether the symbol is local to this
 # buffer's module
-fun make_ref(rr: *rslv.ResolveResult, own: sess.StableModuleId, sid: rslv.SymbolId, name_span: src.Span) SymbolRef {
+fun make_ref(rr: *rslv.ResolveResult, own: lmodule.StableModuleId, sid: rslv.SymbolId, name_span: src.Span) SymbolRef {
     var sr: SymbolRef;
     sr.sym_id    = sid;
     sr.name_span = name_span;
@@ -301,7 +302,7 @@ fun make_ref(rr: *rslv.ResolveResult, own: sess.StableModuleId, sid: rslv.Symbol
 # whether `sid`'s decl is owned by `own` (this buffer's
 # module) and so addressable in this Ast. primitives and imported / used
 # symbols originate elsewhere
-pub fun symbol_is_local(rr: *rslv.ResolveResult, own: sess.StableModuleId, sid: rslv.SymbolId) bool {
+pub fun symbol_is_local(rr: *rslv.ResolveResult, own: lmodule.StableModuleId, sid: rslv.SymbolId) bool {
     if (rslv.symbol_index(sid) >= rr.symbol_count) { ret false; }
     val sym: *rslv.Symbol = ?rr.symbols[rslv.symbol_index(sid)];
     if (sym.kind == rslv.SYM_PRIM) { ret false; }
@@ -322,7 +323,7 @@ pub fun symbol_is_local(rr: *rslv.ResolveResult, own: sess.StableModuleId, sid: 
 # origin: ModuleId owning the declaration
 # decl:   DeclId of the declaration in `origin`'s Ast
 # ret:    the local SymbolId, or SYMBOL_NIL
-pub fun symbol_by_decl(rr: *rslv.ResolveResult, origin: sess.StableModuleId, decl: id.DeclId) rslv.SymbolId {
+pub fun symbol_by_decl(rr: *rslv.ResolveResult, origin: lmodule.StableModuleId, decl: id.DeclId) rslv.SymbolId {
     if (id.decl_is_nil(decl)) { ret rslv.SYMBOL_NIL; }
     var i: u32 = 0;
     for (i < rr.symbol_count) {
@@ -366,7 +367,7 @@ pub fun definition_kind_of(sym: *rslv.Symbol) rslv.SymKind {
 # canon:  the target's interned canonical name
 # kind:   the kind the target was declared as
 # ret:    true when `sid` names that declaration
-pub fun symbol_denotes(rr: *rslv.ResolveResult, sid: rslv.SymbolId, origin: sess.StableModuleId,
+pub fun symbol_denotes(rr: *rslv.ResolveResult, sid: rslv.SymbolId, origin: lmodule.StableModuleId,
     decl: id.DeclId, canon: intern.StrId, kind: rslv.SymKind) bool {
     if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= rr.symbol_count) { ret false; }
     val sym: *rslv.Symbol = ?rr.symbols[rslv.symbol_index(sid)];
@@ -1103,7 +1104,7 @@ pub fun field_decl_self_at(decl_a: *ast.Ast, fields_start: u32, fields_len: u32,
 # decl_file:  SourceFile backing the declaring module (the field-name bytes)
 # field_name: byte span of the field's declared name in `decl_file`
 pub rec FieldKey {
-    origin:     sess.StableModuleId;
+    origin:     lmodule.StableModuleId;
     decl:       id.DeclId;
     file:       src.FileId;
     name:       intern.StrId;
@@ -1133,7 +1134,7 @@ pub rec FieldKey {
 # qf:  the SourceFile backing `a` (the referenced name bytes)
 # key: the field identity to match
 # ret: some(name span) when `eid` references the keyed field, or none
-pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) opt[src.Span] {
+pub fun field_ref_span_at(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) opt[src.Span] {
     val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
     if (sel eo.none) { ret opt[src.Span].none{}; }
     val e: *expr.Expr = eo.some;
@@ -1166,8 +1167,8 @@ pub fun field_ref_span_at(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInter
 # member receiver or a struct literal whose `(origin, decl)` equals the key names
 # the same record across modules, regardless of pointer / generic-instance wrapping
 # (peeled by `nominal_of`)
-fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, key: FieldKey) bool {
-    val tid: type.TypeId         = mtypes.type_of(sr, eid);
+fun host_matches(sr: *sema_product.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, key: FieldKey) bool {
+    val tid: type_kind.TypeId    = mtypes.type_of(sr, eid);
     val no:  opt[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
     if (sel no.none) { ret false; }
     val n: mtypes.Nominal = no.some;
@@ -1197,7 +1198,7 @@ fun host_matches(sr: *sema.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, k
 # out:       array of at least `cap` Span slots
 # cap:       capacity of `out`
 # ret:       number of spans written
-pub fun collect_field_sites(a: *ast.Ast, sr: *sema.SemaResult, ti: *type.TypeInterner, qf: *src.SourceFile, key: FieldKey, declaring: bool, want_doc: bool, decl_src: str, doc: src.Span, out: *src.Span, cap: usize) usize {
+pub fun collect_field_sites(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type.TypeInterner, qf: *src.SourceFile, key: FieldKey, declaring: bool, want_doc: bool, decl_src: str, doc: src.Span, out: *src.Span, cap: usize) usize {
     var n:  usize = 0;
     var ei: usize = 0;
     for (ei < a.exprs.len && n < cap) {
@@ -1437,8 +1438,8 @@ fun fk(origin: u32, decl: u32, decl_file: *src.SourceFile, off: usize, len: usiz
 # slot TYPE_NIL. the test stand-in for sema's own typing output, so the field
 # matcher can be driven without a whole analysis. released with `free_sema`
 #[testing]
-fun mk_sema(pa: *Allocator, n: u32) sema.SemaResult {
-    var sr: sema.SemaResult;
+fun mk_sema(pa: *Allocator, n: u32) sema_product.SemaResult {
+    var sr: sema_product.SemaResult;
     sr.alloc            = pa;
     sr.expr_type        = nil;
     sr.type_resolved_ty = nil;
@@ -1447,13 +1448,13 @@ fun mk_sema(pa: *Allocator, n: u32) sema.SemaResult {
     sr.type_count       = 0;
     sr.decl_count       = 0;
     if (n > 0) {
-        val r: res[*type.TypeId, allocator.Error] = allocate[type.TypeId](pa, n::usize);
+        val r: res[*type_kind.TypeId, allocator.Error] = allocate[type_kind.TypeId](pa, n::usize);
         if (sel r.ok) {
             sr.expr_type  = r.ok;
             sr.expr_count = n;
             var i: u32 = 0;
             for (i < n) {
-                sr.expr_type[i] = type.TYPE_NIL;
+                sr.expr_type[i] = type_kind.TYPE_NIL;
                 i               = i + 1;
             }
         }
@@ -1462,9 +1463,9 @@ fun mk_sema(pa: *Allocator, n: u32) sema.SemaResult {
 }
 
 #[testing]
-fun free_sema(pa: *Allocator, sr: *sema.SemaResult) {
+fun free_sema(pa: *Allocator, sr: *sema_product.SemaResult) {
     if (sr.expr_type != nil && sr.expr_count > 0) {
-        deallocate[type.TypeId](pa, sr.expr_type, sr.expr_count::usize);
+        deallocate[type_kind.TypeId](pa, sr.expr_type, sr.expr_count::usize);
     }
 }
 
@@ -1527,16 +1528,16 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     if (sel sel_9.err) { ret 1; }
     # the record P is declared in module 2, decl 4; its field "x" lives at offset
     # 8 of the declaring source. the buffer text "p.x" carries the member access
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type.TYPE_REC);
+    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp:  type.TypeId    = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
-    var buf:   src.SourceFile = stub_file("p.x");
+    val recp:  type_kind.TypeId = recp_r.ok;
+    var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
+    var buf:   src.SourceFile   = stub_file("p.x");
 
     # expr 0 = receiver "p" (typed P); expr 1 = member access "p.x" (name "x"@2)
-    val recv: id.ExprId       = add_ident(?a, 0, 1);
-    val mem:  id.ExprId       = add_member(?a, recv, 2, 1);
-    var sr:   sema.SemaResult = mk_sema(?pa, 2);
+    val recv: id.ExprId               = add_ident(?a, 0, 1);
+    val mem:  id.ExprId               = add_member(?a, recv, 2, 1);
+    var sr:   sema_product.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[id.expr_index(recv)] = recp;
 
     val key:  FieldKey      = fk(2, 4, ?declf, 8, 1);
@@ -1565,15 +1566,15 @@ test field_ref_span_at_matches_a_struct_literal_field_init {
     var ti:     type.TypeInterner;
     val sel_13: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_13.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(1), t_owner(3), type.TYPE_REC);
+    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(1), t_owner(3), type_kind.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp:  type.TypeId    = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
-    var buf:   src.SourceFile = stub_file("P{ x: 1 }"); # init "x" at offset 3
+    val recp:  type_kind.TypeId = recp_r.ok;
+    var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
+    var buf:   src.SourceFile   = stub_file("P{ x: 1 }"); # init "x" at offset 3
 
     # expr 0 = the struct literal itself, typed P; its single init names "x"@3
-    val lit: id.ExprId       = add_struct_lit(?a, 3, 1);
-    var sr:  sema.SemaResult = mk_sema(?pa, 1);
+    val lit: id.ExprId               = add_struct_lit(?a, 3, 1);
+    var sr:  sema_product.SemaResult = mk_sema(?pa, 1);
     sr.expr_type[id.expr_index(lit)] = recp;
 
     val key:  FieldKey      = fk(3, 1, ?declf, 8, 1);
@@ -1599,15 +1600,15 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     var ti:     type.TypeInterner;
     val sel_14: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_14.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type.TYPE_REC);
+    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp:  type.TypeId    = recp_r.ok;
-    var declf: src.SourceFile = stub_file("rec P { x: i32; }"); # "x" at offset 8
-    var buf:   src.SourceFile = stub_file("p.x");
+    val recp:  type_kind.TypeId = recp_r.ok;
+    var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
+    var buf:   src.SourceFile   = stub_file("p.x");
 
-    val recv: id.ExprId       = add_ident(?a, 0, 1);
-    val mem:  id.ExprId       = add_member(?a, recv, 2, 1);
-    var sr:   sema.SemaResult = mk_sema(?pa, 2);
+    val recv: id.ExprId               = add_ident(?a, 0, 1);
+    val mem:  id.ExprId               = add_member(?a, recv, 2, 1);
+    var sr:   sema_product.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[id.expr_index(recv)] = recp;
 
     var fail: bool = false;
@@ -1619,7 +1620,7 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     val sel_16: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1));
     if (sel sel_16.some) { fail = true; }
     # receiver untyped (TYPE_NIL): no match.
-    sr.expr_type[id.expr_index(recv)] = type.TYPE_NIL;
+    sr.expr_type[id.expr_index(recv)] = type_kind.TYPE_NIL;
     val sel_17: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?declf, 8, 1));
     if (sel sel_17.some) { fail = true; }
 
@@ -1637,9 +1638,9 @@ test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     var ti:     type.TypeInterner;
     val sel_18: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel sel_18.err) { ret 1; }
-    val recp_r: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(0), type.TYPE_REC);
+    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(0), type_kind.TYPE_REC);
     if (sel recp_r.err) { ret 1; }
-    val recp: type.TypeId = recp_r.ok;
+    val recp: type_kind.TypeId = recp_r.ok;
 
     # the declaring module's source: the doc block then `rec P { x: i32; y: i32; }`.
     # the doc `# x:` component name is at offset 18 (after "# a point\n# ---\n# ")
@@ -1652,13 +1653,13 @@ test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     val xoff: usize = 42;
 
     # the module under walk also contains two member accesses and a struct lit on x
-    var buf: src.SourceFile  = stub_file("p.x q.x P{ x: 1 }");
-    val r1:  id.ExprId       = add_ident(?a, 0, 1); # "p"
-    val m1:  id.ExprId       = add_member(?a, r1, 2, 1); # "p.x" name @2
-    val r2:  id.ExprId       = add_ident(?a, 4, 1); # "q"
-    val m2:  id.ExprId       = add_member(?a, r2, 6, 1); # "q.x" name @6
-    val lit: id.ExprId       = add_struct_lit(?a, 11, 1); # "P{ x" name @11
-    var sr:  sema.SemaResult = mk_sema(?pa, 5);
+    var buf: src.SourceFile          = stub_file("p.x q.x P{ x: 1 }");
+    val r1:  id.ExprId               = add_ident(?a, 0, 1); # "p"
+    val m1:  id.ExprId               = add_member(?a, r1, 2, 1); # "p.x" name @2
+    val r2:  id.ExprId               = add_ident(?a, 4, 1); # "q"
+    val m2:  id.ExprId               = add_member(?a, r2, 6, 1); # "q.x" name @6
+    val lit: id.ExprId               = add_struct_lit(?a, 11, 1); # "P{ x" name @11
+    var sr:  sema_product.SemaResult = mk_sema(?pa, 5);
     sr.expr_type[id.expr_index(r1)]  = recp;
     sr.expr_type[id.expr_index(r2)]  = recp;
     sr.expr_type[id.expr_index(lit)] = recp;
@@ -1785,9 +1786,9 @@ test symbol_denotes_matches_a_use_imported_binding_by_canonical_name {
     rr.symbols      = ?syms[0];
     rr.symbol_count = 4;
 
-    val org:  sess.StableModuleId = lmodule.stable_id(3);
-    val dcl:  id.DeclId           = id.decl(7);
-    val cnon: intern.StrId        = intern.str_id(11);
+    val org:  lmodule.StableModuleId = lmodule.stable_id(3);
+    val dcl:  id.DeclId              = id.decl(7);
+    val cnon: intern.StrId           = intern.str_id(11);
 
     var fail: bool = false;
     if (!symbol_denotes(?rr, rslv.symbol_id(0), org, dcl, cnon, rslv.SYM_FUN)) { fail = true; }

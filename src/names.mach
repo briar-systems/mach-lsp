@@ -31,7 +31,8 @@ use mem: std.memory;
 use mach.lang.diagnostic;
 use mach.lang.editor;
 use mach.lang.fail;
-use src: mach.lang.source;
+use lang_phase: mach.lang.phase;
+use src:        mach.lang.source;
 
 # the spans one file's rename rewrites, in the order they were found
 pub rec Spans {
@@ -163,11 +164,11 @@ pub fun shape(alloc: *Allocator, before: str, after: str) u8 {
     var b: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, before);
     if (sel b.err) { ret SHAPE_UNCHECKED; }
     var out: u8 = SHAPE_UNCHECKED;
-    if (sel b.ok.failure.none && fail.is_accepted(b.ok.status)) {
+    if (sel b.ok.failure.none && lang_phase.is_accepted(b.ok.status)) {
         out = SHAPE_CHANGED;
         var a: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, after);
         if (sel a.ok) {
-            if (sel a.ok.failure.none && fail.is_accepted(a.ok.status)
+            if (sel a.ok.failure.none && lang_phase.is_accepted(a.ok.status)
                 && diagnostic.error_count(a.ok.diagnostics) <= diagnostic.error_count(b.ok.diagnostics)) {
                 val same: res[bool, fail.Fail] = editor.same_shape(?b.ok, ?a.ok);
                 if (sel same.ok) {

@@ -10,7 +10,7 @@ arch = "x86_64"
 sys = "linux"
 abi = "sysv64"
 
-[target.linux-arm64]
+[target.linux-aarch64]
 arch = "aarch64"
 sys = "linux"
 abi = "aapcs64"
@@ -63,4 +63,12 @@ ref = "branch/dev"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
+ref = "branch/dev"
+
+[dep.toml]
+git = "https://github.com/briar-systems/mach-toml"
+ref = "branch/dev"
+
+[dep.json]
+git = "https://github.com/briar-systems/mach-json"
 ref = "branch/dev"

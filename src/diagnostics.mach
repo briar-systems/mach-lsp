@@ -23,6 +23,8 @@ use std.collections.vector.Vector;
 use std.allocator.page;
 
 use diag: mach.lang.diagnostic;
+use mach.lang.diagnostic.annotation;
+use mach.lang.driver;
 use mach.lang.editor;
 use ferr: mach.lang.fail;
 use src:  mach.lang.source;
@@ -84,14 +86,14 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     if (sel vr.ok) {
         val v: project.DocumentView = vr.ok;
         if (v.stale) {
-            if (!standalone(es, d, editor.PHASE_PARSE, alloc, ?result)) { ret; }
+            if (!standalone(es, d, driver.FRONTEND_PARSE, alloc, ?result)) { ret; }
             list       = result.diagnostics;
-            at.sources = ?es.s.sources;
+            at.sources = es.s.sources;
             if (count_for(list, own) == 0) {
                 list = nil;
                 if (v.parse_ok) {
                     list       = project.diagnostics_of(v.root);
-                    at.sources = ?v.root.s.sources;
+                    at.sources = v.root.s.sources;
                     at.root    = v.root;
                     own        = v.file_id;
                 }
@@ -99,7 +101,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         }
         or {
             list       = project.diagnostics_of(v.root);
-            at.sources = ?v.root.s.sources;
+            at.sources = v.root.s.sources;
             at.root    = v.root;
             own        = v.file_id;
         }
@@ -117,15 +119,15 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         # contradict it: an `embed` it cannot see the artifact of reads as the
         # error when the real one is that no target could be selected (#375).
         val governed: bool                 = project.has_project(w, d.uri);
-        var phase:    editor.AnalysisPhase = editor.PHASE_SEMA;
-        if (governed)                                  { phase = editor.PHASE_PARSE; }
+        var phase:    driver.FrontendPhase = driver.FRONTEND_SEMA;
+        if (governed)                                  { phase = driver.FRONTEND_PARSE; }
         if (!standalone(es, d, phase, alloc, ?result)) { ret; }
         list       = result.diagnostics;
-        at.sources = ?es.s.sources;
+        at.sources = es.s.sources;
         # a parse never consults the project, so the refusal comes from a resolve,
         # the first phase that does; what it says about the buffer goes unread
         if (governed && project.root_for_loaded(w, d.uri) == nil) {
-            if (!standalone(es, d, editor.PHASE_RESOLVE, alloc, ?refused)) {
+            if (!standalone(es, d, driver.FRONTEND_RESOLVE, alloc, ?refused)) {
                 editor.analysis_dnit(?result);
                 ret;
             }
@@ -191,8 +193,10 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
         notes.push_kind(b, ferr.kind_of(f));
         json.buf_push(b, ",\"source\":\"mach\",\"message\":");
         json.buf_push_quoted(b, result.message);
-        val po: opt[ferr.Place] = ferr.place_of(f);
-        if (sel po.some) { push_place(b, po.some, result.message, alloc); }
+        val po: opt[src.Location] = ferr.place_of(f);
+        if (sel po.some) {
+            if (push_related_entry(b, at, po.some, result.message, alloc, 0) > 0) { json.buf_push_byte(b, ']'); }
+        }
         json.buf_push_byte(b, '}');
         ret;
     }
@@ -218,21 +222,6 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
     }
 }
 
-# append `,"relatedInformation":[...]` holding the one place a failure points at
-fun push_place(b: *json.Buf, p: ferr.Place, label: str, alloc: *Allocator) {
-    if (!p.spanned) { ret; }
-    val u: str = uris.of_path(alloc, p.path);
-    if (u == nil) { ret; }
-    json.buf_push(b, ",\"relatedInformation\":[{\"location\":{\"uri\":");
-    json.buf_push_quoted(b, u);
-    json.buf_push(b, ",\"range\":");
-    render.range(b, notes.place_range(p));
-    json.buf_push(b, "},\"message\":");
-    json.buf_push_quoted(b, label);
-    json.buf_push(b, "}]");
-    json.free_str(u, alloc);
-}
-
 # where a diagnostic's file ids resolve, and how their spans reach the client
 # ---
 # w:       the workspace
@@ -254,7 +243,7 @@ fun text_for(at: *Locator, fid: src.FileId) positions.Text {
 
 # run the editor frontend on the open buffer; on failure the client's list is
 # cleared and false returned
-fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: editor.AnalysisPhase,
+fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: driver.FrontendPhase,
     alloc: *Allocator, out: *editor.AnalysisResult) bool {
     var req: editor.AnalysisRequest                = editor.analysis_request(d.file_id, phase);
     val ar:  res[editor.AnalysisResult, ferr.Fail] = editor.analyze(es, ?req);
@@ -382,7 +371,7 @@ fun push_related(b: *json.Buf, at: *Locator, d: *diag.Diagnostic, alloc: *Alloca
     if (lead) { written = push_related_entry(b, at, d.loc, d.message, alloc, written); }
     var r: usize = 0;
     for (r < d.related.len) {
-        val rel: *diag.Related = ?d.related.data[r];
+        val rel: *annotation.Related = ?d.related.data[r];
         written = push_related_entry(b, at, rel.loc, rel.label, alloc, written);
         r       = r + 1;
     }
@@ -421,8 +410,8 @@ fun stub_diag(message: str) diag.Diagnostic {
     d.loc.span.len    = 1;
     d.message         = message;
     d.children        = vector.init[diag.Child](nil);
-    d.related         = vector.init[diag.Related](nil);
-    d.fixes           = vector.init[diag.Fix](nil);
+    d.related         = vector.init[annotation.Related](nil);
+    d.fixes           = vector.init[annotation.Fix](nil);
     ret d;
 }
 
@@ -438,8 +427,8 @@ fun stub_children(items: *diag.Child, n: usize) Vector[diag.Child] {
 
 # borrow `items` as a diagnostic's related list without owning them
 #[testing]
-fun stub_related(items: *diag.Related, n: usize) Vector[diag.Related] {
-    var v: Vector[diag.Related] = vector.init[diag.Related](nil);
+fun stub_related(items: *annotation.Related, n: usize) Vector[annotation.Related] {
+    var v: Vector[annotation.Related] = vector.init[annotation.Related](nil);
     v.data = items;
     v.len  = n;
     v.cap  = n;
@@ -481,7 +470,7 @@ test a_secondary_location_renders_as_a_located_relatedinformation_entry {
     val added: res[src.FileId, src.Error] = src.add(?m, "file:///w/a.mach", "ab\ncd");
     if (sel added.err) { ret 1; }
 
-    var rels: [1]diag.Related;
+    var rels: [1]annotation.Related;
     rels[0].loc.file        = added.ok;
     rels[0].loc.span.offset = 0;
     rels[0].loc.span.len    = 2;
@@ -509,7 +498,7 @@ test a_secondary_location_with_an_unresolvable_file_is_skipped {
     page.make(?pa);
     var m: src.SourceMap = src.init(?pa);
 
-    var rels: [1]diag.Related;
+    var rels: [1]annotation.Related;
     rels[0].loc.file        = src.file_id(9);
     rels[0].loc.span.offset = 0;
     rels[0].loc.span.len    = 1;

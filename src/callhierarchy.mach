@@ -77,7 +77,7 @@ use mls.positions;
 use mls.project;
 use mls.render;
 
-use sj:      std.data.json;
+use sj:      json.value;
 use strutil: std.text.string;
 
 use std.allocator;
@@ -102,7 +102,7 @@ val INDIRECT_DETAIL: str = "fun value: the call target is not statically known";
 # decl_span: the whole declaration, the item's range and the body's bounds
 rec Anchor {
     site:      project.Site;
-    origin:    sess.StableModuleId;
+    origin:    lmodule.StableModuleId;
     decl:      id.DeclId;
     canon:     intern.StrId;
     name_span: src.Span;
@@ -221,7 +221,7 @@ pub fun incoming(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allo
     val mc:  u32 = project.module_count(an.root);
     var mid: u32 = 0;
     for (mid < mc) {
-        val cur:  sess.StableModuleId     = project.module_id_at(an.root, mid);
+        val cur:  lmodule.StableModuleId  = project.module_id_at(an.root, mid);
         val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
         if (sel mv_o.none) {
             mid = mid + 1;

@@ -41,20 +41,22 @@ use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use aexpr: mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
-use atype: mach.lang.fe.ast.type;
-use fedoc: mach.lang.fe.doc;
-use np:    mach.lang.fe.path;
-use rslv:  mach.lang.fe.resolve;
-use mach.lang.fe.sema;
+use atype:        mach.lang.fe.ast.type;
+use fedoc:        mach.lang.fe.doc;
+use np:           mach.lang.fe.path;
+use rslv:         mach.lang.fe.resolve;
+use sema_product: mach.lang.fe.sema.product;
 use mach.lang.fe.sema.typename;
 use mach.lang.intern;
 use lmodule: mach.lang.module;
 use sess:    mach.lang.session;
 use src:     mach.lang.source;
 use mach.lang.type;
+use type_kind: mach.lang.type.kind;
 use mls.trace;
 use strutil: std.text.string;
 
+use sj: json.value;
 use mls.analysis;
 use mls.documents;
 use mls.features;
@@ -65,7 +67,6 @@ use mls.project;
 use mls.render;
 use mls.transport;
 use mtypes: mls.types;
-use sj:     std.data.json;
 
 use mach.lang.fail;
 use std.allocator;
@@ -139,8 +140,8 @@ fun expression_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
 
     val eid: id.ExprId = ast.offset_to_expr(an.a, offset);
     if (id.expr_is_nil(eid)) { ret false; }
-    val tid: type.TypeId = project.type_of(an.sr, eid);
-    if (type.is_nil(tid)) { ret false; }
+    val tid: type_kind.TypeId = project.type_of(an.sr, eid);
+    if (type_kind.is_nil(tid)) { ret false; }
 
     val tr: res[str, fail.Fail] = typename.type_to_str(s, tid);
     if (sel tr.err) { ret false; }
@@ -289,10 +290,10 @@ fun field_hover(ws: *project.Workspace, alloc: *Allocator, an: *analysis.Analyze
     if (sel fo.none) { ret false; }
     val fr: features.FieldRef = fo.some;
 
-    val sr: *sema.SemaResult = an.sr;
+    val sr: *sema_product.SemaResult = an.sr;
     if (sr == nil) { ret false; }
 
-    val tid: type.TypeId             = project.type_of(sr, fr.host);
+    val tid: type_kind.TypeId        = project.type_of(sr, fr.host);
     val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
     if (sel rso.none) { ret false; }
     val rs: project.RecordSite = rso.some;
@@ -414,7 +415,7 @@ fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *rslv.Sym
 
     # a module alias's decl is the `use` line the cursor is already on, so
     # rendering it back is no answer. name the module instead.
-    var mid: sess.StableModuleId;
+    var mid: lmodule.StableModuleId;
     if (module_alias_target(sym, ?mid) && an.root != nil) {
         val fqn: str = project.module_fqn(ws, an.root, mid);
         if (fqn != nil) { ret module_hover_markdown(fqn, alloc); }
@@ -952,8 +953,8 @@ fun type_site_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usize) 
 }
 
 # the declaring site of `tid` against the request's buffer and project
-fun site_of_type(ws: *project.Workspace, an: *analysis.Analyzed, tid: type.TypeId) opt[project.TypeSite] {
-    if (type.is_nil(tid)) { ret opt[project.TypeSite].none{}; }
+fun site_of_type(ws: *project.Workspace, an: *analysis.Analyzed, tid: type_kind.TypeId) opt[project.TypeSite] {
+    if (type_kind.is_nil(tid)) { ret opt[project.TypeSite].none{}; }
     ret project.type_site_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
 }
 
@@ -1008,7 +1009,7 @@ fun module_hover_markdown(fqn: str, alloc: *Allocator) str {
 # sym: the symbol under the cursor
 # out: receives the aliased module id
 # ret: true when `sym` is a module alias
-fun module_alias_target(sym: *rslv.Symbol, out: *sess.StableModuleId) bool {
+fun module_alias_target(sym: *rslv.Symbol, out: *lmodule.StableModuleId) bool {
     if (sym.kind != rslv.SYM_USE) { ret false; }
     @out = rslv.use_stable(sym);
     ret true;
@@ -1023,7 +1024,7 @@ fun module_alias_target(sym: *rslv.Symbol, out: *sess.StableModuleId) bool {
 # id_raw: the raw JSON request id, consumed on success
 # ret:    true when a module Location was emitted and replied
 fun module_definition(ws: *project.Workspace, an: analysis.Analyzed, sym: *rslv.Symbol, alloc: *Allocator, id_raw: str) bool {
-    var mid: sess.StableModuleId;
+    var mid: lmodule.StableModuleId;
     if (!module_alias_target(sym, ?mid)) { ret false; }
     if (an.root == nil)                  { ret false; }
     val muri: str = project.module_uri(ws, an.root, mid);
@@ -1070,10 +1071,10 @@ fun field_definition(ws: *project.Workspace, alloc: *Allocator, an: *analysis.An
     if (sel fo.some) {
         val fr: features.FieldRef = fo.some;
 
-        val sr: *sema.SemaResult = an.sr;
+        val sr: *sema_product.SemaResult = an.sr;
         if (sr == nil) { ret false; }
 
-        val tid: type.TypeId             = project.type_of(sr, fr.host);
+        val tid: type_kind.TypeId        = project.type_of(sr, fr.host);
         val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
         if (sel rso.none) { ret false; }
         val rs: project.RecordSite = rso.some;
@@ -1192,7 +1193,7 @@ fun field_target_at(ws: *project.Workspace, an: *analysis.Analyzed, offset: usiz
     if (sel fo.some) {
         val fr: features.FieldRef = fo.some;
         if (an.sr == nil) { ret opt[FieldTarget].none{}; }
-        val tid: type.TypeId             = project.type_of(an.sr, fr.host);
+        val tid: type_kind.TypeId        = project.type_of(an.sr, fr.host);
         val rso: opt[project.RecordSite] = project.record_decl_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
         if (sel rso.none) { ret opt[FieldTarget].none{}; }
         val rs:  project.RecordSite = rso.some;
@@ -1239,7 +1240,7 @@ fun make_field_target(an: *analysis.Analyzed, rs: project.RecordSite, field_name
 # that types a reference is another (owned `file://` URI freed by free_field_refs)
 rec FieldXRef {
     a:         *ast.Ast;
-    sr:        *sema.SemaResult;
+    sr:        *sema_product.SemaResult;
     text:      positions.Text;
     uri:       str;
     declaring: bool;
@@ -1273,7 +1274,7 @@ fun build_field_refs(ws: *project.Workspace, an: analysis.Analyzed, uri: str, t:
     val mc:  u32   = project.module_count(an.root);
     var mid: u32   = 0;
     for (mid < mc && n < cap) {
-        val cur:  sess.StableModuleId     = project.module_id_at(an.root, mid);
+        val cur:  lmodule.StableModuleId  = project.module_id_at(an.root, mid);
         val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
         if (sel mv_o.none) {
             mid = mid + 1;
@@ -2098,7 +2099,7 @@ fun build_refs(ws: *project.Workspace, alloc: *Allocator, an: analysis.Analyzed,
         if (pass == 1 && !reserve_refs(alloc, out, total)) { ret false; }
         var mid: u32 = 0;
         for (mid < mc) {
-            val cur: sess.StableModuleId = project.module_id_at(an.root, mid);
+            val cur: lmodule.StableModuleId = project.module_id_at(an.root, mid);
             if (project_only && !project.is_project_module(ws, an.root, cur)) {
                 mid = mid + 1;
                 cnt;
@@ -2129,7 +2130,7 @@ fun build_refs(ws: *project.Workspace, alloc: *Allocator, an: analysis.Analyzed,
 
 # append the entry for binding `sid` of module `cur`; false when its URI could
 # not be built
-fun push_ref(ws: *project.Workspace, an: analysis.Analyzed, uri: str, cur: sess.StableModuleId,
+fun push_ref(ws: *project.Workspace, an: analysis.Analyzed, uri: str, cur: lmodule.StableModuleId,
     mv: project.ModuleView, sid: rslv.SymbolId, out: *RefSet) bool {
     var muri:  str  = uri;
     val owned: bool = !lmodule.stable_same(cur, an.own);
@@ -2798,7 +2799,7 @@ fun emit_completions(an: analysis.Analyzed, alloc: *Allocator, id_raw: str,
 # mid:        the module in `root`
 # incomplete: the answer is from a snapshot the buffer has moved past
 fun emit_module_members(ws: *project.Workspace, root: *project.Root, pfile: *src.SourceFile, alloc: *Allocator, id_raw: str,
-    prefix: src.Span, mid: sess.StableModuleId, incomplete: bool) bool {
+    prefix: src.Span, mid: lmodule.StableModuleId, incomplete: bool) bool {
     if (root == nil) { ret false; }
     val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
     if (sel mvo.none) { ret false; }
@@ -2872,7 +2873,7 @@ fun emit_receiver_members(ws: *project.Workspace, es: *editor.EditorSession, doc
             val eid: id.ExprId = ast.offset_to_expr(an.a, mapped.some.offset + mapped.some.len - 1);
             if (!id.expr_is_nil(eid)) {
                 val sym: *rslv.Symbol = expr_symbol(an, eid);
-                var mid: sess.StableModuleId;
+                var mid: lmodule.StableModuleId;
                 if (sym != nil && module_alias_target(sym, ?mid)) {
                     if (k == n) { ret emit_module_members(ws, an.root, live, alloc, id_raw, prefix, mid, incomplete); }
                     val named: opt[project.TypeSite] = type_named_in_module(ws, an.root, alloc, mid, live, segs[k]);
@@ -2908,7 +2909,7 @@ fun emit_receiver_members(ws: *project.Workspace, es: *editor.EditorSession, doc
             i     = 1;
         }
         or {
-            val mo: opt[sess.StableModuleId] = module_alias_of(ws, an.root, an.a, an.text.file, alloc, live, segs[0]);
+            val mo: opt[lmodule.StableModuleId] = module_alias_of(ws, an.root, an.a, an.text.file, alloc, live, segs[0]);
             if (sel mo.some) {
                 if (n == 1) { ret emit_module_members(ws, an.root, live, alloc, id_raw, prefix, mo.some, incomplete); }
                 val named: opt[project.TypeSite] = type_named_in_module(ws, an.root, alloc, mo.some, live, segs[1]);
@@ -2929,7 +2930,7 @@ fun emit_receiver_members(ws: *project.Workspace, es: *editor.EditorSession, doc
                 i     = 1;
             }
             or {
-                val mo: opt[sess.StableModuleId] = module_alias_of(ws, an.root, lan.a, live, alloc, live, segs[0]);
+                val mo: opt[lmodule.StableModuleId] = module_alias_of(ws, an.root, lan.a, live, alloc, live, segs[0]);
                 if (sel mo.some) {
                     if (n == 1) { ret emit_module_members(ws, an.root, live, alloc, id_raw, prefix, mo.some, incomplete); }
                     val named: opt[project.TypeSite] = type_named_in_module(ws, an.root, alloc, mo.some, live, segs[1]);
@@ -2991,7 +2992,7 @@ fun expr_symbol(an: analysis.Analyzed, eid: id.ExprId) *rslv.Symbol {
 # the site of the type the name resolves to
 fun expr_type_site(ws: *project.Workspace, an: analysis.Analyzed, eid: id.ExprId, sym: *rslv.Symbol) opt[project.TypeSite] {
     if (an.sr != nil) {
-        val tid: type.TypeId           = project.type_of(an.sr, eid);
+        val tid: type_kind.TypeId      = project.type_of(an.sr, eid);
         val so:  opt[project.TypeSite] =
             project.type_site_in(ws, an.root, an.own, an.own_fid, an.a, an.text, tid);
         if (sel so.some) { ret so; }
@@ -3157,8 +3158,8 @@ fun live_parse(es: *editor.EditorSession, doc: *documents.Document, an: analysis
 # module alias. the head is matched by the bytes it is spelled with, so it
 # resolves the same whether it is used as a value or as a type qualifier (#321)
 fun module_alias_of(ws: *project.Workspace, root: *project.Root, a: *ast.Ast, file: *src.SourceFile,
-    alloc: *Allocator, nfile: *src.SourceFile, name: src.Span) opt[sess.StableModuleId] {
-    if (root == nil) { ret opt[sess.StableModuleId].none{}; }
+    alloc: *Allocator, nfile: *src.SourceFile, name: src.Span) opt[lmodule.StableModuleId] {
+    if (root == nil) { ret opt[lmodule.StableModuleId].none{}; }
     val text: positions.Text = positions.text_of(file);
     var i:    usize          = 0;
     for (i < a.decls.len) {
@@ -3170,17 +3171,17 @@ fun module_alias_of(ws: *project.Workspace, root: *project.Root, a: *ast.Ast, fi
         if (bound.len == 0)                                       { bound = np.leaf(file.text, u.path); }
         if (!features.span_bytes_equal(file, bound, nfile, name)) { cnt; }
         val fqn: str = positions.span_text(text, u.path, alloc);
-        if (fqn == nil) { ret opt[sess.StableModuleId].none{}; }
-        val mo: opt[sess.StableModuleId] = project.module_by_fqn(ws, root, fqn);
+        if (fqn == nil) { ret opt[lmodule.StableModuleId].none{}; }
+        val mo: opt[lmodule.StableModuleId] = project.module_by_fqn(ws, root, fqn);
         strutil.str_free(alloc, fqn);
         ret mo;
     }
-    ret opt[sess.StableModuleId].none{};
+    ret opt[lmodule.StableModuleId].none{};
 }
 
 # the type `name`, spelled in `nfile`, declares in loaded module `mid`
 fun type_named_in_module(ws: *project.Workspace, root: *project.Root, alloc: *Allocator,
-    mid: sess.StableModuleId, nfile: *src.SourceFile, name: src.Span) opt[project.TypeSite] {
+    mid: lmodule.StableModuleId, nfile: *src.SourceFile, name: src.Span) opt[project.TypeSite] {
     val fqn: str = project.module_fqn(ws, root, mid);
     if (fqn == nil) { ret opt[project.TypeSite].none{}; }
     val tname: str = positions.span_text(positions.text_of(nfile), name, alloc);

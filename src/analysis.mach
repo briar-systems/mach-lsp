@@ -20,15 +20,17 @@ use std.types.string.str;
 
 use A: std.allocator;
 
+use sj: json.value;
+use mach.lang.driver;
 use mach.lang.editor;
 use mach.lang.fail;
 use mach.lang.fe.ast;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.sema;
+use rslv:         mach.lang.fe.resolve;
+use sema_product: mach.lang.fe.sema.product;
 use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
-use sj:   std.data.json;
+use lmodule: mach.lang.module;
+use sess:    mach.lang.session;
+use src:     mach.lang.source;
 
 use mls.documents;
 use mls.json;
@@ -50,10 +52,10 @@ use mls.project;
 pub rec Analyzed {
     interner: *intern.Interner;
     text:     positions.Text;
-    sr:       *sema.SemaResult;
+    sr:       *sema_product.SemaResult;
     a:        *ast.Ast;
     rr:       *rslv.ResolveResult;
-    own:      sess.StableModuleId;
+    own:      lmodule.StableModuleId;
     own_fid:  src.FileId;
     root:     *project.Root;
     stale:    bool;
@@ -97,9 +99,9 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     }
     if (project.has_project(ws, uri)) { ret false; }
 
-    if (!standalone(es, doc.file_id, editor.PHASE_SEMA, out)) { ret false; }
-    if (out.rr == nil)                                        { ret false; }
-    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    if (!standalone(es, doc.file_id, driver.FRONTEND_SEMA, out)) { ret false; }
+    if (out.rr == nil)                                           { ret false; }
+    val fo: opt[*src.SourceFile] = src.get(es.s.sources, doc.file_id);
     if (sel fo.none) { ret false; }
     out.interner = ?es.s.interner;
     out.text     = positions.text_of(fo.some);
@@ -114,12 +116,12 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
 # the identity a standalone buffer's symbols carry as their origin. the editor
 # names a standalone buffer's module by the buffer's path; nil when the editor
 # has not analyzed the buffer
-fun buffer_module(es: *editor.EditorSession, fid: src.FileId) sess.StableModuleId {
-    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, fid);
-    if (sel fo.none) { ret sess.STABLE_MODULE_NIL; }
+fun buffer_module(es: *editor.EditorSession, fid: src.FileId) lmodule.StableModuleId {
+    val fo: opt[*src.SourceFile] = src.get(es.s.sources, fid);
+    if (sel fo.none) { ret lmodule.STABLE_MODULE_NIL; }
     val name: res[intern.StrId, A.Error] = intern.add(?es.s.interner, fo.some.path);
-    if (sel name.err) { ret sess.STABLE_MODULE_NIL; }
-    ret sess.stable_module_id_lookup(es.s, name.ok);
+    if (sel name.err) { ret lmodule.STABLE_MODULE_NIL; }
+    ret lmodule.stable_module_id_lookup(?es.s.modules, name.ok);
 }
 
 # resolve `uri` to its current analysis whether or not the document is open
@@ -148,9 +150,9 @@ pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *do
 
     val root: *project.Root = project.root_for_loaded(ws, uri);
     if (root == nil) { ret false; }
-    val mo: opt[sess.StableModuleId] = project.module_for_uri(ws, root, uri);
+    val mo: opt[lmodule.StableModuleId] = project.module_for_uri(ws, root, uri);
     if (sel mo.none) { ret false; }
-    val mid:  sess.StableModuleId     = mo.some;
+    val mid:  lmodule.StableModuleId  = mo.some;
     val mv_o: opt[project.ModuleView] = project.module_view(ws, root, mid);
     if (sel mv_o.none) { ret false; }
     val mv: project.ModuleView = mv_o.some;
@@ -177,10 +179,10 @@ pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *do
 # ---
 # es:    the standalone editor session
 # fid:   the open buffer
-# phase: PHASE_PARSE, PHASE_RESOLVE or PHASE_SEMA
+# phase: driver.FRONTEND_PARSE, driver.FRONTEND_RESOLVE or driver.FRONTEND_SEMA
 # out:   receives `a`, `rr` and `sr`; a product the phase did not reach is nil
 # ret:   true when the frontend ran; the products may still be nil on a rejected phase
-pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.AnalysisPhase, out: *Analyzed) bool {
+pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: driver.FrontendPhase, out: *Analyzed) bool {
     out.a  = nil;
     out.rr = nil;
     out.sr = nil;
@@ -194,12 +196,12 @@ pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.Ana
     var result: editor.AnalysisResult    = ar.ok;
     val a:      res[*ast.Ast, fail.Fail] = editor.ast_of(?result);
     if (sel a.ok) { out.a = a.ok; }
-    if (phase >= editor.PHASE_RESOLVE) {
+    if (phase >= driver.FRONTEND_RESOLVE) {
         val rr: res[*rslv.ResolveResult, fail.Fail] = editor.resolve_of(?result);
         if (sel rr.ok) { out.rr = rr.ok; }
     }
-    if (phase == editor.PHASE_SEMA) {
-        val sr: res[*sema.SemaResult, fail.Fail] = editor.sema_of(?result);
+    if (phase == driver.FRONTEND_SEMA) {
+        val sr: res[*sema_product.SemaResult, fail.Fail] = editor.sema_of(?result);
         if (sel sr.ok) { out.sr = sr.ok; }
     }
     editor.analysis_dnit(?result);
@@ -212,7 +214,7 @@ pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.Ana
 # doc: the open document
 pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.Ast {
     var an: Analyzed;
-    if (!standalone(es, doc.file_id, editor.PHASE_PARSE, ?an)) { ret nil; }
+    if (!standalone(es, doc.file_id, driver.FRONTEND_PARSE, ?an)) { ret nil; }
     ret an.a;
 }
 
@@ -232,14 +234,14 @@ pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.As
 pub fun syntax_of(es: *editor.EditorSession, doc: *documents.Document, out: *Analyzed) bool {
     val tree: *ast.Ast = syntax_tree(es, doc);
     if (tree == nil) { ret false; }
-    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
+    val fo: opt[*src.SourceFile] = src.get(es.s.sources, doc.file_id);
     if (sel fo.none) { ret false; }
     out.interner = nil;
     out.text     = positions.text_of(fo.some);
     out.sr       = nil;
     out.a        = tree;
     out.rr       = nil;
-    out.own      = sess.STABLE_MODULE_NIL;
+    out.own      = lmodule.STABLE_MODULE_NIL;
     out.own_fid  = doc.file_id;
     out.root     = nil;
     out.stale    = false;
