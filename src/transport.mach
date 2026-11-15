@@ -92,9 +92,9 @@ pub fun read_message_from(handle: usize, msg: *Message, alloc: *Allocator) ReadS
     msg.body     = nil;
     msg.body_len = 0;
 
-    val hr: res[*u8, allocator.Error] = allocate[u8](alloc, HEADER_MAX);
-    if (sel hr.err) { ret READ_ERROR; }
-    val header: *u8 = hr.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, HEADER_MAX);
+    if (sel res_allocate.err) { ret READ_ERROR; }
+    val header: *u8 = res_allocate.ok;
 
     var header_len: usize = 0;
     for (true) {
@@ -130,9 +130,9 @@ pub fun read_message_from(handle: usize, msg: *Message, alloc: *Allocator) ReadS
     val body_len: usize = body_len_r::usize;
 
     # body_len is capped below usize max, so the terminator addition cannot wrap
-    val br: res[*u8, allocator.Error] = allocate[u8](alloc, body_len + 1);
-    if (sel br.err) { ret READ_ERROR; }
-    val body: *u8 = br.ok;
+    val res_allocate_alloc: res[*u8, allocator.Error] = allocate[u8](alloc, body_len + 1);
+    if (sel res_allocate_alloc.err) { ret READ_ERROR; }
+    val body: *u8 = res_allocate_alloc.ok;
 
     var got: usize = 0;
     for (got < body_len) {
@@ -178,12 +178,12 @@ pub fun send_message(body: str, alloc: *Allocator) bool {
     }
     val total: usize = fixed + body_len;
 
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, total);
-    if (sel r.err) {
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, total);
+    if (sel res_allocate.err) {
         WRITE_FAILED = true;
         ret false;
     }
-    val buf: *u8   = r.ok;
+    val buf: *u8   = res_allocate.ok;
     var off: usize = 0;
     mem.raw_copy((buf::usize + off)::ptr, HEADER_PREFIX::ptr, prefix_len);
     off = off + prefix_len;

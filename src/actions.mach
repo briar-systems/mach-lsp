@@ -67,12 +67,12 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
         ret;
     }
 
-    val vr: res[project.DocumentView, str] = project.document_view(ws, d);
-    if (sel vr.err) {
+    val res_document_view: res[project.DocumentView, str] = project.document_view(ws, d);
+    if (sel res_document_view.err) {
         render.reply_empty_array(alloc, id_raw);
         ret;
     }
-    val v: project.DocumentView = vr.ok;
+    val v: project.DocumentView = res_document_view.ok;
     # a fix's edits are computed against the snapshot's text; applied to a buffer
     # that has moved on they would rewrite the wrong bytes, so a stale view offers
     # nothing. the server holds this request until the rebuild lands
@@ -195,9 +195,9 @@ fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources:
 
 # the source file an edit addresses, or nil
 fun edit_file(sources: *src.SourceMap, ed: *annotation.Edit) *src.SourceFile {
-    val fo: opt[*src.SourceFile] = src.get(sources, ed.loc.file);
-    if (sel fo.none) { ret nil; }
-    ret fo.some;
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(sources, ed.loc.file);
+    if (sel opt_sources_entry.none) { ret nil; }
+    ret opt_sources_entry.some;
 }
 
 # whether a diagnostic's span touches the requested range

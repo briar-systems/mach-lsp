@@ -224,15 +224,15 @@ pub fun live_span(t: Text, span: src.Span, enclosing: bool) opt[src.Span] {
 # is a claim about exactly those bytes, and a change inside them changed what it
 # names. A declaration's full range is not such a claim; see `maps_around`.
 pub fun maps(t: Text, span: src.Span) bool {
-    val o: opt[src.Span] = live_span(t, span, false);
-    ret sel o.some;
+    val opt_live_span: opt[src.Span] = live_span(t, span, false);
+    ret sel opt_live_span.some;
 }
 
 # as `maps`, for a range that merely surrounds what it describes - a
 # declaration around an edit to its body is still that declaration
 pub fun maps_around(t: Text, span: src.Span) bool {
-    val o: opt[src.Span] = live_span(t, span, true);
-    ret sel o.some;
+    val opt_live_span: opt[src.Span] = live_span(t, span, true);
+    ret sel opt_live_span.some;
 }
 
 # the analyzed offset for the client's offset `q`, or none inside a window. a
@@ -254,12 +254,12 @@ fun analyzed_offset(t: Text, q: usize) opt[usize] {
 # ret:  the same bytes' span in `t.file`, or none
 pub fun analyzed_span(t: Text, span: src.Span) opt[src.Span] {
     if (span.len == 0) { ret opt[src.Span].none{}; }
-    val ao: opt[usize] = analyzed_offset(t, span.offset);
-    if (sel ao.none) { ret opt[src.Span].none{}; }
-    val bo: opt[usize] = analyzed_offset(t, span.offset + span.len - 1);
-    if (sel bo.none) { ret opt[src.Span].none{}; }
-    val a: usize = ao.some;
-    val b: usize = bo.some;
+    val opt_analyzed_offset: opt[usize] = analyzed_offset(t, span.offset);
+    if (sel opt_analyzed_offset.none) { ret opt[src.Span].none{}; }
+    val opt_usize: opt[usize] = analyzed_offset(t, span.offset + span.len - 1);
+    if (sel opt_usize.none) { ret opt[src.Span].none{}; }
+    val a: usize = opt_analyzed_offset.some;
+    val b: usize = opt_usize.some;
     if (b < a) { ret opt[src.Span].none{}; }
     var out: src.Span;
     out.offset = a;
@@ -275,9 +275,9 @@ pub fun analyzed_span(t: Text, span: src.Span) opt[src.Span] {
 # q:   an offset into `client_file(t)`
 # ret: an offset into `t.file`
 pub fun analyzed_anchor(t: Text, q: usize) usize {
-    val ao: opt[usize] = analyzed_offset(t, q);
-    if (sel ao.some) { ret ao.some; }
-    if (t.blind)     { ret 0; }
+    val opt_analyzed_offset: opt[usize] = analyzed_offset(t, q);
+    if (sel opt_analyzed_offset.some) { ret opt_analyzed_offset.some; }
+    if (t.blind)                      { ret 0; }
     val i: usize = first_after_new(t, q);
     if (i >= t.win_count) { ret t.len; }
     ret t.wins[i].old_start;
@@ -305,9 +305,9 @@ fun client_len(t: Text) usize {
 # ch:   0-based LSP character, in the negotiated encoding
 # ret:  some(offset) into `t.file`, or none
 pub fun offset_at(t: Text, line: usize, ch: usize) opt[usize] {
-    val qo: opt[usize] = client_offset(t, line, ch);
-    if (sel qo.none) { ret qo; }
-    ret analyzed_offset(t, qo.some);
+    val opt_client_offset: opt[usize] = client_offset(t, line, ch);
+    if (sel opt_client_offset.none) { ret opt_client_offset; }
+    ret analyzed_offset(t, opt_client_offset.some);
 }
 
 # as `offset_at`, for one end of a range the client uses as a filter rather
@@ -321,15 +321,15 @@ pub fun offset_at(t: Text, line: usize, ch: usize) opt[usize] {
 # is_end: whether this is the range's end
 # ret:    some(offset) into `t.file`, or none for an out-of-range line
 pub fun bound_at(t: Text, line: usize, ch: usize, is_end: bool) opt[usize] {
-    val qo: opt[usize] = client_offset(t, line, ch);
-    if (sel qo.none) { ret qo; }
-    val ao: opt[usize] = analyzed_offset(t, qo.some);
-    if (sel ao.some) { ret ao; }
+    val opt_client_offset: opt[usize] = client_offset(t, line, ch);
+    if (sel opt_client_offset.none) { ret opt_client_offset; }
+    val opt_analyzed_offset: opt[usize] = analyzed_offset(t, opt_client_offset.some);
+    if (sel opt_analyzed_offset.some) { ret opt_analyzed_offset; }
     if (t.blind) {
         if (is_end) { ret opt[usize].some{t.len}; }
         ret opt[usize].some{0};
     }
-    val i: usize = first_after_new(t, qo.some);
+    val i: usize = first_after_new(t, opt_client_offset.some);
     if (is_end) { ret opt[usize].some{t.wins[i].old_end}; }
     ret opt[usize].some{t.wins[i].old_start};
 }
@@ -338,9 +338,9 @@ pub fun bound_at(t: Text, line: usize, ch: usize, is_end: bool) opt[usize] {
 fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
     val file: *src.SourceFile = client_file(t);
     if (file == nil) { ret opt[usize].none{}; }
-    val ls: opt[usize] = src.line_start(file, line + 1);
-    if (sel ls.none) { ret opt[usize].none{}; }
-    val ls_off: usize = ls.some;
+    val opt_line_start: opt[usize] = src.line_start(file, line + 1);
+    if (sel opt_line_start.none) { ret opt[usize].none{}; }
+    val ls_off: usize = opt_line_start.some;
 
     var le_off: usize = client_len(t);
     if (line + 1 < file.lines.len) { le_off = file.lines.starts[line + 1]; }
@@ -356,17 +356,17 @@ fun client_offset(t: Text, line: usize, ch: usize) opt[usize] {
 # ret:  the 0-based range in the client's buffer, or none
 pub fun span_range(t: Text, span: src.Span) opt[LspRange] {
     if (t.file == nil) { ret opt[LspRange].none{}; }
-    val lo: opt[src.Span] = live_span(t, span, false);
-    if (sel lo.none) { ret opt[LspRange].none{}; }
-    ret opt[LspRange].some{range_of(client_file(t), lo.some)};
+    val opt_live_span: opt[src.Span] = live_span(t, span, false);
+    if (sel opt_live_span.none) { ret opt[LspRange].none{}; }
+    ret opt[LspRange].some{range_of(client_file(t), opt_live_span.some)};
 }
 
 # as `span_range`, carrying a range that surrounds the window; see `maps_around`
 pub fun span_range_around(t: Text, span: src.Span) opt[LspRange] {
     if (t.file == nil) { ret opt[LspRange].none{}; }
-    val lo: opt[src.Span] = live_span(t, span, true);
-    if (sel lo.none) { ret opt[LspRange].none{}; }
-    ret opt[LspRange].some{range_of(client_file(t), lo.some)};
+    val opt_live_span: opt[src.Span] = live_span(t, span, true);
+    if (sel opt_live_span.none) { ret opt[LspRange].none{}; }
+    ret opt[LspRange].some{range_of(client_file(t), opt_live_span.some)};
 }
 
 # the LSP range covering a byte span in `file`. a zero-length span
@@ -423,9 +423,9 @@ pub fun span_text(t: Text, span: src.Span, alloc: *Allocator) str {
     var len: usize = span.len;
     if (span.offset + len > t.len) { len = t.len - span.offset; }
 
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
-    if (sel r.err) { ret nil; }
-    val buf: *u8 = r.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val buf: *u8 = res_allocate.ok;
     mem.raw_copy(buf::ptr, (t.file.text::usize + span.offset)::ptr, len);
     buf[len] = 0;
     ret buf::str;
@@ -691,9 +691,9 @@ test a_paired_text_maps_spans_around_the_window {
     if (!some_is(bound_at(t, 0, 6, true), 5))  { fail = true; }
 
     # the reported range indexes the client's lines
-    val ro: opt[LspRange] = span_range(t, t_span(8, 3));
-    if (sel ro.some) {
-        if (ro.some.start_line != 2 || ro.some.start_char != 0) { fail = true; }
+    val opt_span_range: opt[LspRange] = span_range(t, t_span(8, 3));
+    if (sel opt_span_range.some) {
+        if (opt_span_range.some.start_line != 2 || opt_span_range.some.start_char != 0) { fail = true; }
     }
     or { fail = true; }
     textdiff.dnit(?pa, ?wins);

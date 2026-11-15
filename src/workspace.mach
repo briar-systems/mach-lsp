@@ -83,10 +83,10 @@ fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
     val n:       u32   = project.module_count(root);
     var mi:      u32   = 0;
     for (mi < n && emitted < MAX_RESULTS) {
-        val mid: lmodule.StableModuleId  = project.module_id_at(root, mi);
-        val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
-        if (sel mvo.some) {
-            val mv: project.ModuleView = mvo.some;
+        val mid:             lmodule.StableModuleId  = project.module_id_at(root, mi);
+        val opt_module_view: opt[project.ModuleView] = project.module_view(ws, root, mid);
+        if (sel opt_module_view.some) {
+            val mv: project.ModuleView = opt_module_view.some;
             if (mv.rr != nil && mv.a != nil) {
                 val uri: str = project.module_uri(ws, root, mid);
                 if (uri != nil) {
@@ -113,13 +113,13 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
         # the module that declares it, so a name appears once per declaration
         # rather than once per importer
         if (lmodule.stable_same(sym.origin, mid) && features.completion_candidate(mv.rr, rslv.symbol_id(i))) {
-            val no: opt[str] = intern.get(?root.s.interner, sym.name);
-            if (sel no.some) {
-                val name: str = no.some;
+            val opt_interner_entry: opt[str] = intern.get(?root.s.interner, sym.name);
+            if (sel opt_interner_entry.some) {
+                val name: str = opt_interner_entry.some;
                 if (match_tier(query, name) == tier) {
-                    val spo: opt[src.Span] = features.decl_name_span_of(mv.a, sym);
-                    if (sel spo.some) {
-                        if (push_symbol(b, mv.text, uri, spo.some, name,
+                    val opt_decl_name_span_of: opt[src.Span] = features.decl_name_span_of(mv.a, sym);
+                    if (sel opt_decl_name_span_of.some) {
+                        if (push_symbol(b, mv.text, uri, opt_decl_name_span_of.some, name,
                             features.lsp_symbol_kind(sym.kind), fqn, emitted > 0)) {
                             emitted = emitted + 1;
                         }

@@ -127,17 +127,17 @@ pub fun capture(alloc: *Allocator, store: *diag.DiagnosticStore, manifest: str) 
 # text:     the reason
 # manifest: the uri of the root's manifest
 pub fun refusal(alloc: *Allocator, f: ferr.Fail, sources: *src.SourceMap, text: str, manifest: str) Notes {
-    var n:     Notes              = empty();
-    val k:     dkind.Kind         = ferr.kind_of(f);
-    val po:    opt[src.Location]  = ferr.place_of(f);
-    var range: positions.LspRange = file_start();
-    var at:    str                = nil;
-    if (sel po.some) {
-        val fo: opt[*src.SourceFile] = src.get(sources, po.some.file);
-        if (sel fo.some) {
-            if (fo.some.present) {
-                at    = uris.of_path(alloc, fo.some.path);
-                range = positions.range_of(fo.some, po.some.span);
+    var n:            Notes              = empty();
+    val k:            dkind.Kind         = ferr.kind_of(f);
+    val opt_place_of: opt[src.Location]  = ferr.place_of(f);
+    var range:        positions.LspRange = file_start();
+    var at:           str                = nil;
+    if (sel opt_place_of.some) {
+        val opt_sources_entry: opt[*src.SourceFile] = src.get(sources, opt_place_of.some.file);
+        if (sel opt_sources_entry.some) {
+            if (opt_sources_entry.some.present) {
+                at    = uris.of_path(alloc, opt_sources_entry.some.path);
+                range = positions.range_of(opt_sources_entry.some, opt_place_of.some.span);
             }
         }
     }
@@ -153,18 +153,18 @@ pub fun refusal(alloc: *Allocator, f: ferr.Fail, sources: *src.SourceMap, text: 
 fun add(alloc: *Allocator, n: *Notes, severity: i64, kind: dkind.Kind, text: str, uri: str, range: positions.LspRange) {
     if (text == nil || uri == nil || n.len >= MAX_NOTES) { ret; }
     if (n.items == nil) {
-        val r: res[*Note, allocator.Error] = allocate[Note](alloc, MAX_NOTES);
-        if (sel r.err) { ret; }
-        n.items = r.ok;
+        val res_allocate: res[*Note, allocator.Error] = allocate[Note](alloc, MAX_NOTES);
+        if (sel res_allocate.err) { ret; }
+        n.items = res_allocate.ok;
     }
-    val dr: res[str, allocator.Error] = strutil.str_dup(alloc, text);
-    if (sel dr.err) { ret; }
-    val ur: res[str, allocator.Error] = strutil.str_dup(alloc, uri);
-    if (sel ur.err) {
-        strutil.str_free(alloc, dr.ok);
+    val res_str_dup: res[str, allocator.Error] = strutil.str_dup(alloc, text);
+    if (sel res_str_dup.err) { ret; }
+    val res_str_dup_alloc: res[str, allocator.Error] = strutil.str_dup(alloc, uri);
+    if (sel res_str_dup_alloc.err) {
+        strutil.str_free(alloc, res_str_dup.ok);
         ret;
     }
-    n.items[n.len] = Note{severity: severity, kind: kind, text: dr.ok, uri: ur.ok, range: range};
+    n.items[n.len] = Note{severity: severity, kind: kind, text: res_str_dup.ok, uri: res_str_dup_alloc.ok, range: range};
     n.len          = n.len + 1;
 }
 

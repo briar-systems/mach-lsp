@@ -80,11 +80,11 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     result.alloc = nil;
     var refused: editor.AnalysisResult = editor.AnalysisResult{};
     refused.alloc = nil;
-    var at:  Locator                        = Locator{w: w, root: nil, sources: nil};
-    var own: src.FileId                     = d.file_id;
-    val vr:  res[project.DocumentView, str] = project.document_view(w, d);
-    if (sel vr.ok) {
-        val v: project.DocumentView = vr.ok;
+    var at:                Locator                        = Locator{w: w, root: nil, sources: nil};
+    var own:               src.FileId                     = d.file_id;
+    val res_document_view: res[project.DocumentView, str] = project.document_view(w, d);
+    if (sel res_document_view.ok) {
+        val v: project.DocumentView = res_document_view.ok;
         if (v.stale) {
             if (!standalone(es, d, driver.FRONTEND_PARSE, alloc, ?result)) { ret; }
             list       = result.diagnostics;
@@ -193,9 +193,9 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
         notes.push_kind(b, ferr.kind_of(f));
         json.buf_push(b, ",\"source\":\"mach\",\"message\":");
         json.buf_push_quoted(b, result.message);
-        val po: opt[src.Location] = ferr.place_of(f);
-        if (sel po.some) {
-            if (push_related_entry(b, at, po.some, result.message, alloc, 0) > 0) { json.buf_push_byte(b, ']'); }
+        val opt_place_of: opt[src.Location] = ferr.place_of(f);
+        if (sel opt_place_of.some) {
+            if (push_related_entry(b, at, opt_place_of.some, result.message, alloc, 0) > 0) { json.buf_push_byte(b, ']'); }
         }
         json.buf_push_byte(b, '}');
         ret;
@@ -236,8 +236,8 @@ rec Locator {
 # the text a file id's spans are reported through
 fun text_for(at: *Locator, fid: src.FileId) positions.Text {
     if (at.root != nil) { ret project.file_text(at.w, at.root, fid); }
-    val so: opt[*src.SourceFile] = src.get(at.sources, fid);
-    if (sel so.some) { ret positions.text_of(so.some); }
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(at.sources, fid);
+    if (sel opt_sources_entry.some) { ret positions.text_of(opt_sources_entry.some); }
     ret positions.text_of(nil);
 }
 
@@ -245,10 +245,10 @@ fun text_for(at: *Locator, fid: src.FileId) positions.Text {
 # cleared and false returned
 fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: driver.FrontendPhase,
     alloc: *Allocator, out: *editor.AnalysisResult) bool {
-    var req: editor.AnalysisRequest                = editor.analysis_request(d.file_id, phase);
-    val ar:  res[editor.AnalysisResult, ferr.Fail] = editor.analyze(es, ?req);
-    if (sel ar.err) {
-        var f: ferr.Fail = ar.err;
+    var req:         editor.AnalysisRequest                = editor.analysis_request(d.file_id, phase);
+    val res_analyze: res[editor.AnalysisResult, ferr.Fail] = editor.analyze(es, ?req);
+    if (sel res_analyze.err) {
+        var f: ferr.Fail = res_analyze.err;
         trace.log("diagnostics: standalone analysis failed: ");
         trace.log(ferr.describe(f));
         trace.log("\n");
@@ -256,7 +256,7 @@ fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: driver.
         clear(alloc, d.uri);
         ret false;
     }
-    @out = ar.ok;
+    @out = res_analyze.ok;
     ret true;
 }
 
@@ -325,9 +325,9 @@ fun range_for(t: positions.Text, span: src.Span, out: *positions.LspRange) bool 
     out.end_line   = 0;
     out.end_char   = 0;
     if (t.file == nil) { ret true; }
-    val ro: opt[positions.LspRange] = positions.span_range(t, span);
-    if (sel ro.none) { ret false; }
-    @out = ro.some;
+    val opt_span_range: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel opt_span_range.none) { ret false; }
+    @out = opt_span_range.some;
     ret true;
 }
 
@@ -466,12 +466,12 @@ test a_secondary_location_renders_as_a_located_relatedinformation_entry {
 
     # add builds the line index and issues the first FileId as 1, since slot 0 is
     # the FILE_NIL sentinel
-    var m:     src.SourceMap              = src.init(?pa);
-    val added: res[src.FileId, src.Error] = src.add(?m, "file:///w/a.mach", "ab\ncd");
-    if (sel added.err) { ret 1; }
+    var m:         src.SourceMap              = src.init(?pa);
+    val res_added: res[src.FileId, src.Error] = src.add(?m, "file:///w/a.mach", "ab\ncd");
+    if (sel res_added.err) { ret 1; }
 
     var rels: [1]annotation.Related;
-    rels[0].loc.file        = added.ok;
+    rels[0].loc.file        = res_added.ok;
     rels[0].loc.span.offset = 0;
     rels[0].loc.span.len    = 2;
     rels[0].label           = "previous definition here";

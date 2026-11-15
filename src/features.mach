@@ -82,9 +82,9 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId
     if (!id.expr_is_nil(eid) && rr.expr_resolved != nil && id.expr_index(eid) < rr.expr_count) {
         val sid: rslv.SymbolId = rr.expr_resolved[id.expr_index(eid)];
         if (!rslv.symbol_is_nil(sid) && rslv.symbol_index(sid) < rr.symbol_count) {
-            val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-            if (sel eo.some) {
-                ret opt[SymbolRef].some{make_ref(rr, own, sid, name_span_of_expr(eo.some))};
+            val opt_expr: opt[*expr.Expr] = ast.get_expr(a, eid);
+            if (sel opt_expr.some) {
+                ret opt[SymbolRef].some{make_ref(rr, own, sid, name_span_of_expr(opt_expr.some))};
             }
         }
     }
@@ -93,9 +93,9 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId
     if (!id.type_is_nil(tid) && rr.type_resolved != nil && id.type_index(tid) < rr.type_count) {
         val sid: rslv.SymbolId = rr.type_resolved[id.type_index(tid)];
         if (!rslv.symbol_is_nil(sid) && rslv.symbol_index(sid) < rr.symbol_count) {
-            val tno: opt[src.Span] = type_name_span(a, tid);
-            if (sel tno.some) {
-                ret opt[SymbolRef].some{make_ref(rr, own, sid, tno.some)};
+            val opt_type_name_span: opt[src.Span] = type_name_span(a, tid);
+            if (sel opt_type_name_span.some) {
+                ret opt[SymbolRef].some{make_ref(rr, own, sid, opt_type_name_span.some)};
             }
         }
     }
@@ -108,11 +108,11 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId
         if (rr.decl_symbol != nil && id.decl_index(did) < rr.decl_count) {
             val sid: rslv.SymbolId = rr.decl_symbol[id.decl_index(did)];
             if (!rslv.symbol_is_nil(sid) && rslv.symbol_index(sid) < rr.symbol_count) {
-                val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-                if (sel d_opt.some) {
-                    val nso: opt[src.Span] = decl_name_span(d_opt.some);
-                    if (sel nso.some) {
-                        val nspan: src.Span = nso.some;
+                val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+                if (sel opt_decl.some) {
+                    val opt_decl_name_span: opt[src.Span] = decl_name_span(opt_decl.some);
+                    if (sel opt_decl_name_span.some) {
+                        val nspan: src.Span = opt_decl_name_span.some;
                         if (ast.span_contains(nspan, offset)) {
                             ret opt[SymbolRef].some{make_ref(rr, own, sid, nspan)};
                         }
@@ -124,14 +124,14 @@ pub fun ref_at(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId
         # a function's parameter and generic binding names are not decls - they
         # bind SYM_PARAM / SYM_GENERIC symbols carrying (decl, slot). resolve a
         # cursor on one of those binding names through the symbol table
-        val bo: opt[SymbolRef] = binding_ref_in_decl(a, rr, own, did, offset);
-        if (sel bo.some) { ret bo; }
+        val opt_binding_ref_in_decl: opt[SymbolRef] = binding_ref_in_decl(a, rr, own, did, offset);
+        if (sel opt_binding_ref_in_decl.some) { ret opt_binding_ref_in_decl; }
 
         # a `use` / `fwd` path is neither an expr nor a type, and an import decl
         # has no name span, so nothing above reaches it - yet decl_symbol holds
         # exactly the symbol the import binds
-        val io: opt[SymbolRef] = import_ref_in_decl(a, rr, own, did, file, offset);
-        if (sel io.some) { ret io; }
+        val opt_import_ref_in_decl: opt[SymbolRef] = import_ref_in_decl(a, rr, own, did, file, offset);
+        if (sel opt_import_ref_in_decl.some) { ret opt_import_ref_in_decl; }
     }
 
     ret opt[SymbolRef].none{};
@@ -159,9 +159,9 @@ fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.Stable
     val sid: rslv.SymbolId = rr.decl_symbol[id.decl_index(did)];
     if (rslv.symbol_is_nil(sid) || rslv.symbol_index(sid) >= rr.symbol_count) { ret opt[SymbolRef].none{}; }
 
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret opt[SymbolRef].none{}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) { ret opt[SymbolRef].none{}; }
+    val d: *decl.Decl = opt_decl.some;
 
     var path:  src.Span;
     var alias: src.Span;
@@ -187,9 +187,9 @@ fun import_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.Stable
 # generics carry no Decl node - their symbol is found by matching (decl, slot)
 # in the symbol table
 fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.StableModuleId, did: id.DeclId, offset: usize) opt[SymbolRef] {
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret opt[SymbolRef].none{}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) { ret opt[SymbolRef].none{}; }
+    val d: *decl.Decl = opt_decl.some;
 
     val gstart: u32 = generics_start_of(d);
     val glen:   u32 = generics_len_of(d);
@@ -223,9 +223,9 @@ fun binding_ref_in_decl(a: *ast.Ast, rr: *rslv.ResolveResult, own: lmodule.Stabl
 # in decl `did`, or TYPE_NIL. a parameter carries no Decl node, so neither the
 # decl nor the expr side tables can answer for a cursor on its name
 pub fun param_type_at(a: *ast.Ast, did: id.DeclId, offset: usize) id.TypeId {
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret id.TYPE_NIL; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) { ret id.TYPE_NIL; }
+    val d: *decl.Decl = opt_decl.some;
     if (d.kind != decl.DECL_KIND_FUN) { ret id.TYPE_NIL; }
 
     var pi: u32 = 0;
@@ -277,9 +277,9 @@ fun find_binding_symbol(rr: *rslv.ResolveResult, kind: rslv.SymKind, did: id.Dec
 pub fun binding_name_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
     if (sym.kind != rslv.SYM_PARAM && sym.kind != rslv.SYM_GENERIC) { ret opt[src.Span].none{}; }
     if (id.decl_is_nil(sym.decl))                                   { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    val d: *decl.Decl = opt_decl.some;
 
     if (sym.kind == rslv.SYM_GENERIC) {
         if (sym.slot >= generics_len_of(d)) { ret opt[src.Span].none{}; }
@@ -384,9 +384,9 @@ pub fun symbol_denotes(rr: *rslv.ResolveResult, sid: rslv.SymbolId, origin: lmod
 # a:   the buffer's parsed Ast
 # ret: the module-scope decl count
 pub fun top_level_count(a: *ast.Ast) u32 {
-    val mo: opt[*module.Module] = ast.get_module(a, a.root_module);
-    if (sel mo.none) { ret 0; }
-    ret mo.some.decls_len;
+    val opt_module: opt[*module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) { ret 0; }
+    ret opt_module.some.decls_len;
 }
 
 # the DeclId of the `i`-th module-scope declaration, or DECL_NIL
@@ -398,9 +398,9 @@ pub fun top_level_count(a: *ast.Ast) u32 {
 # i:   index into the module's top-level decl list
 # ret: the DeclId, or DECL_NIL
 pub fun top_level_decl(a: *ast.Ast, i: u32) id.DeclId {
-    val mo: opt[*module.Module] = ast.get_module(a, a.root_module);
-    if (sel mo.none) { ret id.DECL_NIL; }
-    val m: *module.Module = mo.some;
+    val opt_module: opt[*module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) { ret id.DECL_NIL; }
+    val m: *module.Module = opt_module.some;
     if (i >= m.decls_len) { ret id.DECL_NIL; }
     ret a.decl_ids.data[m.decls_start + i];
 }
@@ -423,9 +423,9 @@ pub fun symbol(rr: *rslv.ResolveResult, sid: rslv.SymbolId) opt[*rslv.Symbol] {
 # ret: some(span) of the decl, or none
 pub fun decl_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
     if (id.decl_is_nil(sym.decl)) { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    ret opt[src.Span].some{d_opt.some.span};
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{opt_decl.some.span};
 }
 
 # the span of a local symbol's declared name identifier (the
@@ -438,9 +438,9 @@ pub fun decl_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
 # ret: some(span) of the name identifier, or none
 pub fun decl_name_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
     if (id.decl_is_nil(sym.decl)) { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    ret decl_name_span(d_opt.some);
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    ret decl_name_span(opt_decl.some);
 }
 
 # the span go-to-definition should land on for a local
@@ -486,14 +486,14 @@ pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) op
     if (sym.kind == rslv.SYM_PARAM)   { ret param_signature_span(a, sym); }
 
     if (id.decl_is_nil(sym.decl)) { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    val d: *decl.Decl = opt_decl.some;
 
     if (d.kind == decl.DECL_KIND_FUN && !id.stmt_is_nil(d.data.fun_.body)) {
-        val so: opt[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
-        if (sel so.some) {
-            val body_off: usize = so.some.span.offset;
+        val opt_stmt: opt[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+        if (sel opt_stmt.some) {
+            val body_off: usize = opt_stmt.some.span.offset;
             if (body_off > d.span.offset) {
                 var sp: src.Span;
                 sp.offset = d.span.offset;
@@ -506,16 +506,16 @@ pub fun signature_span(a: *ast.Ast, file: *src.SourceFile, sym: *rslv.Symbol) op
     # summary, not a source viewer: a 13-field record renders as a wall that
     # buries the one line the reader asked about. trim to the header.
     if (d.kind == decl.DECL_KIND_REC || d.kind == decl.DECL_KIND_UNI) {
-        val ho: opt[src.Span] = header_span(file, d.span, '{');
-        if (sel ho.some) { ret ho; }
+        val opt_header_span: opt[src.Span] = header_span(file, d.span, '{');
+        if (sel opt_header_span.some) { ret opt_header_span; }
     }
 
     # a binding whose initialiser runs over several lines has the same problem;
     # its type is what hover is for, and that ends at the `=`
     if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
         if (spans_multiple_lines(file, d.span)) {
-            val ho: opt[src.Span] = header_span(file, d.span, '=');
-            if (sel ho.some) { ret ho; }
+            val opt_header_span: opt[src.Span] = header_span(file, d.span, '=');
+            if (sel opt_header_span.some) { ret opt_header_span; }
         }
     }
 
@@ -565,20 +565,20 @@ fun is_space(c: u8) bool {
 # binding name through the end of its type annotation - for hover. falls back
 # to just the name span when the type node is unavailable. none for a non-param
 fun param_signature_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
-    val no: opt[src.Span] = binding_name_span(a, sym);
-    if (sel no.none) { ret opt[src.Span].none{}; }
-    val name: src.Span = no.some;
+    val opt_binding_name_span: opt[src.Span] = binding_name_span(a, sym);
+    if (sel opt_binding_name_span.none) { ret opt[src.Span].none{}; }
+    val name: src.Span = opt_binding_name_span.some;
 
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[src.Span].some{name}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (sel opt_decl.none) { ret opt[src.Span].some{name}; }
+    val d: *decl.Decl = opt_decl.some;
     if (d.kind != decl.DECL_KIND_FUN || sym.slot >= d.data.fun_.params_len) { ret opt[src.Span].some{name}; }
 
     val tn: *decl.TypedName = ?a.typed_names.data[d.data.fun_.params_start + sym.slot];
     if (id.type_is_nil(tn.ty)) { ret opt[src.Span].some{name}; }
-    val to: opt[*atype.Type] = ast.get_type(a, tn.ty);
-    if (sel to.none) { ret opt[src.Span].some{name}; }
-    val tspan: src.Span = to.some.span;
+    val opt_type: opt[*atype.Type] = ast.get_type(a, tn.ty);
+    if (sel opt_type.none) { ret opt[src.Span].some{name}; }
+    val tspan: src.Span = opt_type.some.span;
 
     val end: usize = tspan.offset + tspan.len;
     if (end <= name.offset) { ret opt[src.Span].some{name}; }
@@ -602,9 +602,9 @@ fun param_signature_span(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
 pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
     if (sym.kind == rslv.SYM_PARAM || sym.kind == rslv.SYM_GENERIC) { ret opt[src.Span].none{}; }
     if (id.decl_is_nil(sym.decl))                                   { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, sym.decl);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    val d: *decl.Decl = opt_decl.some;
     if (d.doc.len == 0) { ret opt[src.Span].none{}; }
     ret opt[src.Span].some{d.doc};
 }
@@ -777,9 +777,9 @@ pub fun lsp_completion_kind(kind: rslv.SymKind) i64 {
 pub fun expr_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, target: rslv.SymbolId) opt[src.Span] {
     if (rr.expr_resolved == nil || id.expr_index(eid) >= rr.expr_count)  { ret opt[src.Span].none{}; }
     if (!rslv.symbol_same(rr.expr_resolved[id.expr_index(eid)], target)) { ret opt[src.Span].none{}; }
-    val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret opt[src.Span].none{}; }
-    ret opt[src.Span].some{name_span_of_expr(eo.some)};
+    val opt_expr: opt[*expr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none) { ret opt[src.Span].none{}; }
+    ret opt[src.Span].some{name_span_of_expr(opt_expr.some)};
 }
 
 # the name span of type `tid` when it resolves to `target`, or
@@ -829,9 +829,9 @@ pub fun completion_candidate(rr: *rslv.ResolveResult, sid: rslv.SymbolId) bool {
 pub fun decl_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId) opt[src.Span] {
     if (rr.decl_symbol == nil || id.decl_index(did) >= rr.decl_count)  { ret opt[src.Span].none{}; }
     if (!rslv.symbol_same(rr.decl_symbol[id.decl_index(did)], target)) { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    ret decl_name_span(d_opt.some);
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    ret decl_name_span(opt_decl.some);
 }
 
 # the byte span of the final dotted segment of import `path`
@@ -883,9 +883,9 @@ pub fun import_leaf_span(file: *src.SourceFile, path: src.Span) src.Span {
 pub fun import_ref_span(a: *ast.Ast, rr: *rslv.ResolveResult, did: id.DeclId, target: rslv.SymbolId, file: *src.SourceFile) opt[src.Span] {
     if (rr.decl_symbol == nil || id.decl_index(did) >= rr.decl_count)  { ret opt[src.Span].none{}; }
     if (!rslv.symbol_same(rr.decl_symbol[id.decl_index(did)], target)) { ret opt[src.Span].none{}; }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret opt[src.Span].none{}; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) { ret opt[src.Span].none{}; }
+    val d: *decl.Decl = opt_decl.some;
     if (d.kind == decl.DECL_KIND_USE) { ret opt[src.Span].some{import_leaf_span(file, d.data.use_.path)}; }
     if (d.kind == decl.DECL_KIND_FWD) { ret opt[src.Span].some{import_leaf_span(file, d.data.fwd_.path)}; }
     ret opt[src.Span].none{};
@@ -951,10 +951,10 @@ pub fun token_span_of_expr(e: *expr.Expr) opt[src.Span] {
 # text: the source the tree's spans index
 # eid:  the expression
 pub fun multiline_string(a: *ast.Ast, text: str, eid: id.ExprId) opt[src.Span] {
-    val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none)                            { ret opt[src.Span].none{}; }
-    if (eo.some.kind != expr.EXPR_KIND_LIT_STR) { ret opt[src.Span].none{}; }
-    val tok: src.Span = eo.some.data.lit_str.tok;
+    val opt_expr: opt[*expr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none)                            { ret opt[src.Span].none{}; }
+    if (opt_expr.some.kind != expr.EXPR_KIND_LIT_STR) { ret opt[src.Span].none{}; }
+    val tok: src.Span = opt_expr.some.data.lit_str.tok;
     if (text == nil || !literal.str_multiline(src.span_view(text, tok))) { ret opt[src.Span].none{}; }
     ret opt[src.Span].some{tok};
 }
@@ -965,17 +965,17 @@ pub fun multiline_string(a: *ast.Ast, text: str, eid: id.ExprId) opt[src.Span] {
 # e:   the expression
 # ret: the token when there is one, else the expression's span
 pub fun text_span_of_expr(e: *expr.Expr) src.Span {
-    val to: opt[src.Span] = token_span_of_expr(e);
-    if (sel to.some) { ret to.some; }
+    val opt_token_span_of_expr: opt[src.Span] = token_span_of_expr(e);
+    if (sel opt_token_span_of_expr.some) { ret opt_token_span_of_expr.some; }
     ret e.span;
 }
 
 # the name span of a named type node, or none when the type at
 # `tid` is not a named reference (a pointer / array / fun type wrapping it)
 fun type_name_span(a: *ast.Ast, tid: id.TypeId) opt[src.Span] {
-    val t_opt: opt[*atype.Type] = ast.get_type(a, tid);
-    if (sel t_opt.none) { ret opt[src.Span].none{}; }
-    val t: *atype.Type = t_opt.some;
+    val opt_type: opt[*atype.Type] = ast.get_type(a, tid);
+    if (sel opt_type.none) { ret opt[src.Span].none{}; }
+    val t: *atype.Type = opt_type.some;
     if (t.kind == atype.TYPE_KIND_NAMED) { ret opt[src.Span].some{t.data.named.name}; }
     ret opt[src.Span].none{};
 }
@@ -1012,9 +1012,9 @@ pub rec FieldRef {
 pub fun field_ref_at(a: *ast.Ast, offset: usize) opt[FieldRef] {
     val eid: id.ExprId = ast.offset_to_expr(a, offset);
     if (id.expr_is_nil(eid)) { ret opt[FieldRef].none{}; }
-    val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret opt[FieldRef].none{}; }
-    val e: *expr.Expr = eo.some;
+    val opt_expr: opt[*expr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none) { ret opt[FieldRef].none{}; }
+    val e: *expr.Expr = opt_expr.some;
 
     if (e.kind == expr.EXPR_KIND_MEMBER) {
         if (!ast.span_contains(e.data.member.name, offset)) { ret opt[FieldRef].none{}; }
@@ -1135,9 +1135,9 @@ pub rec FieldKey {
 # key: the field identity to match
 # ret: some(name span) when `eid` references the keyed field, or none
 pub fun field_ref_span_at(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey) opt[src.Span] {
-    val eo: opt[*expr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret opt[src.Span].none{}; }
-    val e: *expr.Expr = eo.some;
+    val opt_expr: opt[*expr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none) { ret opt[src.Span].none{}; }
+    val e: *expr.Expr = opt_expr.some;
 
     if (e.kind == expr.EXPR_KIND_MEMBER) {
         if (!host_matches(sr, ti, e.data.member.object, key))                         { ret opt[src.Span].none{}; }
@@ -1168,10 +1168,10 @@ pub fun field_ref_span_at(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type.T
 # the same record across modules, regardless of pointer / generic-instance wrapping
 # (peeled by `nominal_of`)
 fun host_matches(sr: *sema_product.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, key: FieldKey) bool {
-    val tid: type_kind.TypeId    = mtypes.type_of(sr, eid);
-    val no:  opt[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
-    if (sel no.none) { ret false; }
-    val n: mtypes.Nominal = no.some;
+    val tid:            type_kind.TypeId    = mtypes.type_of(sr, eid);
+    val opt_nominal_of: opt[mtypes.Nominal] = mtypes.nominal_of(ti, tid);
+    if (sel opt_nominal_of.none) { ret false; }
+    val n: mtypes.Nominal = opt_nominal_of.some;
     ret src.file_same(n.file, key.file) && intern.str_same(n.name, key.name);
 }
 
@@ -1202,9 +1202,9 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type
     var n:  usize = 0;
     var ei: usize = 0;
     for (ei < a.exprs.len && n < cap) {
-        val so: opt[src.Span] = field_ref_span_at(a, sr, ti, id.expr(ei::u32), qf, key);
-        if (sel so.some) {
-            out[n] = so.some;
+        val opt_field_ref_span_at: opt[src.Span] = field_ref_span_at(a, sr, ti, id.expr(ei::u32), qf, key);
+        if (sel opt_field_ref_span_at.some) {
+            out[n] = opt_field_ref_span_at.some;
             n      = n + 1;
         }
         ei = ei + 1;
@@ -1213,9 +1213,9 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type
         out[n] = key.field_name;
         n      = n + 1;
         if (want_doc && doc.len != 0 && n < cap) {
-            val co: opt[src.Span] = doc_component_name_span(decl_src, doc, key.decl_file, key.field_name, false);
-            if (sel co.some) {
-                out[n] = co.some;
+            val opt_doc_component_name_span: opt[src.Span] = doc_component_name_span(decl_src, doc, key.decl_file, key.field_name, false);
+            if (sel opt_doc_component_name_span.some) {
+                out[n] = opt_doc_component_name_span.some;
                 n      = n + 1;
             }
         }
@@ -1343,9 +1343,9 @@ fun add_field(a: *ast.Ast, offset: usize, len: usize) u32 {
     tn.name     = span_at(offset, len);
     tn.ty       = id.TYPE_NIL;
     tn.comptime = false;
-    val r: res[u32, fail.Fail] = ast.add_typed_name(a, tn);
-    if (sel r.err) { ret 0; }
-    ret r.ok;
+    val res_add_typed_name: res[u32, fail.Fail] = ast.add_typed_name(a, tn);
+    if (sel res_add_typed_name.err) { ret 0; }
+    ret res_add_typed_name.ok;
 }
 
 test field_decl_span_matches_a_field_across_two_sources {
@@ -1359,16 +1359,16 @@ test field_decl_span_matches_a_field_across_two_sources {
     # the referencing buffer file holds a member access "p.age"
     var qf: src.SourceFile = stub_file("p.age");
 
-    var fail: bool          = false;
-    val o:    opt[src.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
-    if (sel o.some) {
-        val sp: src.Span = o.some;
+    var fail:                bool          = false;
+    val opt_field_decl_span: opt[src.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 3));
+    if (sel opt_field_decl_span.some) {
+        val sp: src.Span = opt_field_decl_span.some;
         if (sp.offset != 5 || sp.len != 3) { fail = true; }
     }
     or { fail = true; }
     # "a" names no field
-    val unknown: opt[src.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 1));
-    if (sel unknown.some) { fail = true; }
+    val opt_unknown: opt[src.Span] = field_decl_span(?da, ?df, start, 2, ?qf, span_at(2, 1));
+    if (sel opt_unknown.some) { fail = true; }
 
     ast.dnit(?da);
     if (fail) { ret 1; }
@@ -1389,16 +1389,16 @@ test field_doc_desc_finds_the_matching_component_s_description {
 
     var fail: bool = false;
     # "y" field -> the "y" component description
-    val oy: opt[src.Span] = field_doc_desc(text, doc, span_at(92, 1));
-    if (sel oy.some) {
-        val sp: src.Span = oy.some;
+    val opt_field_doc_desc: opt[src.Span] = field_doc_desc(text, doc, span_at(92, 1));
+    if (sel opt_field_doc_desc.some) {
+        val sp: src.Span = opt_field_doc_desc.some;
         if (!region_eq(text, sp, "the vertical coordinate")) { fail = true; }
     }
     or { fail = true; }
     # "x" field -> the "x" component description
-    val ox: opt[src.Span] = field_doc_desc(text, doc, span_at(84, 1));
-    if (sel ox.some) {
-        val sp: src.Span = ox.some;
+    val opt_field_doc_desc_text: opt[src.Span] = field_doc_desc(text, doc, span_at(84, 1));
+    if (sel opt_field_doc_desc_text.some) {
+        val sp: src.Span = opt_field_doc_desc_text.some;
         if (!region_eq(text, sp, "the horizontal coordinate")) { fail = true; }
     }
     or { fail = true; }
@@ -1448,9 +1448,9 @@ fun mk_sema(pa: *Allocator, n: u32) sema_product.SemaResult {
     sr.type_count       = 0;
     sr.decl_count       = 0;
     if (n > 0) {
-        val r: res[*type_kind.TypeId, allocator.Error] = allocate[type_kind.TypeId](pa, n::usize);
-        if (sel r.ok) {
-            sr.expr_type  = r.ok;
+        val res_allocate: res[*type_kind.TypeId, allocator.Error] = allocate[type_kind.TypeId](pa, n::usize);
+        if (sel res_allocate.ok) {
+            sr.expr_type  = res_allocate.ok;
             sr.expr_count = n;
             var i: u32 = 0;
             for (i < n) {
@@ -1477,9 +1477,9 @@ fun add_ident(a: *ast.Ast, off: usize, len: usize) id.ExprId {
     e.span           = span_at(off, len);
     e.kind           = expr.EXPR_KIND_IDENT;
     e.data.ident.tok = span_at(off, len);
-    val r: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
-    if (sel r.err) { ret id.EXPR_NIL; }
-    ret r.ok;
+    val res_add_expr: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
+    if (sel res_add_expr.err) { ret id.EXPR_NIL; }
+    ret res_add_expr.ok;
 }
 
 # append a member access `obj.<name>` where `obj` is expr `object`
@@ -1492,9 +1492,9 @@ fun add_member(a: *ast.Ast, object: id.ExprId, name_off: usize, name_len: usize)
     e.kind               = expr.EXPR_KIND_MEMBER;
     e.data.member.object = object;
     e.data.member.name   = span_at(name_off, name_len);
-    val r: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
-    if (sel r.err) { ret id.EXPR_NIL; }
-    ret r.ok;
+    val res_add_expr: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
+    if (sel res_add_expr.err) { ret id.EXPR_NIL; }
+    ret res_add_expr.ok;
 }
 
 # append a struct literal with a single field init named over
@@ -1504,9 +1504,9 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
     var fi: expr.FieldInit;
     fi.name  = span_at(name_off, name_len);
     fi.value = id.EXPR_NIL;
-    val fr: res[u32, fail.Fail] = ast.add_field_init(a, fi);
-    if (sel fr.err) { ret id.EXPR_NIL; }
-    val start: u32 = fr.ok;
+    val res_add_field_init: res[u32, fail.Fail] = ast.add_field_init(a, fi);
+    if (sel res_add_field_init.err) { ret id.EXPR_NIL; }
+    val start: u32 = res_add_field_init.ok;
 
     var e: expr.Expr;
     e.span                         = span_at(name_off, name_len);
@@ -1514,23 +1514,23 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
     e.data.struct_lit.ty           = id.TYPE_NIL;
     e.data.struct_lit.fields_start = start;
     e.data.struct_lit.fields_len   = 1;
-    val r: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
-    if (sel r.err) { ret id.EXPR_NIL; }
-    ret r.ok;
+    val res_add_expr: res[id.ExprId, fail.Fail] = ast.add_expr(a, e);
+    if (sel res_add_expr.err) { ret id.EXPR_NIL; }
+    ret res_add_expr.ok;
 }
 
 test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     var pa: Allocator;
     page.make(?pa);
-    var a:     ast.Ast        = ast.init(?pa, src.file_id(0));
-    var ti:    type.TypeInterner;
-    val sel_9: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_9.err) { ret 1; }
+    var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
+    var ti:            type.TypeInterner;
+    val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
+    if (sel err_type_made.err) { ret 1; }
     # the record P is declared in module 2, decl 4; its field "x" lives at offset
     # 8 of the declaring source. the buffer text "p.x" carries the member access
-    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:  type_kind.TypeId = recp_r.ok;
+    val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
+    if (sel res_recp.err) { ret 1; }
+    val recp:  type_kind.TypeId = res_recp.ok;
     var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
     var buf:   src.SourceFile   = stub_file("p.x");
 
@@ -1540,17 +1540,17 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     var sr:   sema_product.SemaResult = mk_sema(?pa, 2);
     sr.expr_type[id.expr_index(recv)] = recp;
 
-    val key:  FieldKey      = fk(2, 4, ?declf, 8, 1);
-    var fail: bool          = false;
-    val o:    opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
-    if (sel o.some) {
-        val sp: src.Span = o.some;
+    val key:                   FieldKey      = fk(2, 4, ?declf, 8, 1);
+    var fail:                  bool          = false;
+    val opt_field_ref_span_at: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
+    if (sel opt_field_ref_span_at.some) {
+        val sp: src.Span = opt_field_ref_span_at.some;
         if (sp.offset != 2 || sp.len != 1) { fail = true; }
     }
     or { fail = true; }
     # the receiver IDENT itself is not a member access - no field span.
-    val sel_10: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, recv, ?buf, key);
-    if (sel sel_10.some) { fail = true; }
+    val opt_field_ref_span_at_recv: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, recv, ?buf, key);
+    if (sel opt_field_ref_span_at_recv.some) { fail = true; }
 
     free_sema(?pa, ?sr);
     type.dnit(?ti);
@@ -1562,13 +1562,13 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
 test field_ref_span_at_matches_a_struct_literal_field_init {
     var pa: Allocator;
     page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, src.file_id(0));
-    var ti:     type.TypeInterner;
-    val sel_13: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_13.err) { ret 1; }
-    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(1), t_owner(3), type_kind.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:  type_kind.TypeId = recp_r.ok;
+    var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
+    var ti:            type.TypeInterner;
+    val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
+    if (sel err_type_made.err) { ret 1; }
+    val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(1), t_owner(3), type_kind.TYPE_REC);
+    if (sel res_recp.err) { ret 1; }
+    val recp:  type_kind.TypeId = res_recp.ok;
     var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
     var buf:   src.SourceFile   = stub_file("P{ x: 1 }"); # init "x" at offset 3
 
@@ -1577,11 +1577,11 @@ test field_ref_span_at_matches_a_struct_literal_field_init {
     var sr:  sema_product.SemaResult = mk_sema(?pa, 1);
     sr.expr_type[id.expr_index(lit)] = recp;
 
-    val key:  FieldKey      = fk(3, 1, ?declf, 8, 1);
-    var fail: bool          = false;
-    val o:    opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
-    if (sel o.some) {
-        val sp: src.Span = o.some;
+    val key:                   FieldKey      = fk(3, 1, ?declf, 8, 1);
+    var fail:                  bool          = false;
+    val opt_field_ref_span_at: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
+    if (sel opt_field_ref_span_at.some) {
+        val sp: src.Span = opt_field_ref_span_at.some;
         if (sp.offset != 3 || sp.len != 1) { fail = true; }
     }
     or { fail = true; }
@@ -1596,13 +1596,13 @@ test field_ref_span_at_matches_a_struct_literal_field_init {
 test field_ref_span_at_rejects_a_different_record_and_a_different_field {
     var pa: Allocator;
     page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, src.file_id(0));
-    var ti:     type.TypeInterner;
-    val sel_14: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_14.err) { ret 1; }
-    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp:  type_kind.TypeId = recp_r.ok;
+    var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
+    var ti:            type.TypeInterner;
+    val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
+    if (sel err_type_made.err) { ret 1; }
+    val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
+    if (sel res_recp.err) { ret 1; }
+    val recp:  type_kind.TypeId = res_recp.ok;
     var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
     var buf:   src.SourceFile   = stub_file("p.x");
 
@@ -1613,16 +1613,16 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
 
     var fail: bool = false;
     # right record, wrong field name ("y" vs the access "x"): no match
-    var decly:  src.SourceFile = stub_file("y");
-    val sel_15: opt[src.Span]  = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1));
-    if (sel sel_15.some) { fail = true; }
+    var decly:                 src.SourceFile = stub_file("y");
+    val opt_field_ref_span_at: opt[src.Span]  = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1));
+    if (sel opt_field_ref_span_at.some) { fail = true; }
     # right field name, wrong record identity (decl 9): no match.
-    val sel_16: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1));
-    if (sel sel_16.some) { fail = true; }
+    val opt_field_ref_span_at_mem: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1));
+    if (sel opt_field_ref_span_at_mem.some) { fail = true; }
     # receiver untyped (TYPE_NIL): no match.
     sr.expr_type[id.expr_index(recv)] = type_kind.TYPE_NIL;
-    val sel_17: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?declf, 8, 1));
-    if (sel sel_17.some) { fail = true; }
+    val opt_field_ref_span_at_buf: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?declf, 8, 1));
+    if (sel opt_field_ref_span_at_buf.some) { fail = true; }
 
     free_sema(?pa, ?sr);
     type.dnit(?ti);
@@ -1634,13 +1634,13 @@ test field_ref_span_at_rejects_a_different_record_and_a_different_field {
 test collect_field_sites_gathers_the_body_sites_the_decl_and_the_doc_component {
     var pa: Allocator;
     page.make(?pa);
-    var a:      ast.Ast        = ast.init(?pa, src.file_id(0));
-    var ti:     type.TypeInterner;
-    val sel_18: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel sel_18.err) { ret 1; }
-    val recp_r: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(0), type_kind.TYPE_REC);
-    if (sel recp_r.err) { ret 1; }
-    val recp: type_kind.TypeId = recp_r.ok;
+    var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
+    var ti:            type.TypeInterner;
+    val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
+    if (sel err_type_made.err) { ret 1; }
+    val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(0), type_kind.TYPE_REC);
+    if (sel res_recp.err) { ret 1; }
+    val recp: type_kind.TypeId = res_recp.ok;
 
     # the declaring module's source: the doc block then `rec P { x: i32; y: i32; }`.
     # the doc `# x:` component name is at offset 18 (after "# a point\n# ---\n# ")
@@ -1706,10 +1706,10 @@ test doc_component_name_span_rewrites_a_plain_field_param_component {
     doc.len    = str_len(txt);
     var qf: src.SourceFile = stub_file("b");
 
-    var fail: bool          = false;
-    val o:    opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
-    if (sel o.some) {
-        val sp: src.Span = o.some;
+    var fail:                        bool          = false;
+    val opt_doc_component_name_span: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
+    if (sel opt_doc_component_name_span.some) {
+        val sp: src.Span = opt_doc_component_name_span.some;
         if (!region_eq(txt, sp, "b")) { fail = true; }
         if (sp.len != 1)              { fail = true; }
         # it must be the component head "b", not the "b" inside "the augend".
@@ -1730,9 +1730,9 @@ test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
 
     var fail: bool = false;
     # generic match: the inner "T" only, brackets preserved
-    val o: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), true);
-    if (sel o.some) {
-        val sp: src.Span = o.some;
+    val opt_doc_component_name_span: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), true);
+    if (sel opt_doc_component_name_span.some) {
+        val sp: src.Span = opt_doc_component_name_span.some;
         if (!region_eq(txt, sp, "T")) { fail = true; }
         if (sp.len != 1)              { fail = true; }
         # the byte before the matched span is the '[' and after is the ']'.
@@ -1740,8 +1740,8 @@ test doc_component_name_span_rewrites_the_inner_identifier_of_a_generic_t {
     }
     or { fail = true; }
     # the same query in non-generic mode must NOT match "[T]" (it is not "T").
-    val sel_22: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
-    if (sel sel_22.some) { fail = true; }
+    val opt_doc_component_name_span_txt: opt[src.Span] = doc_component_name_span(txt, doc, ?qf, span_at(0, 1), false);
+    if (sel opt_doc_component_name_span_txt.some) { fail = true; }
 
     if (fail) { ret 1; }
     ret 0;

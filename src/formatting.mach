@@ -46,14 +46,14 @@ pub fun formatting(alloc: *Allocator, docs: *documents.Store, id: *sj.Value, par
         ret;
     }
 
-    var diags:     diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
-    val formatted: res[str, fail.Fail]        = fe_format.format_source(alloc, file.text, d.file_id, ?diags);
+    var diags:         diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
+    val res_formatted: res[str, fail.Fail]        = fe_format.format_source(alloc, file.text, d.file_id, ?diags);
     diagnostic.store_dnit(?diags);
-    if (sel formatted.err) {
+    if (sel res_formatted.err) {
         render.reply_empty_array(alloc, id_raw);
         ret;
     }
-    val output: str = formatted.ok;
+    val output: str = res_formatted.ok;
     if (str_equals(file.text, output)) {
         str_free(alloc, output);
         render.reply_empty_array(alloc, id_raw);

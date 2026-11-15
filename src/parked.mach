@@ -77,14 +77,14 @@ pub fun push(q: *Queue, body: str, len: usize, uri: str, id: str) bool {
         var cap: usize = q.cap * 2;
         if (cap == 0) { cap = 4; }
         if (q.items == nil) {
-            val r: res[*Entry, allocator.Error] = allocate[Entry](q.alloc, cap);
-            if (sel r.err) { ret false; }
-            q.items = r.ok;
+            val res_allocate: res[*Entry, allocator.Error] = allocate[Entry](q.alloc, cap);
+            if (sel res_allocate.err) { ret false; }
+            q.items = res_allocate.ok;
         }
         or {
-            val r: res[*Entry, allocator.Error] = reallocate[Entry](q.alloc, q.items, q.cap, cap);
-            if (sel r.err) { ret false; }
-            q.items = r.ok;
+            val res_reallocate: res[*Entry, allocator.Error] = reallocate[Entry](q.alloc, q.items, q.cap, cap);
+            if (sel res_reallocate.err) { ret false; }
+            q.items = res_reallocate.ok;
         }
         q.cap = cap;
     }
@@ -126,9 +126,9 @@ pub fun names(e: *Entry, uri: str) bool {
 }
 
 fun copy_bytes(alloc: *Allocator, text: str, len: usize) str {
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
-    if (sel r.err) { ret nil; }
-    val out: *u8 = r.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val out: *u8 = res_allocate.ok;
     if (len > 0) { mem.raw_copy(out::ptr, text::ptr, len); }
     out[len] = 0;
     ret out::str;

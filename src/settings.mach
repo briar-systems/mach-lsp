@@ -111,10 +111,10 @@ pub fun parse(params: *sj.Value, alloc: *Allocator, report: bool) Settings {
 
     var i: usize = 0;
     for (i < json.count(opts)) {
-        val key: str            = key_text(opts, i, alloc);
-        val v:   opt[*sj.Value] = sj.value_get(opts, i);
+        val key:           str            = key_text(opts, i, alloc);
+        val opt_value_get: opt[*sj.Value] = sj.value_get(opts, i);
         if (key != nil) {
-            if (sel v.some) { apply_option(?s, key, v.some, alloc, report); }
+            if (sel opt_value_get.some) { apply_option(?s, key, opt_value_get.some, alloc, report); }
             strutil.str_free(alloc, key);
         }
         i = i + 1;
@@ -156,27 +156,27 @@ pub rec Effective {
 pub fun effective(s: *Settings, alloc: *Allocator, report: bool) Effective {
     var e: Effective = Effective{level: TRACE_OFF, file: nil, deadline_ms: DEFAULT_DEADLINE_MS};
 
-    var given_level: opt[u8]  = opt[u8].none{};
-    var lsp_level:   opt[u8]  = opt[u8].none{};
-    var given_ms:    opt[i64] = opt[i64].none{};
+    var opt_given_level: opt[u8]  = opt[u8].none{};
+    var opt_lsp_level:   opt[u8]  = opt[u8].none{};
+    var opt_given_ms:    opt[i64] = opt[i64].none{};
     if (s != nil) {
-        given_level = s.trace;
-        lsp_level   = s.lsp_trace;
-        given_ms    = s.deadline_ms;
+        opt_given_level = s.trace;
+        opt_lsp_level   = s.lsp_trace;
+        opt_given_ms    = s.deadline_ms;
     }
 
-    var level_from: str     = FROM_DEFAULT;
-    val env_level:  opt[u8] = env_trace(report);
-    if (sel given_level.some) {
-        e.level    = given_level.some;
+    var level_from:    str     = FROM_DEFAULT;
+    val opt_env_level: opt[u8] = env_trace(report);
+    if (sel opt_given_level.some) {
+        e.level    = opt_given_level.some;
         level_from = FROM_OPTION;
     }
-    or (sel env_level.some) {
-        e.level    = env_level.some;
+    or (sel opt_env_level.some) {
+        e.level    = opt_env_level.some;
         level_from = FROM_ENV;
     }
-    or (sel lsp_level.some) {
-        e.level    = lsp_level.some;
+    or (sel opt_lsp_level.some) {
+        e.level    = opt_lsp_level.some;
         level_from = FROM_LSP;
     }
 
@@ -192,14 +192,14 @@ pub fun effective(s: *Settings, alloc: *Allocator, report: bool) Effective {
         file_from = FROM_ENV;
     }
 
-    var deadline_from: str      = FROM_DEFAULT;
-    val env_deadline:  opt[i64] = env_deadline_ms(report);
-    if (sel given_ms.some) {
-        e.deadline_ms = given_ms.some;
+    var deadline_from:    str      = FROM_DEFAULT;
+    val opt_env_deadline: opt[i64] = env_deadline_ms(report);
+    if (sel opt_given_ms.some) {
+        e.deadline_ms = opt_given_ms.some;
         deadline_from = FROM_OPTION;
     }
-    or (sel env_deadline.some) {
-        e.deadline_ms = env_deadline.some;
+    or (sel opt_env_deadline.some) {
+        e.deadline_ms = opt_env_deadline.some;
         deadline_from = FROM_ENV;
     }
 
@@ -238,9 +238,9 @@ fun file_name(file: str) str {
 # MLS_TRACE: `off`, `messages` or `bodies`. any other value turns the trace on
 # at `messages`, so `MLS_TRACE=1` works; an empty one is as if unset
 fun env_trace(report: bool) opt[u8] {
-    var buf: [32]u8;
-    val n_o: opt[usize] = read_env(TRACE_VAR, ?buf[0], 32, report);
-    if (sel n_o.none) { ret opt[u8].none{}; }
+    var buf:          [32]u8;
+    val opt_read_env: opt[usize] = read_env(TRACE_VAR, ?buf[0], 32, report);
+    if (sel opt_read_env.none) { ret opt[u8].none{}; }
     val v: str = (?buf[0])::str;
     if (str_equals(v, "off"))    { ret opt[u8].some{TRACE_OFF}; }
     if (str_equals(v, "bodies")) { ret opt[u8].some{TRACE_BODIES}; }
@@ -249,18 +249,18 @@ fun env_trace(report: bool) opt[u8] {
 
 # MLS_TRACE_FILE, owned, or nil when unset or unusable
 fun env_file(alloc: *Allocator, report: bool) str {
-    var buf: [trace.MAX_PATH]u8;
-    val n_o: opt[usize] = read_env(FILE_VAR, ?buf[0], trace.MAX_PATH, report);
-    if (sel n_o.none) { ret nil; }
+    var buf:          [trace.MAX_PATH]u8;
+    val opt_read_env: opt[usize] = read_env(FILE_VAR, ?buf[0], trace.MAX_PATH, report);
+    if (sel opt_read_env.none) { ret nil; }
     ret json.dup((?buf[0])::str, alloc);
 }
 
 # MLS_REQUEST_DEADLINE_MS, when it is an integer of at least the minimum
 fun env_deadline_ms(report: bool) opt[i64] {
-    var buf: [24]u8;
-    val n_o: opt[usize] = read_env(DEADLINE_VAR, ?buf[0], 24, report);
-    if (sel n_o.none) { ret opt[i64].none{}; }
-    val n:  usize = n_o.some;
+    var buf:          [24]u8;
+    val opt_read_env: opt[usize] = read_env(DEADLINE_VAR, ?buf[0], 24, report);
+    if (sel opt_read_env.none) { ret opt[i64].none{}; }
+    val n:  usize = opt_read_env.some;
     var ms: i64   = 0;
     var i:  usize = 0;
     for (i < n) {
@@ -281,14 +281,14 @@ fun env_deadline_ms(report: bool) opt[i64] {
 # a variable's value, nul-terminated in `buf`, or none when it is unset, empty,
 # unreadable or too long, noting the last two
 fun read_env(name: str, buf: *u8, cap: usize, report: bool) opt[usize] {
-    val r: res[opt[usize], env.EnvError] = env.get(name, buf, cap);
-    if (sel r.err) {
+    val res_name_entry: res[opt[usize], env.EnvError] = env.get(name, buf, cap);
+    if (sel res_name_entry.err) {
         if (report) { trace.logf("settings: {} could not be read; ignored", name); }
         ret opt[usize].none{};
     }
-    val n_o: opt[usize] = r.ok;
-    if (sel n_o.none) { ret opt[usize].none{}; }
-    val n: usize = n_o.some;
+    val opt_length: opt[usize] = res_name_entry.ok;
+    if (sel opt_length.none) { ret opt[usize].none{}; }
+    val n: usize = opt_length.some;
     if (n == 0) { ret opt[usize].none{}; }
     if (n >= cap) {
         if (report) { trace.logf("settings: {} is longer than {} bytes; ignored", name, cap - 1); }
@@ -343,10 +343,10 @@ fun resolve_file(path: str, params: *sj.Value, alloc: *Allocator, report: bool) 
             if (report) { trace.logf("settings: option `traceFile` `{}` is relative and there is no workspace root; ignored", path); }
         }
         or {
-            val jr: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, root, path);
-            if (sel jr.ok) {
-                out = uris.normalize(alloc, jr.ok);
-                strutil.str_free(alloc, jr.ok);
+            val res_join: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, root, path);
+            if (sel res_join.ok) {
+                out = uris.normalize(alloc, res_join.ok);
+                strutil.str_free(alloc, res_join.ok);
             }
             if (out != nil && !uris.is_under(out, root)) {
                 if (report) { trace.logf("settings: option `traceFile` `{}` resolves outside the workspace root; ignored", path); }
@@ -399,10 +399,10 @@ fun option_deadline(v: *sj.Value, report: bool) opt[i64] {
 
 # an owned, nul-terminated copy of object key `i`
 fun key_text(obj: *sj.Value, i: usize, alloc: *Allocator) str {
-    val ko: opt[str] = sj.value_key(obj, i);
-    if (sel ko.none) { ret nil; }
-    val n: usize                     = sj.value_key_len(obj, i);
-    val r: res[str, allocator.Error] = strutil.str_dup_range(alloc, ko.some, 0, n);
-    if (sel r.err) { ret nil; }
-    ret r.ok;
+    val opt_value_key: opt[str] = sj.value_key(obj, i);
+    if (sel opt_value_key.none) { ret nil; }
+    val n:                 usize                     = sj.value_key_len(obj, i);
+    val res_str_dup_range: res[str, allocator.Error] = strutil.str_dup_range(alloc, opt_value_key.some, 0, n);
+    if (sel res_str_dup_range.err) { ret nil; }
+    ret res_str_dup_range.ok;
 }

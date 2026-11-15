@@ -91,10 +91,10 @@ fun collect(e: *Emitter, a: *ast.Ast) {
     val n:      u32  = features.top_level_count(a);
     var i:      u32  = 0;
     for (i < n) {
-        val d_opt: opt[*decl.Decl] = ast.get_decl(a, features.top_level_decl(a, i));
+        val opt_decl: opt[*decl.Decl] = ast.get_decl(a, features.top_level_decl(a, i));
         i = i + 1;
-        if (sel d_opt.none) { cnt; }
-        val d: *decl.Decl = d_opt.some;
+        if (sel opt_decl.none) { cnt; }
+        val d: *decl.Decl = opt_decl.some;
 
         if (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_FWD) {
             if (in_run) { run = join(run, d.span); }
@@ -121,8 +121,8 @@ fun collect_strings(e: *Emitter, a: *ast.Ast) {
     if (e.text.file == nil) { ret; }
     var i: usize = 0;
     for (i < a.exprs.len) {
-        val so: opt[src.Span] = features.multiline_string(a, e.text.file.text, id.expr(i::u32));
-        if (sel so.some) { push(e, so.some, nil, false); }
+        val opt_multiline_string: opt[src.Span] = features.multiline_string(a, e.text.file.text, id.expr(i::u32));
+        if (sel opt_multiline_string.some) { push(e, opt_multiline_string.some, nil, false); }
         i = i + 1;
     }
 }
@@ -136,9 +136,9 @@ fun push_body(e: *Emitter, a: *ast.Ast, d: *decl.Decl) {
     if (d.kind == decl.DECL_KIND_FUN || d.kind == decl.DECL_KIND_TEST) {
         var sid: id.StmtId = d.data.fun_.body;
         if (d.kind == decl.DECL_KIND_TEST) { sid = d.data.test_.body; }
-        val so: opt[*stmt.Stmt] = ast.get_stmt(a, sid);
-        if (sel so.none) { ret; }
-        push(e, so.some.span, nil, true);
+        val opt_stmt: opt[*stmt.Stmt] = ast.get_stmt(a, sid);
+        if (sel opt_stmt.none) { ret; }
+        push(e, opt_stmt.some.span, nil, true);
         ret;
     }
     if (d.kind == decl.DECL_KIND_REC || d.kind == decl.DECL_KIND_UNI
@@ -170,12 +170,12 @@ rec Emitter {
 #        brace stays in view
 fun push(e: *Emitter, span: src.Span, kind: str, brace: bool) {
     if (span.len == 0) { ret; }
-    val so: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset));
-    val eo: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset + span.len - 1));
-    if (sel so.none) { ret; }
-    if (sel eo.none) { ret; }
-    val start: positions.LspRange = so.some;
-    val end:   positions.LspRange = eo.some;
+    val opt_span_range:      opt[positions.LspRange] = positions.span_range(e.text, point(span.offset));
+    val opt_span_range_text: opt[positions.LspRange] = positions.span_range(e.text, point(span.offset + span.len - 1));
+    if (sel opt_span_range.none)      { ret; }
+    if (sel opt_span_range_text.none) { ret; }
+    val start: positions.LspRange = opt_span_range.some;
+    val end:   positions.LspRange = opt_span_range_text.some;
     if (end.start_line <= start.start_line) { ret; }
 
     if (e.emitted > 0) { json.buf_push_byte(e.b, ','); }

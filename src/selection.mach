@@ -85,27 +85,27 @@ pub fun selection_range(es: *editor.EditorSession, alloc: *Allocator, docs: *doc
 # at the cursor with no parent: the protocol wants one entry per position, and
 # a client expands nothing from it.
 fun push_chain(b: *json.Buf, an: analysis.Analyzed, pos: *sj.Value, alloc: *Allocator) {
-    val line: i64        = json.number(json.member(pos, "line"), -1);
-    val ch:   i64        = json.number(json.member(pos, "character"), -1);
-    var oo:   opt[usize] = opt[usize].none{};
-    if (line >= 0 && ch >= 0) { oo = positions.offset_at(an.text, line::usize, ch::usize); }
-    if (sel oo.none) {
+    val line:          i64        = json.number(json.member(pos, "line"), -1);
+    val ch:            i64        = json.number(json.member(pos, "character"), -1);
+    var opt_offset_at: opt[usize] = opt[usize].none{};
+    if (line >= 0 && ch >= 0) { opt_offset_at = positions.offset_at(an.text, line::usize, ch::usize); }
+    if (sel opt_offset_at.none) {
         push_cursor(b, line, ch);
         ret;
     }
-    val offset: usize = oo.some;
+    val offset: usize = opt_offset_at.some;
 
     val count: usize = collect(an.a, offset, nil, 0);
     if (count == 0) {
         push_cursor(b, line, ch);
         ret;
     }
-    val sa: res[*src.Span, allocator.Error] = allocate[src.Span](alloc, count);
-    if (sel sa.err) {
+    val res_allocate: res[*src.Span, allocator.Error] = allocate[src.Span](alloc, count);
+    if (sel res_allocate.err) {
         push_cursor(b, line, ch);
         ret;
     }
-    val spans: *src.Span = sa.ok;
+    val spans: *src.Span = res_allocate.ok;
     val n:     usize     = collect(an.a, offset, spans, count);
     sort.sort_by[src.Span](spans, n, outer_first);
     val depth: usize = nest(spans, n);
@@ -157,8 +157,8 @@ fun collect(a: *ast.Ast, offset: usize, out: *src.Span, cap: usize) usize {
     for (i < a.decls.len) {
         val d: *decl.Decl = ?a.decls.data[i];
         n = push(out, n, cap, d.span, offset);
-        val nso: opt[src.Span] = features.decl_name_span(d);
-        if (sel nso.some) { n = push(out, n, cap, nso.some, offset); }
+        val opt_decl_name_span: opt[src.Span] = features.decl_name_span(d);
+        if (sel opt_decl_name_span.some) { n = push(out, n, cap, opt_decl_name_span.some, offset); }
         if (d.kind == decl.DECL_KIND_USE) {
             n = push(out, n, cap, d.data.use_.alias, offset);
             n = push(out, n, cap, d.data.use_.path, offset);
@@ -179,8 +179,8 @@ fun collect(a: *ast.Ast, offset: usize, out: *src.Span, cap: usize) usize {
         val e: *expr.Expr = ?a.exprs.data[i];
         n = push(out, n, cap, e.span, offset);
         if (e.kind == expr.EXPR_KIND_MEMBER) { n = push(out, n, cap, e.data.member.name, offset); }
-        val tso: opt[src.Span] = features.token_span_of_expr(e);
-        if (sel tso.some) { n = push(out, n, cap, tso.some, offset); }
+        val opt_token_span_of_expr: opt[src.Span] = features.token_span_of_expr(e);
+        if (sel opt_token_span_of_expr.some) { n = push(out, n, cap, opt_token_span_of_expr.some, offset); }
         i = i + 1;
     }
     i = 0;

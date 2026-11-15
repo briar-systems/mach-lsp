@@ -107,20 +107,20 @@ fun buf_reserve(b: *Buf, want: usize) bool {
     for (next < need) { next = next * 2; }
 
     if (b.data == nil) {
-        val r: res[*u8, allocator.Error] = allocate[u8](b.a, next);
-        if (sel r.err) {
+        val res_allocate: res[*u8, allocator.Error] = allocate[u8](b.a, next);
+        if (sel res_allocate.err) {
             b.failed = true;
             ret false;
         }
-        b.data = r.ok;
+        b.data = res_allocate.ok;
     }
     or {
-        val r: res[*u8, allocator.Error] = reallocate[u8](b.a, b.data, b.cap, next);
-        if (sel r.err) {
+        val res_reallocate: res[*u8, allocator.Error] = reallocate[u8](b.a, b.data, b.cap, next);
+        if (sel res_reallocate.err) {
             b.failed = true;
             ret false;
         }
-        b.data = r.ok;
+        b.data = res_reallocate.ok;
     }
     b.cap = next;
     ret true;
@@ -274,8 +274,8 @@ val READER_ARENA_CAP: usize = 64 * 1024;
 # ret:     true when the arena was created
 pub fun reader_init(rd: *Reader, backing: *Allocator) bool {
     rd.ready = false;
-    val r: err[allocator.Error] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
-    if (sel r.err) { ret false; }
+    val err_arena_made: err[allocator.Error] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
+    if (sel err_arena_made.err) { ret false; }
     rd.ready = true;
     ret true;
 }
@@ -311,10 +311,10 @@ pub fun read(rd: *Reader, body: str, len: usize) Message {
     m.valid = false;
     if (!rd.ready || body == nil) { ret m; }
     var a: Allocator;
-    arena.make(?a, ?rd.ar);
-    val r: res[json_value.Value, json_error.JsonError] = json_parse.parse(body::*u8, len, ?a);
-    if (sel r.err) { ret m; }
-    m.root  = r.ok;
+    arena.allocator(?a, ?rd.ar);
+    val res_parse: res[json_value.Value, json_error.JsonError] = json_parse.parse(body::*u8, len, ?a);
+    if (sel res_parse.err) { ret m; }
+    m.root  = res_parse.ok;
     m.valid = true;
     ret m;
 }
@@ -332,9 +332,9 @@ pub fun release(rd: *Reader) {
 # ret: borrowed member value, or nil
 pub fun member(v: *json_value.Value, key: str) *json_value.Value {
     if (v == nil) { ret nil; }
-    val m: opt[*json_value.Value] = json_value.value_find(v, key);
-    if (sel m.none) { ret nil; }
-    ret m.some;
+    val opt_value_find: opt[*json_value.Value] = json_value.value_find(v, key);
+    if (sel opt_value_find.none) { ret nil; }
+    ret opt_value_find.some;
 }
 
 # the member `key` of the member `outer` of `v`, or nil at any miss
@@ -350,9 +350,9 @@ pub fun member2(v: *json_value.Value, outer: str, key: str) *json_value.Value {
 # the `index`-th element of array `v`, or nil when out of range
 pub fun element(v: *json_value.Value, index: usize) *json_value.Value {
     if (v == nil || !json_value.value_is_array(v)) { ret nil; }
-    val e: opt[*json_value.Value] = json_value.value_get(v, index);
-    if (sel e.none) { ret nil; }
-    ret e.some;
+    val opt_value_get: opt[*json_value.Value] = json_value.value_get(v, index);
+    if (sel opt_value_get.none) { ret nil; }
+    ret opt_value_get.some;
 }
 
 # the number of elements in array or object `v`, 0 for anything else
@@ -377,14 +377,14 @@ pub fun is_null(v: *json_value.Value) bool {
 # ret:   owned nul-terminated text, or nil
 pub fun text(v: *json_value.Value, alloc: *Allocator) str {
     if (v == nil || !json_value.value_is_string(v)) { ret nil; }
-    val sr: res[usize, json_error.JsonError] = json_decode.value_string_decode(v, nil, 0);
-    if (sel sr.err) { ret nil; }
-    val n:  usize                     = sr.ok;
-    val br: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel br.err) { ret nil; }
-    val buf: *u8                              = br.ok;
-    val dr:  res[usize, json_error.JsonError] = json_decode.value_string_decode(v, buf, n);
-    if (sel dr.err) {
+    val res_value_string_decode: res[usize, json_error.JsonError] = json_decode.value_string_decode(v, nil, 0);
+    if (sel res_value_string_decode.err) { ret nil; }
+    val n:            usize                     = res_value_string_decode.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val buf:                         *u8                              = res_allocate.ok;
+    val res_value_string_decode_buf: res[usize, json_error.JsonError] = json_decode.value_string_decode(v, buf, n);
+    if (sel res_value_string_decode_buf.err) {
         deallocate[u8](alloc, buf, n + 1);
         ret nil;
     }
@@ -479,13 +479,13 @@ pub fun quote(s: str, alloc: *Allocator) str {
         buf_dnit(?b);
         ret nil;
     }
-    val n: usize                     = str_len(view);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel r.err) {
+    val n:            usize                     = str_len(view);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) {
         buf_dnit(?b);
         ret nil;
     }
-    val out: *u8 = r.ok;
+    val out: *u8 = res_allocate.ok;
     if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
     out[n] = 0;
     buf_dnit(?b);
@@ -513,13 +513,13 @@ fun buf_take(b: *Buf, alloc: *Allocator) str {
         buf_dnit(b);
         ret nil;
     }
-    val n: usize                     = str_len(view);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel r.err) {
+    val n:            usize                     = str_len(view);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) {
         buf_dnit(b);
         ret nil;
     }
-    val out: *u8 = r.ok;
+    val out: *u8 = res_allocate.ok;
     if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
     out[n] = 0;
     buf_dnit(b);
@@ -704,10 +704,10 @@ pub fun buf_push_range(b: *Buf, s: str, from: usize, to: usize) {
 # an owned copy of `s`
 pub fun dup(s: str, alloc: *Allocator) str {
     if (s == nil) { ret nil; }
-    val n: usize                     = str_len(s);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel r.err) { ret nil; }
-    val out: *u8 = r.ok;
+    val n:            usize                     = str_len(s);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val out: *u8 = res_allocate.ok;
     if (n > 0) { mem.raw_copy(out::ptr, s::ptr, n); }
     out[n] = 0;
     ret out::str;

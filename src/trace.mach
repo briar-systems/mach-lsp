@@ -232,9 +232,9 @@ pub fun frame(label: str, body: str, len: usize) {
 # ---
 # ret: the monotonic clock reading in nanoseconds
 pub fun now_ns() i64 {
-    val c: chrono.InstantClock = chrono.instant();
-    if (sel c.err) { ret 0; }
-    ret c.ok.sec * 1000000000 + c.ok.nsec;
+    val res_instant: chrono.InstantClock = chrono.instant();
+    if (sel res_instant.err) { ret 0; }
+    ret res_instant.ok.sec * 1000000000 + res_instant.ok.nsec;
 }
 
 # writer sink appending to the trace destination

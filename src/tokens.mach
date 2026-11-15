@@ -215,12 +215,12 @@ fun answer(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
         ret;
     }
 
-    val ta: res[*Tok, allocator.Error] = allocate[Tok](alloc, MAX_TOKENS);
-    if (sel ta.err) {
+    val res_allocate: res[*Tok, allocator.Error] = allocate[Tok](alloc, MAX_TOKENS);
+    if (sel res_allocate.err) {
         reply_empty(alloc, id_raw, memo, uri);
         ret;
     }
-    val toks: *Tok = ta.ok;
+    val toks: *Tok = res_allocate.ok;
 
     var n: usize = collect(an, w, toks, MAX_TOKENS);
     if (n > 1) {
@@ -231,13 +231,13 @@ fun answer(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allocator,
     # the wire array, five integers a token at most
     var cap: usize = n * 5;
     if (cap == 0) { cap = 1; }
-    val ia: res[*i64, allocator.Error] = allocate[i64](alloc, cap);
-    if (sel ia.err) {
+    val res_allocate_alloc: res[*i64, allocator.Error] = allocate[i64](alloc, cap);
+    if (sel res_allocate_alloc.err) {
         deallocate[Tok](alloc, toks, MAX_TOKENS);
         reply_empty(alloc, id_raw, memo, uri);
         ret;
     }
-    val ints: *i64  = ia.ok;
+    val ints: *i64  = res_allocate_alloc.ok;
     val len:  usize = encode(an.text, toks, n, ints);
     deallocate[Tok](alloc, toks, MAX_TOKENS);
 
@@ -336,12 +336,12 @@ fun remember(m: *Memo, prior: *Prior, uri: str, id: usize, ints: *i64, len: usiz
             deallocate[i64](m.alloc, ints, cap);
             ret;
         }
-        val du: res[str, allocator.Error] = strutil.str_dup(m.alloc, uri);
-        if (sel du.err) {
+        val res_str_dup: res[str, allocator.Error] = strutil.str_dup(m.alloc, uri);
+        if (sel res_str_dup.err) {
             deallocate[i64](m.alloc, ints, cap);
             ret;
         }
-        p.uri    = du.ok;
+        p.uri    = res_str_dup.ok;
         p.in_use = true;
     }
     or (p.data != nil) {
@@ -363,14 +363,14 @@ fun free_slot(m: *Memo) *Prior {
     var new_len: usize = m.len * 2;
     if (new_len == 0) { new_len = 8; }
     if (m.entries == nil) {
-        val r: res[*Prior, allocator.Error] = allocate[Prior](m.alloc, new_len);
-        if (sel r.err) { ret nil; }
-        m.entries = r.ok;
+        val res_allocate: res[*Prior, allocator.Error] = allocate[Prior](m.alloc, new_len);
+        if (sel res_allocate.err) { ret nil; }
+        m.entries = res_allocate.ok;
     }
     or {
-        val r: res[*Prior, allocator.Error] = reallocate[Prior](m.alloc, m.entries, m.len, new_len);
-        if (sel r.err) { ret nil; }
-        m.entries = r.ok;
+        val res_reallocate: res[*Prior, allocator.Error] = reallocate[Prior](m.alloc, m.entries, m.len, new_len);
+        if (sel res_reallocate.err) { ret nil; }
+        m.entries = res_reallocate.ok;
     }
     var z: usize = m.len;
     for (z < new_len) {
@@ -412,12 +412,12 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
 
     var di: usize = 0;
     for (di < an.a.decls.len && n < cap) {
-        val d_opt: opt[*decl.Decl] = ast.get_decl(an.a, id.decl(di::u32));
-        if (sel d_opt.some) {
-            val d:   *decl.Decl    = d_opt.some;
-            val nso: opt[src.Span] = features.decl_name_span(d);
-            if (sel nso.some) {
-                n = push(out, n, cap, w, nso.some,
+        val opt_decl: opt[*decl.Decl] = ast.get_decl(an.a, id.decl(di::u32));
+        if (sel opt_decl.some) {
+            val d:                  *decl.Decl    = opt_decl.some;
+            val opt_decl_name_span: opt[src.Span] = features.decl_name_span(d);
+            if (sel opt_decl_name_span.some) {
+                n = push(out, n, cap, w, opt_decl_name_span.some,
                     decl_token_type(d.kind), M_DECLARATION);
             }
             n = collect_members(an, d, w, out, n, cap);
@@ -427,12 +427,12 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
 
     var ei: usize = 0;
     for (ei < an.a.exprs.len && n < cap) {
-        val so: opt[rslv.SymbolId] = expr_symbol(an, id.expr(ei::u32));
-        if (sel so.some) {
-            val sid: rslv.SymbolId = so.some;
-            val spo: opt[src.Span] = features.expr_ref_span(an.a, an.rr, id.expr(ei::u32), sid);
-            if (sel spo.some) {
-                n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
+        val opt_expr_symbol: opt[rslv.SymbolId] = expr_symbol(an, id.expr(ei::u32));
+        if (sel opt_expr_symbol.some) {
+            val sid:               rslv.SymbolId = opt_expr_symbol.some;
+            val opt_expr_ref_span: opt[src.Span] = features.expr_ref_span(an.a, an.rr, id.expr(ei::u32), sid);
+            if (sel opt_expr_ref_span.some) {
+                n = push(out, n, cap, w, opt_expr_ref_span.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ei = ei + 1;
@@ -442,19 +442,19 @@ fun collect(an: analysis.Analyzed, w: Window, out: *Tok, cap: usize) usize {
     if (an.text.file != nil) { text = an.text.file.text; }
     var si: usize = 0;
     for (si < an.a.exprs.len && n < cap) {
-        val mo: opt[src.Span] = features.multiline_string(an.a, text, id.expr(si::u32));
-        if (sel mo.some) { n = push_multiline(text, mo.some, w, out, n, cap); }
+        val opt_multiline_string: opt[src.Span] = features.multiline_string(an.a, text, id.expr(si::u32));
+        if (sel opt_multiline_string.some) { n = push_multiline(text, opt_multiline_string.some, w, out, n, cap); }
         si = si + 1;
     }
 
     var ti: usize = 0;
     for (ti < an.a.types.len && n < cap) {
-        val so: opt[rslv.SymbolId] = type_symbol(an, id.type(ti::u32));
-        if (sel so.some) {
-            val sid: rslv.SymbolId = so.some;
-            val spo: opt[src.Span] = features.type_ref_span(an.a, an.rr, id.type(ti::u32), sid);
-            if (sel spo.some) {
-                n = push(out, n, cap, w, spo.some, symbol_token_type(an, sid), M_NONE);
+        val opt_type_symbol: opt[rslv.SymbolId] = type_symbol(an, id.type(ti::u32));
+        if (sel opt_type_symbol.some) {
+            val sid:               rslv.SymbolId = opt_type_symbol.some;
+            val opt_type_ref_span: opt[src.Span] = features.type_ref_span(an.a, an.rr, id.type(ti::u32), sid);
+            if (sel opt_type_ref_span.some) {
+                n = push(out, n, cap, w, opt_type_ref_span.some, symbol_token_type(an, sid), M_NONE);
             }
         }
         ti = ti + 1;
@@ -642,17 +642,17 @@ fun encode(t: positions.Text, toks: *Tok, n: usize, out: *i64) usize {
         var span: src.Span;
         span.offset = toks[i].offset;
         span.len    = toks[i].len;
-        val lo: opt[src.Span] = positions.live_span(t, span, false);
-        if (sel lo.none) {
+        val opt_live_span: opt[src.Span] = positions.live_span(t, span, false);
+        if (sel opt_live_span.none) {
             i = i + 1;
             cnt;
         }
-        val ro: opt[positions.LspRange] = positions.span_range(t, span);
-        if (sel ro.none) {
+        val opt_span_range: opt[positions.LspRange] = positions.span_range(t, span);
+        if (sel opt_span_range.none) {
             i = i + 1;
             cnt;
         }
-        val r: positions.LspRange = ro.some;
+        val r: positions.LspRange = opt_span_range.some;
 
         # a token the conversion split across lines cannot be expressed as a
         # single length, so it is dropped rather than encoded wrong

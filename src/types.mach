@@ -102,9 +102,9 @@ pub fun type_ref_of(sr: *sema_product.SemaResult, tid: id.TypeId) type_kind.Type
 # ret: some(Nominal) for a nominal / instance type, none otherwise
 pub fun nominal_of(ti: *type.TypeInterner, tid: type_kind.TypeId) opt[Nominal] {
     if (type_kind.is_nil(tid) || type_kind.is_error(tid)) { ret opt[Nominal].none{}; }
-    val t_opt: opt[*type.Type] = type.get(ti, tid);
-    if (sel t_opt.none) { ret opt[Nominal].none{}; }
-    val t: *type.Type = t_opt.some;
+    val opt_tid_entry: opt[*type.Type] = type.get(ti, tid);
+    if (sel opt_tid_entry.none) { ret opt[Nominal].none{}; }
+    val t: *type.Type = opt_tid_entry.some;
 
     # peel a single pointer level: a field access through `*T` resolves to T's decl.
     if (t.kind == type_kind.TYPE_POINTER) {
@@ -118,9 +118,9 @@ pub fun nominal_of(ti: *type.TypeInterner, tid: type_kind.TypeId) opt[Nominal] {
         ret opt[Nominal].some{n};
     }
     if (t.kind == type_kind.TYPE_INSTANCE) {
-        val inner: opt[Nominal] = nominal_of(ti, t.data.instance.nominal);
-        if (sel inner.none) { ret inner; }
-        var n: Nominal = inner.some;
+        val opt_inner: opt[Nominal] = nominal_of(ti, t.data.instance.nominal);
+        if (sel opt_inner.none) { ret opt_inner; }
+        var n: Nominal = opt_inner.some;
         n.kind = t.kind;
         ret opt[Nominal].some{n};
     }
@@ -139,24 +139,24 @@ pub fun nominal_of(ti: *type.TypeInterner, tid: type_kind.TypeId) opt[Nominal] {
 # ret:  the DeclId, or none
 pub fun nominal_decl(a: *ast.Ast, text: positions.Text, itn: *intern.Interner, n: Nominal) opt[id.DeclId] {
     if (a == nil || itn == nil) { ret opt[id.DeclId].none{}; }
-    val want: opt[str] = intern.get(itn, n.name);
-    if (sel want.none) { ret opt[id.DeclId].none{}; }
-    val mo: opt[*module.Module] = ast.get_module(a, a.root_module);
-    if (sel mo.none) { ret opt[id.DeclId].none{}; }
-    val m: *module.Module = mo.some;
+    val opt_want: opt[str] = intern.get(itn, n.name);
+    if (sel opt_want.none) { ret opt[id.DeclId].none{}; }
+    val opt_module: opt[*module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) { ret opt[id.DeclId].none{}; }
+    val m: *module.Module = opt_module.some;
     var i: u32            = 0;
     for (i < m.decls_len) {
-        val did:   id.DeclId        = a.decl_ids.data[m.decls_start + i];
-        val d_opt: opt[*adecl.Decl] = ast.get_decl(a, did);
-        if (sel d_opt.some) {
-            val d:     *adecl.Decl = d_opt.some;
+        val did:      id.DeclId        = a.decl_ids.data[m.decls_start + i];
+        val opt_decl: opt[*adecl.Decl] = ast.get_decl(a, did);
+        if (sel opt_decl.some) {
+            val d:     *adecl.Decl = opt_decl.some;
             var name:  src.Span;
             var named: bool        = true;
-            if (d.kind == adecl.DECL_KIND_REC)                         { name = d.data.rec_.name; }
-            or (d.kind == adecl.DECL_KIND_UNI)                         { name = d.data.uni_.name; }
-            or (d.kind == adecl.DECL_KIND_TAG)                         { name = d.data.tag_.name; }
-            or                                                         { named = false; }
-            if (named && positions.span_equals(text, name, want.some)) { ret opt[id.DeclId].some{did}; }
+            if (d.kind == adecl.DECL_KIND_REC)                             { name = d.data.rec_.name; }
+            or (d.kind == adecl.DECL_KIND_UNI)                             { name = d.data.uni_.name; }
+            or (d.kind == adecl.DECL_KIND_TAG)                             { name = d.data.tag_.name; }
+            or                                                             { named = false; }
+            if (named && positions.span_equals(text, name, opt_want.some)) { ret opt[id.DeclId].some{did}; }
         }
         i = i + 1;
     }
@@ -169,23 +169,23 @@ test nominal_of_peels_a_pointer_to_the_pointee_record {
     var ti: type.TypeInterner;
     if (!type_init_ok(?ti, ?pa)) { ret 1; }
 
-    val reco: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
-    if (sel reco.err) {
+    val res_intern_nominal: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
+    if (sel res_intern_nominal.err) {
         type.dnit(?ti);
         ret 1;
     }
-    val rec:  type_kind.TypeId                 = reco.ok;
-    val ptro: res[type_kind.TypeId, fail.Fail] = type.intern_pointer(?ti, rec);
-    if (sel ptro.err) {
+    val rec:                type_kind.TypeId                 = res_intern_nominal.ok;
+    val res_intern_pointer: res[type_kind.TypeId, fail.Fail] = type.intern_pointer(?ti, rec);
+    if (sel res_intern_pointer.err) {
         type.dnit(?ti);
         ret 1;
     }
-    val ptr: type_kind.TypeId = ptro.ok;
+    val ptr: type_kind.TypeId = res_intern_pointer.ok;
 
-    val no:   opt[Nominal] = nominal_of(?ti, ptr);
-    var fail: bool         = false;
-    if (sel no.some) {
-        val n: Nominal = no.some;
+    val opt_nominal_of: opt[Nominal] = nominal_of(?ti, ptr);
+    var fail:           bool         = false;
+    if (sel opt_nominal_of.some) {
+        val n: Nominal = opt_nominal_of.some;
         if (!src.file_same(n.file, src.file_id(2)))     { fail = true; }
         if (!intern.str_same(n.name, intern.str_id(4))) { fail = true; }
         if (n.kind != type_kind.TYPE_REC)               { fail = true; }
@@ -203,30 +203,30 @@ test nominal_of_maps_a_generic_instance_to_its_template {
     var ti: type.TypeInterner;
     if (!type_init_ok(?ti, ?pa)) { ret 1; }
 
-    val i32o: opt[type_kind.TypeId] = type.prim(?ti, type_kind.TYPE_I32);
-    if (sel i32o.none) {
+    val opt_prim: opt[type_kind.TypeId] = type.prim(?ti, type_kind.TYPE_I32);
+    if (sel opt_prim.none) {
         type.dnit(?ti);
         ret 1;
     }
-    val i32t: type_kind.TypeId = i32o.some;
+    val i32t: type_kind.TypeId = opt_prim.some;
     var args: [1]type_kind.TypeId;
     args[0] = i32t;
-    val reco: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(8), t_owner(5), type_kind.TYPE_REC);
-    if (sel reco.err) {
+    val res_intern_nominal: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(8), t_owner(5), type_kind.TYPE_REC);
+    if (sel res_intern_nominal.err) {
         type.dnit(?ti);
         ret 1;
     }
-    val insto: res[type_kind.TypeId, fail.Fail] = type.intern_instance(?ti, reco.ok, ?args[0], 1);
-    if (sel insto.err) {
+    val res_intern_instance: res[type_kind.TypeId, fail.Fail] = type.intern_instance(?ti, res_intern_nominal.ok, ?args[0], 1);
+    if (sel res_intern_instance.err) {
         type.dnit(?ti);
         ret 1;
     }
-    val inst: type_kind.TypeId = insto.ok;
+    val inst: type_kind.TypeId = res_intern_instance.ok;
 
-    val no:   opt[Nominal] = nominal_of(?ti, inst);
-    var fail: bool         = false;
-    if (sel no.some) {
-        val n: Nominal = no.some;
+    val opt_nominal_of: opt[Nominal] = nominal_of(?ti, inst);
+    var fail:           bool         = false;
+    if (sel opt_nominal_of.some) {
+        val n: Nominal = opt_nominal_of.some;
         if (!src.file_same(n.file, src.file_id(5)))     { fail = true; }
         if (!intern.str_same(n.name, intern.str_id(8))) { fail = true; }
         if (n.kind != type_kind.TYPE_INSTANCE)          { fail = true; }
@@ -243,17 +243,17 @@ test nominal_of_returns_none_for_a_type_that_is_not_nominal {
     page.make(?pa);
     var ti: type.TypeInterner;
     if (!type_init_ok(?ti, ?pa)) { ret 1; }
-    var fail: bool                  = false;
-    val i32o: opt[type_kind.TypeId] = type.prim(?ti, type_kind.TYPE_I32);
-    if (sel i32o.some) {
-        val prim_o: opt[Nominal] = nominal_of(?ti, i32o.some);
-        if (sel prim_o.some) { fail = true; }
+    var fail:     bool                  = false;
+    val opt_prim: opt[type_kind.TypeId] = type.prim(?ti, type_kind.TYPE_I32);
+    if (sel opt_prim.some) {
+        val opt_prim: opt[Nominal] = nominal_of(?ti, opt_prim.some);
+        if (sel opt_prim.some) { fail = true; }
     }
     or { fail = true; }
-    val nil_o: opt[Nominal] = nominal_of(?ti, type_kind.TYPE_NIL);
-    val err_o: opt[Nominal] = nominal_of(?ti, type_kind.TYPE_ERROR);
-    if (sel nil_o.some) { fail = true; }
-    if (sel err_o.some) { fail = true; }
+    val opt_nil:        opt[Nominal] = nominal_of(?ti, type_kind.TYPE_NIL);
+    val opt_nominal_of: opt[Nominal] = nominal_of(?ti, type_kind.TYPE_ERROR);
+    if (sel opt_nil.some)        { fail = true; }
+    if (sel opt_nominal_of.some) { fail = true; }
     type.dnit(?ti);
     if (fail) { ret 1; }
     ret 0;
@@ -261,8 +261,8 @@ test nominal_of_returns_none_for_a_type_that_is_not_nominal {
 
 #[testing]
 fun type_init_ok(ti: *type.TypeInterner, pa: *Allocator) bool {
-    val r: err[fail.Fail] = type.init(ti, pa);
-    ret sel r.ok;
+    val err_type_made: err[fail.Fail] = type.init(ti, pa);
+    ret sel err_type_made.ok;
 }
 
 #[testing]

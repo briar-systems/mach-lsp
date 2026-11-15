@@ -312,14 +312,14 @@ fun slot_for(m: *Mirror, uri: str) *Doc {
 fun grow(m: *Mirror) *Doc {
     val new_len: usize = m.len + 1;
     if (m.docs == nil) {
-        val r: res[*Doc, allocator.Error] = allocate[Doc](m.alloc, new_len);
-        if (sel r.err) { ret nil; }
-        m.docs = r.ok;
+        val res_allocate: res[*Doc, allocator.Error] = allocate[Doc](m.alloc, new_len);
+        if (sel res_allocate.err) { ret nil; }
+        m.docs = res_allocate.ok;
     }
     or {
-        val r: res[*Doc, allocator.Error] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
-        if (sel r.err) { ret nil; }
-        m.docs = r.ok;
+        val res_reallocate: res[*Doc, allocator.Error] = reallocate[Doc](m.alloc, m.docs, m.len, new_len);
+        if (sel res_reallocate.err) { ret nil; }
+        m.docs = res_reallocate.ok;
     }
     val d: *Doc = ?m.docs[m.len];
     d.uri      = nil;

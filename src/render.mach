@@ -86,18 +86,18 @@ pub fun range(b: *json.Buf, r: positions.LspRange) {
 # span: byte span to convert
 # ret:  whether a range was written
 pub fun span_range(b: *json.Buf, t: positions.Text, span: src.Span) bool {
-    val ro: opt[positions.LspRange] = positions.span_range(t, span);
-    if (sel ro.none) { ret false; }
-    range(b, ro.some);
+    val opt_span_range: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel opt_span_range.none) { ret false; }
+    range(b, opt_span_range.some);
     ret true;
 }
 
 # as `span_range`, for a range that surrounds what it describes; see
 # `positions.maps_around`
 pub fun span_range_around(b: *json.Buf, t: positions.Text, span: src.Span) bool {
-    val ro: opt[positions.LspRange] = positions.span_range_around(t, span);
-    if (sel ro.none) { ret false; }
-    range(b, ro.some);
+    val opt_span_range_around: opt[positions.LspRange] = positions.span_range_around(t, span);
+    if (sel opt_span_range_around.none) { ret false; }
+    range(b, opt_span_range_around.some);
     ret true;
 }
 
@@ -109,12 +109,12 @@ pub fun span_range_around(b: *json.Buf, t: positions.Text, span: src.Span) bool 
 # span: byte span to report
 # ret:  whether a location was written; nothing is when the span does not map
 pub fun location(b: *json.Buf, t: positions.Text, uri: str, span: src.Span) bool {
-    val ro: opt[positions.LspRange] = positions.span_range(t, span);
-    if (sel ro.none) { ret false; }
+    val opt_span_range: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel opt_span_range.none) { ret false; }
     json.buf_push(b, "{\"uri\":");
     json.buf_push_quoted(b, uri);
     json.buf_push(b, ",\"range\":");
-    range(b, ro.some);
+    range(b, opt_span_range.some);
     json.buf_push_byte(b, '}');
     ret true;
 }
@@ -127,10 +127,10 @@ pub fun location(b: *json.Buf, t: positions.Text, uri: str, span: src.Span) bool
 # new_text: replacement text, quoted and escaped here
 # ret:      whether an edit was written; nothing is when the span does not map
 pub fun text_edit(b: *json.Buf, t: positions.Text, span: src.Span, new_text: str) bool {
-    val ro: opt[positions.LspRange] = positions.span_range(t, span);
-    if (sel ro.none) { ret false; }
+    val opt_span_range: opt[positions.LspRange] = positions.span_range(t, span);
+    if (sel opt_span_range.none) { ret false; }
     json.buf_push(b, "{\"range\":");
-    range(b, ro.some);
+    range(b, opt_span_range.some);
     json.buf_push(b, ",\"newText\":");
     json.buf_push_quoted(b, new_text);
     json.buf_push_byte(b, '}');

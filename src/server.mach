@@ -178,9 +178,9 @@ pub fun init(srv: *Server, alloc: *Allocator) bool {
     srv.served_stale   = false;
     srv.refresh_seq    = 0;
 
-    val sr: res[sess.Session, fail.Fail] = sess.init(alloc);
-    if (sel sr.err) { ret false; }
-    srv.s = sr.ok;
+    val res_sess_made: res[sess.Session, fail.Fail] = sess.init(alloc);
+    if (sel res_sess_made.err) { ret false; }
+    srv.s = res_sess_made.ok;
 
     srv.es         = editor.init(?srv.s);
     srv.docs       = documents.init(?srv.es, alloc);
@@ -594,8 +594,8 @@ fun dispatch_inner(srv: *Server, root: *sj.Value) {
     }
     if (str_equals(method, "$/setTrace")) {
         json.free_str(method, a);
-        val lo: opt[u8] = settings.lsp_level(json.member(params, "value"), a);
-        if (sel lo.some) { trace.set_level(lo.some); }
+        val opt_lsp_level: opt[u8] = settings.lsp_level(json.member(params, "value"), a);
+        if (sel opt_lsp_level.some) { trace.set_level(opt_lsp_level.some); }
         ret;
     }
     if (str_equals(method, "workspace/didChangeConfiguration")) {
@@ -1180,20 +1180,20 @@ fun republish_all(srv: *Server) {
 fun publish_for(srv: *Server, uri: str, text: str, version: i64, is_open: bool) {
     val path: str = uris.path_of(srv.alloc, uri);
     if (path == nil) { ret; }
-    var dr: res[*documents.Document, str];
-    if (is_open) { dr = documents.open(?srv.docs, uri, path, text, version); }
-    or           { dr = documents.change(?srv.docs, uri, text, version); }
+    var res_documents_opened: res[*documents.Document, str];
+    if (is_open) { res_documents_opened = documents.open(?srv.docs, uri, path, text, version); }
+    or           { res_documents_opened = documents.change(?srv.docs, uri, text, version); }
     json.free_str(path, srv.alloc);
 
-    if (sel dr.err) {
+    if (sel res_documents_opened.err) {
         trace.log("documents: ");
-        trace.log(dr.err);
+        trace.log(res_documents_opened.err);
         trace.log("\n");
         ret;
     }
-    val doc: *documents.Document = dr.ok;
-    val cr:  res[bool, str]      = project.document_changed(?srv.ws, doc);
-    if (sel cr.err) {
+    val doc:                  *documents.Document = res_documents_opened.ok;
+    val res_document_changed: res[bool, str]      = project.document_changed(?srv.ws, doc);
+    if (sel res_document_changed.err) {
         trace.log("project: failed to mirror document overlay\n");
         ret;
     }

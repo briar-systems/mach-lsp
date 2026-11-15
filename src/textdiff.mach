@@ -109,15 +109,15 @@ fun myers(alloc: *Allocator, a: Lines, b: Lines, lo: usize, n: usize, m: usize, 
     val size: usize = 2 * max + 3;
     val off:  i64   = (max + 1)::i64;
 
-    val tr: res[*i64, allocator.Error] = allocate[i64](alloc, (max + 1) * size);
-    if (sel tr.err) { ret false; }
-    val trace: *i64                       = tr.ok;
-    val vr:    res[*i64, allocator.Error] = allocate[i64](alloc, size);
-    if (sel vr.err) {
+    val res_allocate: res[*i64, allocator.Error] = allocate[i64](alloc, (max + 1) * size);
+    if (sel res_allocate.err) { ret false; }
+    val trace:              *i64                       = res_allocate.ok;
+    val res_allocate_alloc: res[*i64, allocator.Error] = allocate[i64](alloc, size);
+    if (sel res_allocate_alloc.err) {
         deallocate[i64](alloc, trace, (max + 1) * size);
         ret false;
     }
-    val v: *i64  = vr.ok;
+    val v: *i64  = res_allocate_alloc.ok;
     var z: usize = 0;
     for (z < size) {
         v[z] = 0;
@@ -161,12 +161,12 @@ fun myers(alloc: *Allocator, a: Lines, b: Lines, lo: usize, n: usize, m: usize, 
     }
 
     # walk the path back, marking every deleted old line and inserted new line
-    val dr: res[*bool, allocator.Error] = allocate[bool](alloc, n + m + 2);
-    if (sel dr.err) {
+    val res_bool: res[*bool, allocator.Error] = allocate[bool](alloc, n + m + 2);
+    if (sel res_bool.err) {
         deallocate[i64](alloc, trace, (max + 1) * size);
         ret false;
     }
-    val mark: *bool = dr.ok;
+    val mark: *bool = res_bool.ok;
     var q:    usize = 0;
     for (q < n + m + 2) {
         mark[q] = false;
@@ -243,14 +243,14 @@ fun add_hunk(alloc: *Allocator, out: *Windows, a: Lines, b: Lines, i0: usize, i1
         var cap: usize = out.cap * 2;
         if (cap == 0) { cap = 4; }
         if (out.items == nil) {
-            val r: res[*Window, allocator.Error] = allocate[Window](alloc, cap);
-            if (sel r.err) { ret false; }
-            out.items = r.ok;
+            val res_allocate: res[*Window, allocator.Error] = allocate[Window](alloc, cap);
+            if (sel res_allocate.err) { ret false; }
+            out.items = res_allocate.ok;
         }
         or {
-            val r: res[*Window, allocator.Error] = reallocate[Window](alloc, out.items, out.cap, cap);
-            if (sel r.err) { ret false; }
-            out.items = r.ok;
+            val res_reallocate: res[*Window, allocator.Error] = reallocate[Window](alloc, out.items, out.cap, cap);
+            if (sel res_reallocate.err) { ret false; }
+            out.items = res_reallocate.ok;
         }
         out.cap = cap;
     }
@@ -295,9 +295,9 @@ fun t_file(pa: *Allocator, text: str) src.SourceFile {
         if (text[i] == '\n') { lines = lines + 1; }
         i = i + 1;
     }
-    val r:      res[*usize, allocator.Error] = allocate[usize](pa, lines);
-    var starts: *usize                       = nil;
-    if (sel r.ok) { starts = r.ok; }
+    val res_allocate: res[*usize, allocator.Error] = allocate[usize](pa, lines);
+    var starts:       *usize                       = nil;
+    if (sel res_allocate.ok) { starts = res_allocate.ok; }
     starts[0] = 0;
     var li: usize = 1;
     i = 0;

@@ -64,14 +64,14 @@ pub fun spans_push(s: *Spans, span: src.Span) bool {
         var cap: usize = s.cap * 2;
         if (cap == 0) { cap = 16; }
         if (s.items == nil) {
-            val r: res[*src.Span, allocator.Error] = allocate[src.Span](s.alloc, cap);
-            if (sel r.err) { ret false; }
-            s.items = r.ok;
+            val res_allocate: res[*src.Span, allocator.Error] = allocate[src.Span](s.alloc, cap);
+            if (sel res_allocate.err) { ret false; }
+            s.items = res_allocate.ok;
         }
         or {
-            val r: res[*src.Span, allocator.Error] = reallocate[src.Span](s.alloc, s.items, s.cap, cap);
-            if (sel r.err) { ret false; }
-            s.items = r.ok;
+            val res_reallocate: res[*src.Span, allocator.Error] = reallocate[src.Span](s.alloc, s.items, s.cap, cap);
+            if (sel res_reallocate.err) { ret false; }
+            s.items = res_reallocate.ok;
         }
         s.cap = cap;
     }
@@ -82,9 +82,9 @@ pub fun spans_push(s: *Spans, span: src.Span) bool {
 
 # whether `name` is exactly one identifier token
 pub fun identifier(alloc: *Allocator, name: str) bool {
-    val r: res[bool, fail.Fail] = editor.is_identifier(alloc, name);
-    if (sel r.err) { ret false; }
-    ret r.ok;
+    val res_is_identifier: res[bool, fail.Fail] = editor.is_identifier(alloc, name);
+    if (sel res_is_identifier.err) { ret false; }
+    ret res_is_identifier.ok;
 }
 
 # `text` with every span replaced by `name`, owned, or nil when memory ran out.
@@ -106,9 +106,9 @@ pub fun apply(alloc: *Allocator, text: str, spans: *Spans, name: str) str {
         i = i + 1;
     }
     size = size + (n - from);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, size);
-    if (sel r.err) { ret nil; }
-    val out: *u8 = r.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, size);
+    if (sel res_allocate.err) { ret nil; }
+    val out: *u8 = res_allocate.ok;
 
     var at: usize = 0;
     from = 0;
@@ -161,24 +161,24 @@ pub val SHAPE_UNCHECKED: u8 = 2;
 # whether `after` parses to the same tree as `before`, node for node, with no
 # more errors. a file whose parse is not accepted before cannot be checked
 pub fun shape(alloc: *Allocator, before: str, after: str) u8 {
-    var b: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, before);
-    if (sel b.err) { ret SHAPE_UNCHECKED; }
+    var res_parse_text: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, before);
+    if (sel res_parse_text.err) { ret SHAPE_UNCHECKED; }
     var out: u8 = SHAPE_UNCHECKED;
-    if (sel b.ok.failure.none && lang_phase.is_accepted(b.ok.status)) {
+    if (sel res_parse_text.ok.failure.none && lang_phase.is_accepted(res_parse_text.ok.status)) {
         out = SHAPE_CHANGED;
-        var a: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, after);
-        if (sel a.ok) {
-            if (sel a.ok.failure.none && lang_phase.is_accepted(a.ok.status)
-                && diagnostic.error_count(a.ok.diagnostics) <= diagnostic.error_count(b.ok.diagnostics)) {
-                val same: res[bool, fail.Fail] = editor.same_shape(?b.ok, ?a.ok);
-                if (sel same.ok) {
-                    if (same.ok) { out = SHAPE_SAME; }
+        var res_parse_text_alloc: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, after);
+        if (sel res_parse_text_alloc.ok) {
+            if (sel res_parse_text_alloc.ok.failure.none && lang_phase.is_accepted(res_parse_text_alloc.ok.status)
+                && diagnostic.error_count(res_parse_text_alloc.ok.diagnostics) <= diagnostic.error_count(res_parse_text.ok.diagnostics)) {
+                val res_same: res[bool, fail.Fail] = editor.same_shape(?res_parse_text.ok, ?res_parse_text_alloc.ok);
+                if (sel res_same.ok) {
+                    if (res_same.ok) { out = SHAPE_SAME; }
                 }
             }
-            editor.analysis_dnit(?a.ok);
+            editor.analysis_dnit(?res_parse_text_alloc.ok);
         }
     }
-    editor.analysis_dnit(?b.ok);
+    editor.analysis_dnit(?res_parse_text.ok);
     ret out;
 }
 

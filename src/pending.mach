@@ -68,14 +68,14 @@ pub fun open(l: *Ledger, id: str) bool {
         var cap: usize = l.cap * 2;
         if (cap == 0) { cap = 4; }
         if (l.items == nil) {
-            val r: res[*Request, allocator.Error] = allocate[Request](l.alloc, cap);
-            if (sel r.err) { ret false; }
-            l.items = r.ok;
+            val res_allocate: res[*Request, allocator.Error] = allocate[Request](l.alloc, cap);
+            if (sel res_allocate.err) { ret false; }
+            l.items = res_allocate.ok;
         }
         or {
-            val r: res[*Request, allocator.Error] = reallocate[Request](l.alloc, l.items, l.cap, cap);
-            if (sel r.err) { ret false; }
-            l.items = r.ok;
+            val res_reallocate: res[*Request, allocator.Error] = reallocate[Request](l.alloc, l.items, l.cap, cap);
+            if (sel res_reallocate.err) { ret false; }
+            l.items = res_reallocate.ok;
         }
         l.cap = cap;
     }

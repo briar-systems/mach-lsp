@@ -136,9 +136,9 @@ pub fun init(q: *Queue, alloc: *Allocator) bool {
     q.woken  = false;
     q.live   = false;
 
-    val r: res[*Job, allocator.Error] = allocate[Job](alloc, CAPACITY);
-    if (sel r.err) { ret false; }
-    q.jobs = r.ok;
+    val res_allocate: res[*Job, allocator.Error] = allocate[Job](alloc, CAPACITY);
+    if (sel res_allocate.err) { ret false; }
+    q.jobs = res_allocate.ok;
     q.cap  = CAPACITY;
     var i: usize = 0;
     for (i < q.cap) {
@@ -185,9 +185,9 @@ pub fun start(q: *Queue, f: JobFn, sf: SignalFn, fx: ptr) bool {
 pub fun push(q: *Queue, body: str, len: usize) bool {
     if (body == nil) { ret false; }
 
-    val r: res[*u8, allocator.Error] = allocate[u8](q.alloc, len + 1);
-    if (sel r.err) { ret false; }
-    val copy: *u8 = r.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](q.alloc, len + 1);
+    if (sel res_allocate.err) { ret false; }
+    val copy: *u8 = res_allocate.ok;
     if (len > 0) { mem.raw_copy(copy::ptr, body::ptr, len); }
     copy[len] = 0;
 
@@ -572,9 +572,9 @@ pub fun cancels_init(c: *Cancels, alloc: *Allocator) bool {
     c.count = 0;
     c.cap   = 0;
     c.ids   = nil;
-    val r: res[*Job, allocator.Error] = allocate[Job](alloc, CANCEL_CAP);
-    if (sel r.err) { ret false; }
-    c.ids = r.ok;
+    val res_allocate: res[*Job, allocator.Error] = allocate[Job](alloc, CANCEL_CAP);
+    if (sel res_allocate.err) { ret false; }
+    c.ids = res_allocate.ok;
     c.cap = CANCEL_CAP;
     var i: usize = 0;
     for (i < c.cap) {
@@ -605,10 +605,10 @@ pub fun cancels_dnit(c: *Cancels) {
 # ret:      true when recorded; false when full or out of memory
 pub fun cancel_add(c: *Cancels, id_token: str) bool {
     if (id_token == nil || c.ids == nil) { ret false; }
-    val len: usize                     = str_len(id_token);
-    val r:   res[*u8, allocator.Error] = allocate[u8](c.alloc, len + 1);
-    if (sel r.err) { ret false; }
-    val copy: *u8 = r.ok;
+    val len:          usize                     = str_len(id_token);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](c.alloc, len + 1);
+    if (sel res_allocate.err) { ret false; }
+    val copy: *u8 = res_allocate.ok;
     if (len > 0) { mem.raw_copy(copy::ptr, id_token::ptr, len); }
     copy[len] = 0;
 
