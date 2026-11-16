@@ -29,9 +29,9 @@ use std.allocator.Allocator;
 use mem:     std.memory;
 use strutil: std.text.string;
 
-use mach.lang.editor;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use src: mach.base.source;
+use mach.editor;
+use sess: mach.session;
 
 use sj: json.value;
 use mls.actions;
@@ -63,7 +63,7 @@ use mls.workspace;
 use std.process.exec;
 use std.sync.atomic;
 
-use mach.lang.fail;
+use mach.base.fail;
 # lifecycle statuses
 pub val STATUS_UNINITIALIZED: u8 = 0;
 pub val STATUS_RUNNING:       u8 = 1;

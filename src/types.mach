@@ -18,20 +18,20 @@ use std.types.result.res;
 use std.allocator.Allocator;
 use std.allocator.page;
 
-use mach.lang.fe.ast;
-use adecl: mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.id;
-use mach.lang.fe.ast.module;
-use sema_product: mach.lang.fe.sema.product;
-use mach.lang.intern;
-use lmodule: mach.lang.module;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
-use mach.lang.type;
-use type_kind: mach.lang.type.kind;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.front.ast;
+use adecl: mach.front.ast.decl;
+use mach.front.ast.id;
+use mach.front.ast.module;
+use sema_product: mach.front.sema.product;
+use sess:         mach.session;
+use lmodule:      mach.session.module;
+use mach.type;
+use type_kind: mach.type.kind;
 use mls.positions;
 
-use mach.lang.fail;
+use mach.base.fail;
 use std.types.error.err;
 
 # the declaration site a record / union / tag TypeId nominally refers to -

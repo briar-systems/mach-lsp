@@ -22,12 +22,12 @@ use std.collections.vector.Vector;
 
 use std.allocator.page;
 
-use diag: mach.lang.diagnostic;
-use mach.lang.diagnostic.annotation;
-use mach.lang.driver;
-use mach.lang.editor;
-use ferr: mach.lang.fail;
-use src:  mach.lang.source;
+use diag: mach.base.diagnostic;
+use mach.base.diagnostic.annotation;
+use ferr: mach.base.fail;
+use src:  mach.base.source;
+use mach.compile;
+use mach.editor;
 
 use mls.documents;
 use mls.json;
@@ -86,7 +86,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     if (sel res_document_view.ok) {
         val v: project.DocumentView = res_document_view.ok;
         if (v.stale) {
-            if (!standalone(es, d, driver.FRONTEND_PARSE, alloc, ?result)) { ret; }
+            if (!standalone(es, d, compile.FRONTEND_PARSE, alloc, ?result)) { ret; }
             list       = result.diagnostics;
             at.sources = es.s.sources;
             if (count_for(list, own) == 0) {
@@ -118,16 +118,16 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         # what it says is the refusal, so a fallback's semantics would only
         # contradict it: an `embed` it cannot see the artifact of reads as the
         # error when the real one is that no target could be selected (#375).
-        val governed: bool                 = project.has_project(w, d.uri);
-        var phase:    driver.FrontendPhase = driver.FRONTEND_SEMA;
-        if (governed)                                  { phase = driver.FRONTEND_PARSE; }
+        val governed: bool                  = project.has_project(w, d.uri);
+        var phase:    compile.FrontendPhase = compile.FRONTEND_SEMA;
+        if (governed)                                  { phase = compile.FRONTEND_PARSE; }
         if (!standalone(es, d, phase, alloc, ?result)) { ret; }
         list       = result.diagnostics;
         at.sources = es.s.sources;
         # a parse never consults the project, so the refusal comes from a resolve,
         # the first phase that does; what it says about the buffer goes unread
         if (governed && project.root_for_loaded(w, d.uri) == nil) {
-            if (!standalone(es, d, driver.FRONTEND_RESOLVE, alloc, ?refused)) {
+            if (!standalone(es, d, compile.FRONTEND_RESOLVE, alloc, ?refused)) {
                 editor.analysis_dnit(?result);
                 ret;
             }
@@ -243,7 +243,7 @@ fun text_for(at: *Locator, fid: src.FileId) positions.Text {
 
 # run the editor frontend on the open buffer; on failure the client's list is
 # cleared and false returned
-fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: driver.FrontendPhase,
+fun standalone(es: *editor.EditorSession, d: *documents.Document, phase: compile.FrontendPhase,
     alloc: *Allocator, out: *editor.AnalysisResult) bool {
     var req:         editor.AnalysisRequest                = editor.analysis_request(d.file_id, phase);
     val res_analyze: res[editor.AnalysisResult, ferr.Fail] = editor.analyze(es, ?req);

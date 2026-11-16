@@ -27,7 +27,7 @@ use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
 
-use src: mach.lang.source;
+use src: mach.base.source;
 
 # the most differing lines compared exactly before falling back to one window
 val MAX_EDITS: usize = 128;

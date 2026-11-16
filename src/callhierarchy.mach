@@ -58,16 +58,16 @@ use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use aexpr: mach.lang.fe.ast.expr;
-use mach.lang.fe.ast.id;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.intern;
-use lmodule: mach.lang.module;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.editor;
+use mach.front.ast;
+use mach.front.ast.decl;
+use aexpr: mach.front.ast.expr;
+use mach.front.ast.id;
+use rslv:    mach.front.resolve;
+use sess:    mach.session;
+use lmodule: mach.session.module;
 
 use mls.analysis;
 use mls.documents;

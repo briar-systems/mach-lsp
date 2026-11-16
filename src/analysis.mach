@@ -21,16 +21,16 @@ use std.types.string.str;
 use A: std.allocator;
 
 use sj: json.value;
-use mach.lang.driver;
-use mach.lang.editor;
-use mach.lang.fail;
-use mach.lang.fe.ast;
-use rslv:         mach.lang.fe.resolve;
-use sema_product: mach.lang.fe.sema.product;
-use mach.lang.intern;
-use lmodule: mach.lang.module;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
+use mach.base.fail;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.compile;
+use mach.editor;
+use mach.front.ast;
+use rslv:         mach.front.resolve;
+use sema_product: mach.front.sema.product;
+use sess:         mach.session;
+use lmodule:      mach.session.module;
 
 use mls.documents;
 use mls.json;
@@ -99,8 +99,8 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     }
     if (project.has_project(ws, uri)) { ret false; }
 
-    if (!standalone(es, doc.file_id, driver.FRONTEND_SEMA, out)) { ret false; }
-    if (out.rr == nil)                                           { ret false; }
+    if (!standalone(es, doc.file_id, compile.FRONTEND_SEMA, out)) { ret false; }
+    if (out.rr == nil)                                            { ret false; }
     val opt_sources_entry: opt[*src.SourceFile] = src.get(es.s.sources, doc.file_id);
     if (sel opt_sources_entry.none) { ret false; }
     out.interner = ?es.s.interner;
@@ -179,10 +179,10 @@ pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *do
 # ---
 # es:    the standalone editor session
 # fid:   the open buffer
-# phase: driver.FRONTEND_PARSE, driver.FRONTEND_RESOLVE or driver.FRONTEND_SEMA
+# phase: compile.FRONTEND_PARSE, compile.FRONTEND_RESOLVE or compile.FRONTEND_SEMA
 # out:   receives `a`, `rr` and `sr`; a product the phase did not reach is nil
 # ret:   true when the frontend ran; the products may still be nil on a rejected phase
-pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: driver.FrontendPhase, out: *Analyzed) bool {
+pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: compile.FrontendPhase, out: *Analyzed) bool {
     out.a  = nil;
     out.rr = nil;
     out.sr = nil;
@@ -196,11 +196,11 @@ pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: driver.Fro
     var result:     editor.AnalysisResult    = res_analyze.ok;
     val res_ast_of: res[*ast.Ast, fail.Fail] = editor.ast_of(?result);
     if (sel res_ast_of.ok) { out.a = res_ast_of.ok; }
-    if (phase >= driver.FRONTEND_RESOLVE) {
+    if (phase >= compile.FRONTEND_RESOLVE) {
         val res_resolve_of: res[*rslv.ResolveResult, fail.Fail] = editor.resolve_of(?result);
         if (sel res_resolve_of.ok) { out.rr = res_resolve_of.ok; }
     }
-    if (phase == driver.FRONTEND_SEMA) {
+    if (phase == compile.FRONTEND_SEMA) {
         val res_sema_of: res[*sema_product.SemaResult, fail.Fail] = editor.sema_of(?result);
         if (sel res_sema_of.ok) { out.sr = res_sema_of.ok; }
     }
@@ -214,7 +214,7 @@ pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: driver.Fro
 # doc: the open document
 pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.Ast {
     var an: Analyzed;
-    if (!standalone(es, doc.file_id, driver.FRONTEND_PARSE, ?an)) { ret nil; }
+    if (!standalone(es, doc.file_id, compile.FRONTEND_PARSE, ?an)) { ret nil; }
     ret an.a;
 }
 

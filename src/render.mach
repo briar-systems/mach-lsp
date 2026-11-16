@@ -28,8 +28,8 @@ use std.types.string.str;
 
 use std.allocator.Allocator;
 
-use mach.lang.fe.ast.decl;
-use src: mach.lang.source;
+use src: mach.base.source;
+use mach.front.ast.decl;
 
 use mls.json;
 use mls.positions;

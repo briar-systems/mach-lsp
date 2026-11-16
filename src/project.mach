@@ -19,10 +19,10 @@
 # a Session outlives the message that took it. A root with no snapshot at all
 # has nothing to serve, so its FIRST build still runs inline.
 
-use lalloc:  mach.lang.alloc;
-use lfail:   mach.lang.fail;
-use lmodule: mach.lang.module;
-use lsrc:    mach.lang.source;
+use lalloc:  mach.base.alloc;
+use lfail:   mach.base.fail;
+use lsrc:    mach.base.source;
+use lmodule: mach.session.module;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -52,22 +52,22 @@ use toml_value:  toml.value;
 use std.allocator.page;
 use mem: std.memory;
 
-use diag: mach.lang.diagnostic;
-use mach.lang.driver;
-use dfront:   mach.lang.driver.frontend;
-use dproject: mach.lang.driver.project;
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use adecl: mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.id;
-use rslv:         mach.lang.fe.resolve;
-use sema_product: mach.lang.fe.sema.product;
-use mach.lang.intern;
-use lang_phase: mach.lang.phase;
-use sess:       mach.lang.session;
-use src:        mach.lang.source;
-use mach.lang.type;
-use type_kind: mach.lang.type.kind;
+use diag: mach.base.diagnostic;
+use mach.base.intern;
+use src:          mach.base.source;
+use mach_compile: mach.compile;
+use dfront:       mach.compile.frontend;
+use dproject:     mach.compile.project;
+use mach.editor;
+use mach.front.ast;
+use adecl: mach.front.ast.decl;
+use mach.front.ast.id;
+use rslv:         mach.front.resolve;
+use sema_product: mach.front.sema.product;
+use report_phase: mach.report.phase;
+use sess:         mach.session;
+use mach.type;
+use type_kind: mach.type.kind;
 
 use mls.build;
 use mls.documents;
@@ -82,7 +82,7 @@ use mls.transport;
 use mtypes: mls.types;
 use mls.uris;
 
-use mach.lang.fail;
+use mach.base.fail;
 use std.allocator;
 use io_error: std.io.error;
 
@@ -1015,7 +1015,7 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     fin {
         if (manifest != nil) { strutil.str_free(alloc, manifest); }
     }
-    var req: editor.ProjectRequest = editor.project_request(in.root_path, driver.FRONTEND_SEMA);
+    var req: editor.ProjectRequest = editor.project_request(in.root_path, mach_compile.FRONTEND_SEMA);
     req.buffers      = buffers;
     req.buffer_count = count;
     val res_opened: res[editor.ProjectSnapshot, fail.Fail] = editor.project_init(sn, ?req);
@@ -1040,7 +1040,7 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
         park_snapshot(o, ?snap);
         ret;
     }
-    val opt_internal: opt[fail.Fail] = lang_phase.internal_failure(snap.status);
+    val opt_internal: opt[fail.Fail] = report_phase.internal_failure(snap.status);
     if (sel opt_internal.some) { trace.logf("project: {} analyzed with an internal failure: {}", in.root_path, fail.describe(opt_internal.some)); }
 
     val res_snapshot_mod_paths: res[bool, str] = snapshot_mod_paths(alloc, sn, in, ?snap, o);
@@ -1886,7 +1886,7 @@ fun module_parse_ok(root: *Root, i: u32) bool {
     val m:         *dproject.ModuleEntry    = dproject.module_at(?root.snap.project, i);
     val opt_shown: opt[dfront.ParsedModule] = dfront.parsed(?root.snap.project, m);
     if (sel opt_shown.none) { ret false; }
-    ret lang_phase.is_accepted(opt_shown.some.status);
+    ret report_phase.is_accepted(opt_shown.some.status);
 }
 
 # release a Site's URI when it owns one

@@ -28,11 +28,11 @@ use std.allocator.reallocate;
 
 use mem: std.memory;
 
-use mach.lang.diagnostic;
-use mach.lang.editor;
-use mach.lang.fail;
-use lang_phase: mach.lang.phase;
-use src:        mach.lang.source;
+use mach.base.diagnostic;
+use mach.base.fail;
+use src: mach.base.source;
+use mach.editor;
+use report_phase: mach.report.phase;
 
 # the spans one file's rename rewrites, in the order they were found
 pub rec Spans {
@@ -164,11 +164,11 @@ pub fun shape(alloc: *Allocator, before: str, after: str) u8 {
     var res_parse_text: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, before);
     if (sel res_parse_text.err) { ret SHAPE_UNCHECKED; }
     var out: u8 = SHAPE_UNCHECKED;
-    if (sel res_parse_text.ok.failure.none && lang_phase.is_accepted(res_parse_text.ok.status)) {
+    if (sel res_parse_text.ok.failure.none && report_phase.is_accepted(res_parse_text.ok.status)) {
         out = SHAPE_CHANGED;
         var res_parse_text_alloc: res[editor.AnalysisResult, fail.Fail] = editor.parse_text(alloc, after);
         if (sel res_parse_text_alloc.ok) {
-            if (sel res_parse_text_alloc.ok.failure.none && lang_phase.is_accepted(res_parse_text_alloc.ok.status)
+            if (sel res_parse_text_alloc.ok.failure.none && report_phase.is_accepted(res_parse_text_alloc.ok.status)
                 && diagnostic.error_count(res_parse_text_alloc.ok.diagnostics) <= diagnostic.error_count(res_parse_text.ok.diagnostics)) {
                 val res_same: res[bool, fail.Fail] = editor.same_shape(?res_parse_text.ok, ?res_parse_text_alloc.ok);
                 if (sel res_same.ok) {

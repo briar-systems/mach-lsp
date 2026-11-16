@@ -24,11 +24,11 @@ use std.allocator.reallocate;
 
 use strutil: std.text.string;
 
-use mach.lang.editor;
-use src: mach.lang.source;
+use src: mach.base.source;
+use mach.editor;
 
-use lalloc: mach.lang.alloc;
-use mach.lang.fail;
+use lalloc: mach.base.alloc;
+use mach.base.fail;
 use std.allocator;
 
 # one tracked open document

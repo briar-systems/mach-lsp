@@ -32,27 +32,27 @@ use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.page;
 
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.expr;
-use mach.lang.fe.ast.id;
-use mach.lang.fe.ast.module;
-use mach.lang.fe.ast.stmt;
-use atype: mach.lang.fe.ast.type;
-use fedoc: mach.lang.fe.doc;
-use mach.lang.fe.literal;
-use rslv:         mach.lang.fe.resolve;
-use sema_product: mach.lang.fe.sema.product;
-use mach.lang.intern;
-use lmodule: mach.lang.module;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
-use mach.lang.type;
-use type_kind: mach.lang.type.kind;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.front.ast;
+use mach.front.ast.decl;
+use mach.front.ast.expr;
+use mach.front.ast.id;
+use mach.front.ast.module;
+use mach.front.ast.stmt;
+use atype: mach.front.ast.type;
+use fedoc: mach.front.doc;
+use mach.front.literal;
+use rslv:         mach.front.resolve;
+use sema_product: mach.front.sema.product;
+use sess:         mach.session;
+use lmodule:      mach.session.module;
+use mach.type;
+use type_kind: mach.type.kind;
 
 use mtypes: mls.types;
 
-use mach.lang.fail;
+use mach.base.fail;
 use std.allocator;
 
 # a symbol a position references, joined with the location of the
@@ -611,7 +611,7 @@ pub fun doc_span_of(a: *ast.Ast, sym: *rslv.Symbol) opt[src.Span] {
 
 # the description span of the component in the record / union doc
 # block `doc` whose component name matches the field name `field_name` - scanned
-# through `fe/doc.mach`'s component cursor, comparing each component's `name_span`
+# through `front/doc.mach`'s component cursor, comparing each component's `name_span`
 # bytes against the field-name bytes. both spans index into the declaring module's
 # `source`, since the doc block and the field declaration share that file. none
 # when the doc block has no matching component, no component block at all, or an
@@ -1229,7 +1229,7 @@ pub fun collect_field_sites(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type
 # replaces. for a field or value parameter the component head is `# <name>:` and
 # the whole component `name_span` is the identifier, so it is returned as-is. for a
 # generic the component head keeps its syntactic `# [T]:` bracket form (see
-# `mach.lang.fe.doc`), so the returned span is the inner `T` only - the brackets
+# `mach.front.doc`), so the returned span is the inner `T` only - the brackets
 # are preserved. none when no component matches, or (for a generic) the matched
 # component carries no bracketed identifier. matching compares the inner identifier
 # against `query` so a `# [T]:` head matches the generic named `T`

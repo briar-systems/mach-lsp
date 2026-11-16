@@ -36,23 +36,23 @@ use std.allocator.deallocate;
 
 use mem: std.memory;
 
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use aexpr: mach.lang.fe.ast.expr;
-use mach.lang.fe.ast.id;
-use atype:        mach.lang.fe.ast.type;
-use fedoc:        mach.lang.fe.doc;
-use np:           mach.lang.fe.path;
-use rslv:         mach.lang.fe.resolve;
-use sema_product: mach.lang.fe.sema.product;
-use mach.lang.fe.sema.typename;
-use mach.lang.intern;
-use lmodule: mach.lang.module;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
-use mach.lang.type;
-use type_kind: mach.lang.type.kind;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.editor;
+use mach.front.ast;
+use mach.front.ast.decl;
+use aexpr: mach.front.ast.expr;
+use mach.front.ast.id;
+use atype:        mach.front.ast.type;
+use fedoc:        mach.front.doc;
+use np:           mach.front.path;
+use rslv:         mach.front.resolve;
+use sema_product: mach.front.sema.product;
+use mach.front.sema.typename;
+use sess:    mach.session;
+use lmodule: mach.session.module;
+use mach.type;
+use type_kind: mach.type.kind;
 use mls.trace;
 use strutil: std.text.string;
 
@@ -68,7 +68,7 @@ use mls.render;
 use mls.transport;
 use mtypes: mls.types;
 
-use mach.lang.fail;
+use mach.base.fail;
 use std.allocator;
 # the resolved analysis of one request's target document
 # ---
@@ -459,7 +459,7 @@ fun hover_markdown(ws: *project.Workspace, an: analysis.Analyzed, sym: *rslv.Sym
 }
 
 # render a declaration's first-class doc block (`Decl.doc`) as
-# Markdown. the block is read through `fe/doc.mach`: the summary becomes a prose
+# Markdown. the block is read through `front/doc.mach`: the summary becomes a prose
 # paragraph; when a `# ---` component block follows, a thematic break (`---`
 # fenced by blank lines so CommonMark reads a horizontal rule, not a setext
 # heading) precedes each `# <name>: <desc>` component rendered as a
@@ -667,7 +667,7 @@ fun doc_emit(buf: *u8, off: usize, s: str) usize {
 # A carriage return is treated as part of the line ending rather than as
 # content, so a file saved with CRLF renders the same as one saved with LF.
 #
-# A span from `fe/doc.mach` covers only the first line's leading `#`;
+# A span from `front/doc.mach` covers only the first line's leading `#`;
 # continuation lines keep their own, so those are stripped here. Measures when
 # `buf` is nil, by the same walk, so the two passes cannot disagree.
 fun doc_text(buf: *u8, off: usize, source: str, sp: src.Span) usize {
@@ -1606,7 +1606,7 @@ pub fun document_highlight(ws: *project.Workspace, es: *editor.EditorSession, al
 # append every occurrence of `target` in the buffer, classified by access
 #
 # Lives apart from the request handler because that handler takes an `id`
-# parameter, which shadows the `mach.lang.fe.ast.id` module alias the walk needs.
+# parameter, which shadows the `mach.front.ast.id` module alias the walk needs.
 fun push_symbol_highlights(b: *json.Buf, an: analysis.Analyzed, target: rslv.SymbolId) {
     var emitted: usize = 0;
 
@@ -1820,7 +1820,7 @@ pub fun rename(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
 # symbol's binding into `out` and return true, or false when the symbol is not a
 # param / generic, its owning decl has no docstring, or no component matches its
 # name. the doc block lives in the buffer the decl is declared in, so its name span
-# (`Decl.doc` resolved through `mach.lang.fe.doc`) is a buffer edit. a generic's
+# (`Decl.doc` resolved through `mach.front.doc`) is a buffer edit. a generic's
 # component head is the bracket form `# [T]:`, so the returned span is the inner
 # identifier only (the brackets stay)
 fun param_generic_doc_span(an: analysis.Analyzed, sym: *rslv.Symbol, name: str, out: *src.Span) bool {

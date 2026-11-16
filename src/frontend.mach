@@ -8,7 +8,7 @@
 # builds (#345). A reserve is address space, not memory, so holding the
 # compiler's own size costs nothing until the frontend actually uses it.
 
-use lstack: mach.lang.stack;
+use lstack: mach.base.stack;
 use std.types.size.usize;
 
 # the stack reserve of every thread that runs the linked frontend, in bytes

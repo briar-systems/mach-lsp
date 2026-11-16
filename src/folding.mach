@@ -22,13 +22,13 @@ use std.types.string.str;
 
 use std.allocator.Allocator;
 
-use sj: json.value;
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.id;
-use mach.lang.fe.ast.stmt;
-use src: mach.lang.source;
+use sj:  json.value;
+use src: mach.base.source;
+use mach.editor;
+use mach.front.ast;
+use mach.front.ast.decl;
+use mach.front.ast.id;
+use mach.front.ast.stmt;
 
 use mls.analysis;
 use mls.documents;

@@ -28,19 +28,19 @@ use std.types.string.str_len;
 
 use std.allocator.Allocator;
 
-use sj: json.value;
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use aexpr: mach.lang.fe.ast.expr;
-use mach.lang.fe.ast.id;
-use mach.lang.fe.ast.stmt;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.sema.typename;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
-use mach.lang.type;
-use type_kind: mach.lang.type.kind;
+use sj:  json.value;
+use src: mach.base.source;
+use mach.editor;
+use mach.front.ast;
+use mach.front.ast.decl;
+use aexpr: mach.front.ast.expr;
+use mach.front.ast.id;
+use mach.front.ast.stmt;
+use rslv: mach.front.resolve;
+use mach.front.sema.typename;
+use sess: mach.session;
+use mach.type;
+use type_kind: mach.type.kind;
 
 use mls.analysis;
 use mls.documents;

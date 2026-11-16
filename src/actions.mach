@@ -29,11 +29,11 @@ use std.types.string.str_equals;
 use std.allocator.Allocator;
 
 use sj:   json.value;
-use diag: mach.lang.diagnostic;
-use mach.lang.diagnostic.annotation;
-use mach.lang.editor;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
+use diag: mach.base.diagnostic;
+use mach.base.diagnostic.annotation;
+use src: mach.base.source;
+use mach.editor;
+use sess:    mach.session;
 use strutil: std.text.string;
 
 use mls.analysis;

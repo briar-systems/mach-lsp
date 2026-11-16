@@ -295,7 +295,7 @@ the log will then contain fragments of whatever you have open.
 
 ## How the compiler dependency is wired
 
-`dep/mach` (id `mach`) provides the `mach.lang.*` compiler and retained frontend
+`dep/mach` (id `mach`) provides the `mach.*` compiler and retained frontend
 surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
 declared as git dependencies in `mach.toml` following their `dev` branches
 (`ref = "branch/dev"`), and fetched by `mach dep pull .`. The committed gitlinks

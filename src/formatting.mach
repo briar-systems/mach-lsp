@@ -14,10 +14,10 @@ use std.types.string.str_equals;
 use std.allocator.Allocator;
 
 use sj: json.value;
-use mach.lang.diagnostic;
-use mach.lang.fail;
-use fe_format: mach.lang.fe.format;
-use src:       mach.lang.source;
+use mach.base.diagnostic;
+use mach.base.fail;
+use src:         mach.base.source;
+use tool_format: mach.tool.format;
 
 use mls.documents;
 use mls.json;
@@ -47,7 +47,7 @@ pub fun formatting(alloc: *Allocator, docs: *documents.Store, id: *sj.Value, par
     }
 
     var diags:         diagnostic.DiagnosticStore = diagnostic.store_init(alloc);
-    val res_formatted: res[str, fail.Fail]        = fe_format.format_source(alloc, file.text, d.file_id, ?diags);
+    val res_formatted: res[str, fail.Fail]        = tool_format.format_source(alloc, file.text, d.file_id, ?diags);
     diagnostic.store_dnit(?diags);
     if (sel res_formatted.err) {
         render.reply_empty_array(alloc, id_raw);

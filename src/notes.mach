@@ -27,10 +27,10 @@ use std.allocator.deallocate;
 
 use strutil: std.text.string;
 
-use diag:  mach.lang.diagnostic;
-use dkind: mach.lang.diagnostic.kind;
-use ferr:  mach.lang.fail;
-use src:   mach.lang.source;
+use diag:  mach.base.diagnostic;
+use dkind: mach.base.diagnostic.kind;
+use ferr:  mach.base.fail;
+use src:   mach.base.source;
 
 use mls.json;
 use mls.positions;

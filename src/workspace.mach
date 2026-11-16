@@ -22,11 +22,11 @@ use std.types.string.str_len;
 
 use std.allocator.Allocator;
 
-use rslv: mach.lang.fe.resolve;
-use mach.lang.intern;
-use lmodule: mach.lang.module;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
+use mach.base.intern;
+use src:     mach.base.source;
+use rslv:    mach.front.resolve;
+use sess:    mach.session;
+use lmodule: mach.session.module;
 
 use mls.features;
 use mls.json;

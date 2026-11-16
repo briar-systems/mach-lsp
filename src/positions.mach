@@ -35,7 +35,7 @@ use std.allocator.allocate;
 
 use mem: std.memory;
 
-use src: mach.lang.source;
+use src: mach.base.source;
 
 use mls.textdiff;
 
