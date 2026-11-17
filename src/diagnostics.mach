@@ -28,7 +28,6 @@ use ferr: mach.base.fail;
 use src:  mach.base.source;
 use mach.compile;
 use mach.editor;
-use lmodule: mach.session.module;
 
 use mls.documents;
 use mls.json;
@@ -83,7 +82,6 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
     refused.alloc = nil;
     var at:                Locator                        = Locator{w: w, root: nil, sources: nil};
     var own:               src.FileId                     = d.file_id;
-    var mid:               lmodule.StableModuleId         = lmodule.STABLE_MODULE_NIL;
     val res_document_view: res[project.DocumentView, str] = project.document_view(w, d);
     if (sel res_document_view.ok) {
         val v: project.DocumentView = res_document_view.ok;
@@ -98,7 +96,6 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
                     at.sources = v.root.s.sources;
                     at.root    = v.root;
                     own        = v.file_id;
-                    mid        = v.module;
                 }
             }
         }
@@ -107,7 +104,6 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
             at.sources = v.root.s.sources;
             at.root    = v.root;
             own        = v.file_id;
-            mid        = v.module;
         }
     }
     or {
@@ -154,8 +150,7 @@ pub fun publish(w: *project.Workspace, es: *editor.EditorSession, alloc: *Alloca
         }
         i = i + 1;
     }
-    if (at.root != nil) { push_import_refusal(?b, ?at, mid, own, alloc, written); }
-    or {
+    if (at.root == nil) {
         if (refused.alloc != nil) { push_refusal(?b, ?at, ?refused, own, alloc, written); }
         or                        { push_refusal(?b, ?at, ?result, own, alloc, written); }
     }
@@ -225,38 +220,6 @@ fun push_refusal(b: *json.Buf, at: *Locator, result: *editor.AnalysisResult, own
         }
         i = i + 1;
     }
-}
-
-# the import a refused module stops, shown on the buffer with that module's `$error`
-#
-# A module that imports a refused module is not analysed and the build reports
-# nothing for it: the one line is the `$error`, in the refused module's own file,
-# which the user may not have open. So the buffer shows that `$error` on its own
-# import that leads there, with the `$error`'s place as related information.
-# ---
-# b:       the diagnostics array being written
-# at:      where the snapshot's file ids resolve
-# mid:     the buffer's module
-# own:     the buffer's file id
-# alloc:   message allocator
-# written: entries already in the array
-fun push_import_refusal(b: *json.Buf, at: *Locator, mid: lmodule.StableModuleId, own: src.FileId, alloc: *Allocator, written: usize) {
-    if (written >= MAX_DIAGNOSTICS) { ret; }
-    val opt_found: opt[editor.ImportRefusal] = project.import_refusal(at.root, mid);
-    if (sel opt_found.none) { ret; }
-    val found: editor.ImportRefusal = opt_found.some;
-    var r:     positions.LspRange;
-    if (!range_for(text_for(at, own), found.import, ?r)) { ret; }
-    if (written > 0)                                     { json.buf_push_byte(b, ','); }
-    json.buf_push(b, "{\"range\":");
-    render.range(b, r);
-    json.buf_push(b, ",\"severity\":");
-    json.buf_push_i64(b, notes.lsp_severity(found.cause));
-    notes.push_kind(b, found.cause.kind);
-    json.buf_push(b, ",\"source\":\"mach\",\"message\":");
-    push_message(b, found.cause);
-    push_related(b, at, found.cause, alloc, true);
-    json.buf_push_byte(b, '}');
 }
 
 # where a diagnostic's file ids resolve, and how their spans reach the client

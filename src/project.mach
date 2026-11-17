@@ -1831,17 +1831,6 @@ fun module_index(root: *Root, mid: lmodule.StableModuleId) opt[u32] {
     ret opt[u32].none{};
 }
 
-# the import refusal of module `mid` in `root`'s live snapshot: the import in its file that
-# names a refused module and the `$error` it leads to. none when it is not refused through an
-# import, or the snapshot no longer describes it
-pub fun import_refusal(root: *Root, mid: lmodule.StableModuleId) opt[editor.ImportRefusal] {
-    val opt_module_index: opt[u32] = module_index(root, mid);
-    if (sel opt_module_index.none) { ret opt[editor.ImportRefusal].none{}; }
-    val res_found: res[opt[editor.ImportRefusal], fail.Fail] = editor.project_import_refusal(?root.snap, opt_module_index.some);
-    if (sel res_found.err) { ret opt[editor.ImportRefusal].none{}; }
-    ret res_found.ok;
-}
-
 # the identity of the module at snapshot index `i` in [0, module_count), the
 # id its symbols carry as their origin; nil when there is none
 pub fun module_id_at(root: *Root, i: u32) lmodule.StableModuleId {
