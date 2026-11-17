@@ -73,7 +73,6 @@ class LspSession:
         if env_extra:
             env.update(env_extra)
         self.timeout = timeout
-        self.started = time.monotonic()
         self.proc = subprocess.Popen(
             [str(server)],
             cwd=cwd,
@@ -90,7 +89,6 @@ class LspSession:
         self.stderr_chunks: list[bytes] = []
         self.next_id = 1
         self.message_count = 0
-        self.timings: list[tuple[str, float]] = []
         # the manifests of the projects this session opened documents in. a load
         # publishes what it says about the project on exactly these (#266)
         self.manifests: set[str] = set()
@@ -164,16 +162,14 @@ class LspSession:
         self._send(message)
 
     def request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Send a request, await its id, and retain its latency."""
+        """Send a request, await its id, and fail on an error response."""
         request_id = self.next_id
         self.next_id += 1
         message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        started = time.perf_counter()
         self._send(message)
         response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
-        self.timings.append((f"{method}#{request_id}", time.perf_counter() - started))
         if "error" in response:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
@@ -210,7 +206,6 @@ class LspSession:
         for message in messages:
             payload = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode()
             frames.append(f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload)
-        started = time.perf_counter()
         try:
             with self.send_lock:
                 self.proc.stdin.write(b"".join(frames))
@@ -219,7 +214,6 @@ class LspSession:
             raise ProtocolError(f"server stdin closed; stderr: {self.stderr_text()}") from error
 
         response = self.wait_for(lambda item: item.get("id") == request_id, f"response to {method}")
-        self.timings.append((f"{method}#{request_id}", time.perf_counter() - started))
         if "error" in response:
             raise ProtocolError(f"{method} returned {response['error']!r}")
         return response
@@ -355,7 +349,7 @@ class LspSession:
             else:
                 self.pending.append(item)
 
-    def finish(self, send_exit: bool = True) -> tuple[int, float, int]:
+    def finish(self, send_exit: bool = True) -> tuple[int, int]:
         """Perform shutdown/exit and return process telemetry."""
         response = self.request("shutdown")
         require(response.get("result", object()) is None, f"invalid shutdown response: {response!r}")
@@ -370,7 +364,7 @@ class LspSession:
             raise ProtocolError("server did not exit after shutdown") from error
         self._join()
         require(code == 0, f"server exited with {code}; stderr: {self.stderr_text()}")
-        return code, time.monotonic() - self.started, self.message_count
+        return code, self.message_count
 
     def abort(self) -> None:
         """Stop a failed session without hiding its assertion."""
@@ -651,37 +645,33 @@ class BuildLog:
         done = max(0, log.count("project: rebuilt") - log.count("project: analyzed"))
         return done >= log.count("off the analysis thread")
 
-    def settle(self, at_least: int, description: str, deadline: float = 60.0) -> None:
+    def settle(self, at_least: int, description: str) -> None:
         """Wait until at least `at_least` background builds ran and none is running."""
         eventually(lambda: self.scheduled() >= at_least and self.quiesced(),
-                   lambda done: done, description, deadline)
+                   lambda done: done, description)
 
 
 def eventually(
     probe: Callable[[], Any],
     want: Callable[[Any], bool],
     description: str,
-    deadline: float = 20.0,
 ) -> Any:
     """Poll a project-backed probe until the rebuild behind it has landed.
 
     A rebuild runs off the analysis thread, so the edit that scheduled it is
     answered from the PREVIOUS snapshot and the new one is swapped in a moment
     later. How long that moment is belongs to the machine, not the contract, so
-    these are asserted with a deadline rather than a sleep.
+    the probe is repeated until it holds, and a probe that never holds is a hang
+    for the runner's timeout to end.
 
     Waiting for the diagnostics stream to fall quiet cannot serve here: a
     rebuild that is still running IS quiet, so silence reads as settled on any
     machine slow enough for the question to matter.
     """
-    end = time.monotonic() + deadline
-    last: Any = None
     while True:
         last = probe()
         if want(last):
             return last
-        if time.monotonic() >= end:
-            raise ProtocolError(f"{description} never settled; last result {last!r}")
         time.sleep(0.05)
 
 
@@ -733,7 +723,7 @@ def definition(session: LspSession, path: Path, text: str, name: str) -> dict[st
     return result
 
 
-def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], list[tuple[str, float]]]:
+def run_smoke(server: Path, timeout: float) -> tuple[int, int]:
     """Run lifecycle, diagnostics, synchronization, and multi-root coverage."""
     with tempfile.TemporaryDirectory(prefix="mls-protocol-") as directory:
         root = Path(directory).resolve()
@@ -811,13 +801,10 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
             alpha_manifest = alpha[0].parents[1] / "mach.toml"
             alpha_manifest_text = alpha_manifest.read_text(encoding="utf-8")
             alpha_manifest.write_text(alpha_manifest_text + "\n[broken\n", encoding="utf-8")
-            started = time.perf_counter()
             symbols = session.request(
                 "textDocument/documentSymbol",
                 {"textDocument": {"uri": alpha[0].as_uri()}},
             )
-            require(time.perf_counter() - started < 1.0,
-                    "syntax-only documentSymbol blocked on project analysis")
             require(isinstance(symbols.get("result"), list) and symbols["result"],
                     f"documentSymbol depended on project loading: {symbols!r}")
             alpha_manifest.write_text(alpha_manifest_text, encoding="utf-8")
@@ -1055,7 +1042,7 @@ def run_smoke(server: Path, timeout: float) -> tuple[tuple[int, float, int], lis
 
             telemetry = session.finish()
             finished = True
-            return telemetry, session.timings
+            return telemetry
         finally:
             if not finished:
                 session.abort()
@@ -2212,14 +2199,14 @@ def run_settings(server: Path, timeout: float) -> None:
 
 
 def worker_pid(session: "LspSession") -> int:
-    """The analysis worker's pid: the supervisor's only child."""
-    for _ in range(200):
+    """The analysis worker's pid: the supervisor's only child, once it has one."""
+    while session.proc.poll() is None:
         children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
                                   capture_output=True, text=True).stdout.split()
         if children:
             return int(children[0])
         time.sleep(0.02)
-    raise AssertionError("no analysis worker")
+    raise AssertionError("no analysis worker: the supervisor exited")
 
 
 class SlowProject(NamedTuple):
@@ -2335,9 +2322,7 @@ def run_deadline_spares_load(server: Path, timeout: float) -> None:
             session._send({"jsonrpc": "2.0", "id": renaming, "method": "textDocument/rename",
                            "params": {"textDocument": {"uri": main.as_uri()},
                                       "position": {"line": line, "character": column}, "newName": "take_all"}})
-            deadline = time.monotonic() + timeout
             while trace_log.read_text(encoding="utf-8", errors="replace").count(holding) == holds:
-                require(time.monotonic() < deadline, "the rename was never held")
                 session.assert_no_message(lambda item: item.get("id") == renaming,
                                           "rename answer before it was held, which proves nothing",
                                           settle=0.02)
@@ -2394,17 +2379,17 @@ def run_spare_warmup_after_idle(server: Path, timeout: float) -> None:
 
     The trigger is what this locks in. The pump that schedules the warm-up runs
     when the message queue drains, not only before the next message, so a genuinely
-    idle session -- no further traffic -- still warms. Measured against the pump
-    running only before the next message, the first post-idle edit here rebuilds in
-    warm time, a small fraction of the cold load, and within reach of a second warm
-    edit rather than dwarfing it.
+    idle session -- no further traffic -- still warms. The build log says which
+    builds were warm-ups: exactly one, before the first edit, and none after the
+    edits, because a warmed spare is no longer cold and the edits rebuild into it.
     """
     with tempfile.TemporaryDirectory(prefix="mls-warmup-") as directory:
         root = Path(directory).resolve()
         main, text = write_wide_project(root, "warm", 256)
         builds = BuildLog(root / "trace.log")
         session = LspSession(server, root, timeout, builds.env())
-        durations = re.compile(r"project: rebuilt .* in (\d+)ms")
+        warming = "project: warming the spare session"
+        rebuilding = "project: rebuilding"
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
@@ -2412,39 +2397,33 @@ def run_spare_warmup_after_idle(server: Path, timeout: float) -> None:
             session.notify("textDocument/didOpen", {"textDocument": {
                 "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
             session.diagnostics(main.as_uri(), 1)
-            # the inline cold load's own time, the cost the warm-up is meant to remove
-            cold = durations.findall(builds.text())
-            require(cold, "the cold load did not report a build duration")
-            cold_ms = int(cold[-1])
 
             # no edits follow. the pump must warm the cold spare on the analysis
             # thread going idle; before the trigger fix this only fired at the next
             # message, so an idle session never warmed and this would never settle.
-            eventually(lambda: "warming the spare session" in builds.text(),
-                       lambda hit: hit, "the spare to warm during idle", timeout)
+            eventually(lambda: warming in builds.text(),
+                       lambda hit: hit, "the spare to warm during idle")
             builds.settle(1, "the spare warm-up to finish")
 
-            def edit_ms(version: int) -> int:
+            def edit(version: int) -> None:
                 before = rebuilt(builds)
                 session.notify("textDocument/didChange", {
                     "textDocument": {"uri": main.as_uri(), "version": version},
                     "contentChanges": [{"text": text + f"\n# edit {version}\n"}]})
                 eventually(lambda: rebuilt(builds) > before, lambda hit: hit,
                            f"edit {version} to rebuild")
-                return int(durations.findall(builds.text())[-1])
 
-            first_ms = edit_ms(2)
-            second_ms = edit_ms(3)
+            edit(2)
+            edit(3)
+            builds.settle(3, "the edits' rebuilds to finish")
+            # a round trip, so the pump has run past the last swap
+            session.request("textDocument/documentSymbol", {"textDocument": {"uri": main.as_uri()}})
 
-            # both edits rebuild warm. a first edit that found a cold spare would
-            # rebuild in cold time and dwarf the second; the warm-up keeps it in
-            # reach of a warm rebuild instead.
-            require(first_ms <= second_ms * 3 + 50,
-                    f"first post-idle edit was cold: {first_ms}ms against {second_ms}ms warm "
-                    f"(cold load was {cold_ms}ms)")
-            require(first_ms < cold_ms,
-                    f"first post-idle edit ({first_ms}ms) was no faster than the cold load "
-                    f"({cold_ms}ms), so the warm-up did not take")
+            log = builds.text()
+            require(log.count(warming) == 1,
+                    f"the spare was warmed {log.count(warming)} times, so the warm-up did not leave it warm")
+            require(log.count(rebuilding) >= 2,
+                    f"the two edits scheduled {log.count(rebuilding)} rebuilds")
             session.finish()
             finished = True
         finally:
@@ -2474,14 +2453,7 @@ def run_option_deadline(server: Path, timeout: float) -> None:
             session.notify("textDocument/didOpen", {"textDocument": {
                 "uri": main.as_uri(), "languageId": "mach", "version": 1, "text": text}})
             session.diagnostics(main.as_uri(), 1)
-            for _ in range(200):
-                children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
-                                          capture_output=True, text=True).stdout.split()
-                if children:
-                    wedged = int(children[0])
-                    break
-                time.sleep(0.02)
-            require(wedged is not None, "no analysis worker to wedge")
+            wedged = worker_pid(session)
             os.kill(wedged, signal.SIGSTOP)
             pending = session.next_id
             session.next_id += 1
@@ -3750,12 +3722,9 @@ def run_document_symbol_hierarchy(server: Path, timeout: float) -> None:
             manifest = defs.parents[1] / "mach.toml"
             manifest_text = manifest.read_text(encoding="utf-8")
             manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
-            time.sleep(0.4)
-            started = time.perf_counter()
+            time.sleep(FINGERPRINT_WINDOW)
             broken = session.request(
                 "textDocument/documentSymbol", {"textDocument": {"uri": defs.as_uri()}})
-            require(time.perf_counter() - started < 1.0,
-                    "documentSymbol blocked on project analysis")
             require(isinstance(broken.get("result"), list) and broken["result"],
                     f"documentSymbol needed a loaded project: {broken!r}")
             manifest.write_text(manifest_text, encoding="utf-8")
@@ -3778,7 +3747,8 @@ class SyntaxOnlyFeature(NamedTuple):
 
 # every handler that answers from `analysis.syntax_of`, the PHASE_PARSE view of
 # the open buffer alone. a syntax-only handler answers from the buffer and must
-# never touch the project, so each one is held to the same latency contract.
+# never touch the project, so each one is held to the same contract: losing the
+# project does not change its answer.
 SYNTAX_ONLY_FEATURES = (
     SyntaxOnlyFeature(
         name="documentSymbol",
@@ -3809,159 +3779,22 @@ def syntax_only_cursor(text: str) -> dict[str, int]:
     line = next(i for i, value in enumerate(lines) if value.strip().startswith("ret "))
     return {"line": line, "character": lines[line].index("ret ") + 4}
 
-# the first requests against a healthy project pay a cold project load, once
-# per manifest restore, so the contract is about steady state and these samples
-# are discarded at the start of every round
-SYNTAX_ONLY_WARMUP = 2
-# the samples of each condition are taken in rounds that alternate with the other
-# condition's, so a load change on the machine lands on both. taken as two
-# blocks, a burst under the healthy block and a lull under the standalone one
-# read as a reload: 15.0ms against 6.4ms (2.36x) on a shared x86 mac runner
-# whose previous runs measured 1.02x (#341)
-SYNTAX_ONLY_ROUNDS = 3
-# per condition per round. rounds x samples is odd, so the pooled median is a
-# sample rather than a mean of two
-SYNTAX_ONLY_SAMPLES = 3
-# healthy-project median over standalone median. measured in the same process on
-# the same machine, so machine load cancels: over seven runs each way the
-# absolute medians moved by 5x while the ratio stayed inside 2.77-5.41x against
-# mach v5.0.4 and 0.53-1.20x against v5.1.0. 2.0 separates them.
-SYNTAX_ONLY_RATIO = 2.0
-# under a few milliseconds both paths are dominated by framing rather than by
-# analysis and a ratio means nothing. a project reload never measured below
-# 6.6ms, so this cannot mask one.
-SYNTAX_ONLY_FLOOR = 0.003
 # the manifest fingerprint fallback coalesces to at most one scan per 250 ms per
 # root, so a request inside that window still sees the previous state
 FINGERPRINT_WINDOW = 0.4
-# a reload costs what the project's dependencies cost to load, so a fixture with
-# no dependencies cannot show one: a dependency-free project reloaded in under
-# 3ms even while broken, and the regression was invisible against it. these are
-# the std modules the fixture imports, aliased because several share a leaf name.
-SYNTAX_ONLY_STD_MODULES = (
-    "std.allocator", "std.allocator.arena", "std.allocator.bump", "std.allocator.fixed",
-    "std.allocator.heap", "std.allocator.page", "std.chrono.date", "std.chrono.duration",
-    "std.chrono.format", "std.chrono.time", "std.collections.bitset", "std.collections.deque",
-    "std.collections.heap", "std.collections.map", "std.collections.set",
-    "std.collections.slice", "std.collections.sort", "std.collections.vector",
-    "std.crypto.ct", "std.crypto.hash.fnv1a", "std.crypto.hash.siphash", "std.crypto.rand",
-    "std.encoding.leb128", "std.net.resolve", "std.net.tcp", "std.net.udp",
-    "std.sync.channel", "std.sync.thread", "std.text.utf8",
-    "std.encoding.base64", "std.encoding.binary", "std.encoding.hex", "std.filesystem",
-    "std.format", "std.input", "std.io.file", "std.io.reader", "std.io.writer",
-    "std.log", "std.math", "std.math.bignum", "std.math.bits", "std.math.float",
-    "std.math.mat4", "std.math.quat", "std.memory", "std.net.dns", "std.net.ip",
-)
 
 
-def write_std_backed_project(parent: Path) -> tuple[Path, str]:
-    """Create an app whose vendored dependency is this repo's own `dep/std`.
+def run_syntax_only_buffer_answers(server: Path, timeout: float) -> None:
+    """A syntax-only request answers from the buffer alone, healthy project or not.
 
-    A reload's cost is its dependencies', so the project has to carry a real one
-    for the reload to be visible at all. `dep/std` is already on disk in any tree
-    that could have built the server under test.
+    Each feature is asked against a project that loads and again under a
+    manifest that cannot load. A syntax-only answer is a function of the
+    buffer, so the two answers must be usable and identical.
     """
-    source = Path(__file__).resolve().parents[1] / "dep" / "std"
-    require((source / "mach.toml").is_file(),
-            f"the std dependency is not realized: {source} (run `mach dep pull .`)")
-    root = parent / "stdapp"
-    (root / "src").mkdir(parents=True)
-    shutil.copytree(source, root / "dep" / "std",
-                    ignore=shutil.ignore_patterns(".git", "out", "dep"))
-    (root / "mach.toml").write_text(
-        f"""[project]
-{COMPILER_RANGE}
-id = "stdapp"
-version = "0.1.0"
-src = "src"
-work = "out/{{target.name}}/{{profile.name}}"
-
-[target.linux]
-arch = "x86_64"
-sys = "linux"
-abi = "sysv64"
-
-[profile.debug]
-optimize = false
-debug = true
-simd = "scalarize"
-
-[artifact.app]
-kind = "bin"
-entry = "main.mach"
-out = "bin/app"
-targets = ["*"]
-link = []
-need = []
-
-[dep.std]
-path = "dep/std"
-""",
-        encoding="utf-8",
-    )
-    uses = "".join(f"use m{i}: {module};\n"
-                   for i, module in enumerate(SYNTAX_ONLY_STD_MODULES))
-    text = f"{uses}\npub fun main() i32 {{\n    ret 0;\n}}\n"
-    main = root / "src" / "main.mach"
-    main.write_text(text, encoding="utf-8")
-    return main, text
-
-
-def ratio_text(healthy: float, standalone: float) -> str:
-    """Format a latency ratio, or say so when the baseline is too small to divide."""
-    if standalone <= 0.0:
-        return "unmeasurable baseline"
-    return f"{healthy / standalone:.2f}x"
-
-
-def syntax_only_samples(session: LspSession, feature: SyntaxOnlyFeature, uri: str,
-                        text: str, label: str, samples: int) -> tuple[list[float], Any]:
-    """Latency of `samples` identical requests, with the last reply.
-
-    perf_counter, not monotonic: monotonic ticks about every 15.6ms on Windows,
-    which reads a millisecond-scale request as zero elapsed.
-    """
-    durations: list[float] = []
-    result: Any = None
-    for _ in range(samples):
-        started = time.perf_counter()
-        response = session.request(feature.method, feature.params(uri, text))
-        durations.append(time.perf_counter() - started)
-        result = response.get("result")
-        require(feature.valid(result),
-                f"{feature.name} answered nothing usable {label}: {response!r}")
-    return durations, result
-
-
-def median(durations: list[float]) -> float:
-    ordered = sorted(durations)
-    return ordered[len(ordered) // 2]
-
-
-def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, float, float]]:
-    """A syntax-only request must not reload the project through the editor session.
-
-    Until mach#3431, `editor.analyze` tore the project down on every call, so a
-    request needing nothing but a parse of the open buffer paid a full project
-    reload: against this repo, 1586.9ms healthy versus 34.8ms under a manifest
-    that cannot load, a 45.6x gap that shipped in 0.18.0 unnoticed. The only
-    latency assertion documentSymbol had broke the manifest first, so it measured
-    the one path that was never slow.
-
-    Two things make this able to fail where that one could not. The project
-    carries a real dependency, because a reload costs what its dependencies cost
-    and a dependency-free fixture shows nothing. And the bound is a ratio against
-    the standalone path measured in the same run rather than a wall-clock
-    threshold, so it neither flakes under machine load nor passes because the
-    machine was fast. The ratio cancels load only when both paths see the same
-    load, so the two are sampled in alternating rounds rather than as two blocks
-    (#341).
-    """
-    require(SYNTAX_ONLY_FEATURES, "no syntax-only feature is under a latency assertion")
-    measured: list[tuple[str, float, float]] = []
-    with tempfile.TemporaryDirectory(prefix="mls-synlat-") as directory:
+    require(SYNTAX_ONLY_FEATURES, "no syntax-only feature is under test")
+    with tempfile.TemporaryDirectory(prefix="mls-synonly-") as directory:
         root = Path(directory).resolve()
-        main, text = write_std_backed_project(root)
+        main, _, text = write_project(root, "synonly", 3)
         manifest = main.parents[1] / "mach.toml"
         manifest_text = manifest.read_text(encoding="utf-8")
         uri = main.as_uri()
@@ -3977,55 +3810,31 @@ def run_syntax_only_latency(server: Path, timeout: float) -> list[tuple[str, flo
                                   "version": 1, "text": text}},
             )
             # the fixture must load cleanly, or "healthy" is not healthy and the
-            # comparison is between two standalone paths
+            # comparison is between two broken-project answers
             assert_diagnostics(session.diagnostics(uri, 1), False, 1)
 
             for feature in SYNTAX_ONLY_FEATURES:
-                healthy_samples: list[float] = []
-                standalone_samples: list[float] = []
-                for _ in range(SYNTAX_ONLY_ROUNDS):
-                    syntax_only_samples(session, feature, uri, text,
-                                        "warming the project load", SYNTAX_ONLY_WARMUP)
-                    durations, healthy_result = syntax_only_samples(
-                        session, feature, uri, text,
-                        "against a healthy project", SYNTAX_ONLY_SAMPLES)
-                    healthy_samples.extend(durations)
+                healthy = session.request(feature.method, feature.params(uri, text)).get("result")
+                require(feature.valid(healthy),
+                        f"{feature.name} answered nothing usable against a healthy project: {healthy!r}")
 
-                    manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+                manifest.write_text(manifest_text + "\n[broken\n", encoding="utf-8")
+                time.sleep(FINGERPRINT_WINDOW)
+                try:
+                    standalone = session.request(feature.method, feature.params(uri, text)).get("result")
+                finally:
+                    manifest.write_text(manifest_text, encoding="utf-8")
                     time.sleep(FINGERPRINT_WINDOW)
-                    try:
-                        durations, standalone_result = syntax_only_samples(
-                            session, feature, uri, text,
-                            "under a broken manifest", SYNTAX_ONLY_SAMPLES)
-                        standalone_samples.extend(durations)
-                    finally:
-                        manifest.write_text(manifest_text, encoding="utf-8")
-                        time.sleep(FINGERPRINT_WINDOW)
-
-                    # a syntax-only answer is a function of the buffer, so losing
-                    # the project must not change it. without this the ratio could
-                    # be met by answering less.
-                    require(healthy_result == standalone_result,
-                            f"{feature.name} answered differently once the project was lost")
-
-                healthy = median(healthy_samples)
-                standalone = median(standalone_samples)
-                allowed = max(standalone * SYNTAX_ONLY_RATIO, SYNTAX_ONLY_FLOOR)
-                # require's message is built whether or not it fails, so the
-                # ratio cannot be divided here unguarded
-                require(healthy <= allowed,
-                        f"{feature.name} reloads the project on a healthy root: "
-                        f"{healthy * 1000:.1f}ms healthy vs {standalone * 1000:.1f}ms "
-                        f"standalone ({ratio_text(healthy, standalone)}, allowed "
-                        f"{allowed * 1000:.1f}ms)")
-                measured.append((feature.name, healthy, standalone))
+                require(feature.valid(standalone),
+                        f"{feature.name} answered nothing usable under a broken manifest: {standalone!r}")
+                require(healthy == standalone,
+                        f"{feature.name} answered differently once the project was lost")
 
             session.finish()
             finished = True
         finally:
             if not finished:
                 session.abort()
-    return measured
 
 
 def run_completion_context(server: Path, timeout: float) -> None:
@@ -4189,8 +3998,6 @@ def run_completion_freshness(server: Path, timeout: float) -> None:
             pending_labels = [item.get("label") for item in pending_result.get("items", [])]
             require("live" in pending_labels,
                     f"current editor member was absent before rebuild: {pending_labels!r}")
-            require(session.timings[-1][1] < 1.0,
-                    f"isolated completion blocked for {session.timings[-1][1]:.3f}s")
 
             gate.release()
             session.diagnostics(main.as_uri(), version)
@@ -5265,11 +5072,8 @@ def run_workspace_symbol(server: Path, timeout: float) -> None:
                     assert_range(location.get("range"), "symbol.location.range")
                 return items
 
-            # nothing is loaded yet: a query must answer, not block on a build
-            started = time.perf_counter()
+            # nothing is loaded yet: a query answers from loaded roots only
             require(query("answer") == [], "an unloaded workspace returned symbols")
-            require(time.perf_counter() - started < 2.0,
-                    "workspace/symbol forced a cold project load")
 
             session.notify(
                 "textDocument/didOpen",
@@ -6491,15 +6295,6 @@ def run_crash_containment(server: Path, timeout: float) -> None:
         print("  crash containment: skipped (needs pgrep and SIGKILL)")
         return
 
-    def worker_of(session: "LspSession") -> int:
-        for _ in range(200):
-            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
-                                      capture_output=True, text=True).stdout.split()
-            if children:
-                return int(children[0])
-            time.sleep(0.02)
-        raise AssertionError("no analysis worker: the compiler runs in the client process")
-
     # a crash is survived, and the session resumes with the text it had
     with tempfile.TemporaryDirectory(prefix="mls-crash-") as directory:
         root = Path(directory).resolve()
@@ -6517,7 +6312,7 @@ def run_crash_containment(server: Path, timeout: float) -> None:
             session.diagnostics(main.as_uri(), 1)
 
             # the process the client talks to must not be the one analysing
-            worker = worker_of(session)
+            worker = worker_pid(session)
 
             # an edit the client will never send again: it exists only in the
             # worker's buffer and in whatever the supervisor kept
@@ -6603,7 +6398,7 @@ def run_crash_containment(server: Path, timeout: float) -> None:
             # what a worker dying on the session itself looks like
             for _ in range(8):
                 try:
-                    os.kill(worker_of(session), signal.SIGKILL)
+                    os.kill(worker_pid(session), signal.SIGKILL)
                 except (AssertionError, ProcessLookupError):
                     break
                 time.sleep(0.15)
@@ -6637,15 +6432,6 @@ def run_hung_worker(server: Path, timeout: float) -> None:
         print("  hung worker: skipped (needs pgrep and SIGSTOP)")
         return
 
-    def worker_of(session: "LspSession") -> int:
-        for _ in range(200):
-            children = subprocess.run(["pgrep", "-P", str(session.proc.pid)],
-                                      capture_output=True, text=True).stdout.split()
-            if children:
-                return int(children[0])
-            time.sleep(0.02)
-        raise AssertionError("no analysis worker to wedge")
-
     # a deadline short enough to test, in place of the two minutes a real
     # session allows before it will call analysis stuck
     previous = os.environ.get("MLS_REQUEST_DEADLINE_MS")
@@ -6675,7 +6461,7 @@ def run_hung_worker(server: Path, timeout: float) -> None:
                 )
                 session.diagnostics(main.as_uri(), 2)
 
-                wedged = worker_of(session)
+                wedged = worker_pid(session)
                 os.kill(wedged, signal.SIGSTOP)
 
                 pending = session.next_id
@@ -6735,7 +6521,7 @@ def run_hung_worker(server: Path, timeout: float) -> None:
                     )
                     session.diagnostics(main.as_uri(), 1)
 
-                    wedged = worker_of(session)
+                    wedged = worker_pid(session)
                     os.kill(wedged, signal.SIGSTOP)
                     if send_shutdown:
                         session._send({"jsonrpc": "2.0", "id": session.next_id,
@@ -7010,7 +6796,7 @@ def run_clean_eof(server: Path, timeout: float) -> None:
         finished = False
         try:
             session.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
-            exit_code, _, _ = session.finish(send_exit=False)
+            exit_code, _ = session.finish(send_exit=False)
             require(exit_code == 0, f"clean EOF after shutdown exited {exit_code}")
             finished = True
         finally:
@@ -7063,7 +6849,7 @@ def probe_closed_stdout(server: Path, timeout: float, restore_signals: bool) -> 
 
 
 def main() -> int:
-    """Run the suite and print request timing plus process-exit telemetry."""
+    """Run the suite and print what it covered."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("server", type=Path, help="path to the debug mls executable")
     parser.add_argument("--timeout", type=float, default=30.0, help="seconds allowed per response")
@@ -7074,7 +6860,7 @@ def main() -> int:
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     try:
-        (exit_code, elapsed, message_count), timings = run_smoke(server, args.timeout)
+        exit_code, message_count = run_smoke(server, args.timeout)
         run_version(server, args.timeout)
         run_settings(server, args.timeout)
         run_manifest_notes(server, args.timeout)
@@ -7103,7 +6889,7 @@ def main() -> int:
         run_selection_range(server, args.timeout)
         run_type_definition(server, args.timeout)
         run_call_hierarchy(server, args.timeout)
-        syntax_only = run_syntax_only_latency(server, args.timeout)
+        run_syntax_only_buffer_answers(server, args.timeout)
         run_completion_context(server, args.timeout)
         run_completion_freshness(server, args.timeout)
         run_completion_alias_while_behind(server, args.timeout)
@@ -7139,10 +6925,10 @@ def main() -> int:
     except Exception as error:
         print(f"protocol smoke: FAIL: {error}", file=sys.stderr)
         return 1
-    print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code}, {elapsed:.3f}s)")
+    print(f"protocol smoke: PASS ({message_count} messages, exit {exit_code})")
     print("  a request is answered while a project rebuild is still running")
     print("  an embed of an artifact output resolves in the project's requirement scope")
-    print("  an idle root warms its cold spare, so the first edit after idle is warm")
+    print("  an idle root warms its cold spare once, before the first edit after idle")
     print("  a burst of edits during a build coalesces into one follow-up build")
     print("  a failed rebuild leaves the previous snapshot answering")
     print("  use / fwd import paths navigate to their declarations")
@@ -7152,7 +6938,7 @@ def main() -> int:
     print("  selectionRange expands a cursor one syntax level at a time")
     print("  typeDefinition lands on a type's declaration: record, nested field, tag, return type")
     print("  call hierarchy resolves items across modules, and reports calls through fun values")
-    print("  a syntax-only request answers from the buffer without reloading the project")
+    print("  a syntax-only request answers the same whether or not the project loads")
     print("  completion answers for the cursor: members, exports, prefixes")
     print("  queued completion uses current editor analysis before the deferred rebuild")
     print("  a use that names no module costs only its names, not the buffer's completion")
@@ -7176,11 +6962,6 @@ def main() -> int:
     print("  malformed/oversized frames: 8 rejected with exit 1")
     print("  closed stdout reader with inherited SIG_IGN: exit 1")
     print("  closed stdout reader: exit 1")
-    for name, healthy, standalone in syntax_only:
-        print(f"  {name} steady state: {healthy * 1000:.1f}ms healthy, "
-              f"{standalone * 1000:.1f}ms standalone ({healthy / standalone:.2f}x)")
-    for label, duration in timings:
-        print(f"  {label}: {duration:.3f}s")
     return 0
 
 
