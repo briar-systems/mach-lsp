@@ -167,10 +167,12 @@ val MATCH_WORD:     u8 = 1;
 val MATCH_INTERIOR: u8 = 2;
 val MATCH_NONE:     u8 = 3;
 
+# the best tier any occurrence of `query` in `name` earns
 fun match_tier(query: str, name: str) u8 {
     val qn: usize = str_len(query);
     val nn: usize = str_len(name);
     if (qn == 0 || qn > nn) { ret MATCH_NONE; }
+    var best:  u8    = MATCH_NONE;
     var start: usize = 0;
     for (start + qn <= nn) {
         var i:    usize = 0;
@@ -182,11 +184,11 @@ fun match_tier(query: str, name: str) u8 {
         if (same) {
             if (start == 0)             { ret MATCH_PREFIX; }
             if (name[start - 1] == '_') { ret MATCH_WORD; }
-            ret MATCH_INTERIOR;
+            best = MATCH_INTERIOR;
         }
         start = start + 1;
     }
-    ret MATCH_NONE;
+    ret best;
 }
 
 # ASCII lowercase; identifiers are ASCII in Mach
@@ -202,6 +204,7 @@ test match_rank_prefers_leading_over_interior_hits {
     if (match_tier("buf", "json_buf_push") != MATCH_WORD)    { fail = true; }
     if (match_tier("push", "json_buf_push") != MATCH_WORD)   { fail = true; }
     if (match_tier("uf", "json_buf_push") != MATCH_INTERIOR) { fail = true; }
+    if (match_tier("ab", "xab_ab") != MATCH_WORD)            { fail = true; }
     # the case that made raw substring matching noisy
     if (match_tier("read_", "thread_spawn") != MATCH_INTERIOR) { fail = true; }
     if (match_tier("zzz", "json_buf_push") != MATCH_NONE)      { fail = true; }
