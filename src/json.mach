@@ -575,6 +575,25 @@ test content_survives_growth_past_the_initial_capacity {
     ret 0;
 }
 
+# the decimal writers at zero, at both i64 extremes and at a usize of all twenty
+# digits; the i64 minimum has no positive i64 to negate into
+test buf_push_i64__zero_the_extremes_and_a_full_width_usize {
+    var pa: Allocator;
+    page.make(?pa);
+    var b: Buf = buf_init(?pa);
+    buf_push_i64(?b, 0);
+    buf_push_byte(?b, ' ');
+    buf_push_i64(?b, 9223372036854775807);
+    buf_push_byte(?b, ' ');
+    buf_push_i64(?b, 0x8000000000000000u64:~i64);
+    buf_push_byte(?b, ' ');
+    buf_push_usize(?b, 18446744073709551615);
+    val same: bool = str_equals(buf_str(?b), "0 9223372036854775807 -9223372036854775808 18446744073709551615");
+    buf_dnit(?b);
+    if (!same) { ret 1; }
+    ret 0;
+}
+
 # --- reading ---
 
 # a response must echo the request id with the type it arrived as; a string id
