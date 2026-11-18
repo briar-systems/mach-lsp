@@ -305,10 +305,8 @@ beside them as a flat closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`,
 `dep/deflate`, `dep/zstd`). std is the one mach's own pin names, because the
 server and the compiler it links share one std.
 
-That mach is the v7 language ahead of its release, so it still reports version
-6.10.1 and `[project].mach` admits 6.10.1 and every 7.x (`>=6, <8`). The source
-is on v7 spellings, which a 6.x release refuses: build it with a compiler built
-from the `dep/mach` tree.
+That mach is v7, reporting version 7.0.0, and `[project].mach` is `^7`. A 6.x
+release refuses the source and the range: build it with a 7.x compiler.
 
 ### Compiler compatibility
 

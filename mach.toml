@@ -3,7 +3,7 @@ id = "mls"
 version = "2.1.0"
 src = "src"
 work = "out/{target.name}/{profile.name}"
-mach = ">=6, <8"
+mach = "^7"
 
 [target.linux-x86_64]
 arch = "x86_64"
