@@ -361,6 +361,10 @@ var SIGNALS: i64 = 0;
 #[testing]
 fun note(ctx: ptr) {
     SIGNALS = SIGNALS + 1;
+    if (SEEN_LEN < 64) {
+        SEEN[SEEN_LEN::usize] = '!';
+        SEEN_LEN              = SEEN_LEN + 1;
+    }
 }
 
 #[testing]
@@ -372,6 +376,9 @@ fun record(ctx: ptr, body: str, len: usize) {
     SEEN_SUM = SEEN_SUM + len::i64;
 }
 
+# a body is copied on push, so the caller's buffer may be reused at once: the
+# first body is pushed from a buffer changed before the worker starts, the rest
+# while it runs
 test every_pushed_body_reaches_the_worker_once_in_order {
     var pa: Allocator;
     page.make(?pa);
@@ -379,12 +386,18 @@ test every_pushed_body_reaches_the_worker_once_in_order {
     if (!init(?q, ?pa)) { ret 1; }
     SEEN_LEN = 0;
     SEEN_SUM = 0;
-    if (!start(?q, record, note, nil)) {
+
+    var scratch: [8]u8;
+    scratch[0] = 'a';
+    scratch[1] = '1';
+    scratch[2] = 0;
+    if (!push(?q, (?scratch[0])::str, 2)) {
         dnit(?q);
         ret 1;
     }
+    scratch[0] = 'z';
 
-    if (!push(?q, "a1", 2)) {
+    if (!start(?q, record, note, nil)) {
         dnit(?q);
         ret 1;
     }
@@ -411,41 +424,6 @@ test every_pushed_body_reaches_the_worker_once_in_order {
     ret 0;
 }
 
-# a body is copied on push, so the caller's buffer may be reused immediately
-test a_pushed_body_is_copied_not_borrowed {
-    var pa: Allocator;
-    page.make(?pa);
-    var q: Queue;
-    if (!init(?q, ?pa)) { ret 1; }
-    SEEN_LEN = 0;
-    SEEN_SUM = 0;
-
-    var scratch: [8]u8;
-    scratch[0] = 'x';
-    scratch[1] = 'y';
-    scratch[2] = 0;
-    if (!push(?q, (?scratch[0])::str, 2)) {
-        dnit(?q);
-        ret 1;
-    }
-    scratch[0] = 'z';
-
-    if (!start(?q, record, note, nil)) {
-        dnit(?q);
-        ret 1;
-    }
-    join(?q);
-
-    var fail: bool = false;
-    if (SEEN_LEN != 1) { fail = true; }
-    or {
-        if (SEEN[0] != 'x') { fail = true; }
-    }
-    dnit(?q);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
 # the bound is what stops a client from buying unbounded memory with didChange
 test a_full_queue_refuses_a_push_instead_of_growing {
     var pa: Allocator;
@@ -467,55 +445,10 @@ test a_full_queue_refuses_a_push_instead_of_growing {
     ret 0;
 }
 
-# a rebuild finishing off the analysis thread reaches it only through a signal,
-# so the queue must deliver one that arrives while the worker is asleep
-test a_signal_reaches_the_worker_with_no_message_queued {
-    var pa: Allocator;
-    page.make(?pa);
-    var q: Queue;
-    if (!init(?q, ?pa)) { ret 1; }
-    SIGNALS  = 0;
-    SEEN_LEN = 0;
-    if (!start(?q, record, note, nil)) {
-        dnit(?q);
-        ret 1;
-    }
-    signal(?q);
-    join(?q);
-    var fail: bool = false;
-    if (SIGNALS != 1)  { fail = true; }
-    if (SEEN_LEN != 0) { fail = true; }
-    dnit(?q);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# a signal carries no payload, so two that land before the worker looks are one
-# piece of work, not two
+# a signal carries no payload, so signals that land before the worker looks are
+# one piece of work, and queued input is drained ahead of it, so a rebuild
+# landing mid-burst never delays the message already waiting
 test pending_signals_collapse {
-    var pa: Allocator;
-    page.make(?pa);
-    var q: Queue;
-    if (!init(?q, ?pa)) { ret 1; }
-    SIGNALS = 0;
-    signal(?q);
-    signal(?q);
-    signal(?q);
-    if (!start(?q, record, note, nil)) {
-        dnit(?q);
-        ret 1;
-    }
-    join(?q);
-    var fail: bool = false;
-    if (SIGNALS != 1) { fail = true; }
-    dnit(?q);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-# queued input is drained ahead of a signal, so a rebuild landing mid-burst
-# never delays the message already waiting
-test a_queued_message_is_taken_before_a_pending_signal {
     var pa: Allocator;
     page.make(?pa);
     var q: Queue;
@@ -523,6 +456,7 @@ test a_queued_message_is_taken_before_a_pending_signal {
     SIGNALS  = 0;
     SEEN_LEN = 0;
     SEEN_SUM = 0;
+    signal(?q);
     signal(?q);
     if (!push(?q, "a1", 2)) {
         dnit(?q);
@@ -534,8 +468,12 @@ test a_queued_message_is_taken_before_a_pending_signal {
     }
     join(?q);
     var fail: bool = false;
-    if (SEEN_LEN != 1) { fail = true; }
     if (SIGNALS != 1)  { fail = true; }
+    if (SEEN_LEN != 2) { fail = true; }
+    or {
+        if (SEEN[0] != 'a') { fail = true; }
+        if (SEEN[1] != '!') { fail = true; }
+    }
     dnit(?q);
     if (fail) { ret 1; }
     ret 0;

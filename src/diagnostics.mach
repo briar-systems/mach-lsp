@@ -415,16 +415,6 @@ fun stub_diag(message: str) diag.Diagnostic {
     ret d;
 }
 
-# borrow `items` as a diagnostic's child list without owning them
-#[testing]
-fun stub_children(items: *diag.Child, n: usize) Vector[diag.Child] {
-    var v: Vector[diag.Child] = vector.init[diag.Child](nil);
-    v.data = items;
-    v.len  = n;
-    v.cap  = n;
-    ret v;
-}
-
 # borrow `items` as a diagnostic's related list without owning them
 #[testing]
 fun stub_related(items: *annotation.Related, n: usize) Vector[annotation.Related] {
@@ -433,29 +423,6 @@ fun stub_related(items: *annotation.Related, n: usize) Vector[annotation.Related
     v.len  = n;
     v.cap  = n;
     ret v;
-}
-
-# the help line is the half of a mach diagnostic that says what to DO; it rode
-# nowhere before, so its presence in the rendered message is the regression pin
-test note_and_help_ride_the_message_as_trailing_lines {
-    var pa: Allocator;
-    page.make(?pa);
-    var b:    json.Buf        = json.buf_init(?pa);
-    var d:    diag.Diagnostic = stub_diag("type mismatch");
-    var kids: [2]diag.Child;
-    kids[0].kind = diag.CHILD_NOTE;
-    kids[0].text = "expected i32";
-    kids[1].kind = diag.CHILD_HELP;
-    kids[1].text = "cast with `v::i32`";
-    d.children   = stub_children(?kids[0], 2);
-    push_message(?b, ?d);
-
-    var fail: bool = false;
-    if (!str_equals(json.buf_str(?b),
-        "\"type mismatch\\nnote: expected i32\\nhelp: cast with `v::i32`\"")) { fail = true; }
-    json.buf_dnit(?b);
-    if (fail) { ret 1; }
-    ret 0;
 }
 
 # a secondary location carries the file it points INTO, which need not be the

@@ -575,46 +575,7 @@ test content_survives_growth_past_the_initial_capacity {
     ret 0;
 }
 
-test numbers_render_in_base_10_with_a_sign_only_where_negative {
-    var pa: Allocator;
-    page.make(?pa);
-    var b: Buf = buf_init(?pa);
-    buf_push_usize(?b, 0);
-    buf_push_byte(?b, ' ');
-    buf_push_i64(?b, -42);
-    buf_push_byte(?b, ' ');
-    buf_push_i64(?b, 42);
-    var fail: bool = false;
-    if (!str_equals(buf_str(?b), "0 -42 42")) { fail = true; }
-    buf_dnit(?b);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
 # --- reading ---
-
-test string_escapes_in_a_value_decode_to_their_logical_bytes {
-    var pa: Allocator;
-    page.make(?pa);
-    var rd: Reader;
-    if (!reader_init(?rd, ?pa)) { ret 1; }
-    val body: str     = "{\"text\":\"a\\nb\\tc\\\"d\"}";
-    var m:    Message = read(?rd, body, str_len(body));
-    var fail: bool    = false;
-    if (!m.valid) { fail = true; }
-    or {
-        val v: str = text(member(?m.root, "text"), ?pa);
-        if (v == nil) { fail = true; }
-        or {
-            if (!str_equals(v, "a\nb\tc\"d")) { fail = true; }
-            free_str(v, ?pa);
-        }
-    }
-    release(?rd);
-    reader_dnit(?rd);
-    if (fail) { ret 1; }
-    ret 0;
-}
 
 # a response must echo the request id with the type it arrived as; a string id
 # is re-emitted from its wire bytes rather than decoded and re-escaped

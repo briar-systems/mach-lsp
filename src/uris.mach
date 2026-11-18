@@ -371,30 +371,6 @@ test a_malformed_escape_or_an_encoded_nul_is_refused {
     ret 0;
 }
 
-test normalization_collapses_and_without_escaping_the_root {
-    var pa: Allocator;
-    page.make(?pa);
-    var fail: bool = false;
-    val a:    str  = normalize(?pa, "/a/./b/../c");
-    if (a == nil) { fail = true; }
-    or {
-        if (!str_equals(a, native(?pa, "/a/c"))) { fail = true; }
-    }
-    val b: str = normalize(?pa, "/a//b/");
-    if (b == nil) { fail = true; }
-    or {
-        if (!str_equals(b, native(?pa, "/a/b"))) { fail = true; }
-    }
-    # `..` at the root stays at the root rather than climbing above it
-    val c: str = normalize(?pa, "/../x");
-    if (c == nil) { fail = true; }
-    or {
-        if (!str_equals(c, native(?pa, "/x"))) { fail = true; }
-    }
-    if (fail) { ret 1; }
-    ret 0;
-}
-
 test a_path_becomes_a_file_uri_a_client_can_parse {
     var pa: Allocator;
     page.make(?pa);

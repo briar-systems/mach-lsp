@@ -1519,7 +1519,19 @@ fun add_struct_lit(a: *ast.Ast, name_off: usize, name_len: usize) id.ExprId {
     ret res_add_expr.ok;
 }
 
-test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
+# whether `field_ref_span_at` answers `eid` with the span `[off, off + len)`,
+# or with none when `len` is 0
+#[testing]
+fun ref_is(a: *ast.Ast, sr: *sema_product.SemaResult, ti: *type.TypeInterner, eid: id.ExprId, qf: *src.SourceFile, key: FieldKey, off: usize, len: usize) bool {
+    val opt_field_ref_span_at: opt[src.Span] = field_ref_span_at(a, sr, ti, eid, qf, key);
+    if (sel opt_field_ref_span_at.none) { ret len == 0; }
+    ret len != 0 && opt_field_ref_span_at.some.offset == off && opt_field_ref_span_at.some.len == len;
+}
+
+# a member access and a struct literal init of the keyed record's field match at
+# the field name; a receiver that is not a member access, another field name,
+# another record and an untyped receiver do not
+test field_ref_span_at_matches_only_the_keyed_field_of_the_keyed_record {
     var pa: Allocator;
     page.make(?pa);
     var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
@@ -1527,102 +1539,34 @@ test field_ref_span_at_matches_a_member_access_of_the_keyed_record {
     val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
     if (sel err_type_made.err) { ret 1; }
     # the record P is declared in module 2, decl 4; its field "x" lives at offset
-    # 8 of the declaring source. the buffer text "p.x" carries the member access
+    # 8 of the declaring source. the buffer carries "p.x" and "P{ x: 1 }"
     val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
     if (sel res_recp.err) { ret 1; }
     val recp:  type_kind.TypeId = res_recp.ok;
     var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
-    var buf:   src.SourceFile   = stub_file("p.x");
+    var decly: src.SourceFile   = stub_file("y");
+    var buf:   src.SourceFile   = stub_file("p.x\nP{ x: 1 }"); # init "x" at offset 7
 
-    # expr 0 = receiver "p" (typed P); expr 1 = member access "p.x" (name "x"@2)
+    # expr 0 = receiver "p" (typed P), expr 1 = member access "x"@2, expr 2 = the
+    # struct literal (typed P) whose single init names "x"@7
     val recv: id.ExprId               = add_ident(?a, 0, 1);
     val mem:  id.ExprId               = add_member(?a, recv, 2, 1);
-    var sr:   sema_product.SemaResult = mk_sema(?pa, 2);
+    val lit:  id.ExprId               = add_struct_lit(?a, 7, 1);
+    var sr:   sema_product.SemaResult = mk_sema(?pa, 3);
     sr.expr_type[id.expr_index(recv)] = recp;
+    sr.expr_type[id.expr_index(lit)]  = recp;
 
-    val key:                   FieldKey      = fk(2, 4, ?declf, 8, 1);
-    var fail:                  bool          = false;
-    val opt_field_ref_span_at: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, key);
-    if (sel opt_field_ref_span_at.some) {
-        val sp: src.Span = opt_field_ref_span_at.some;
-        if (sp.offset != 2 || sp.len != 1) { fail = true; }
-    }
-    or { fail = true; }
-    # the receiver IDENT itself is not a member access - no field span.
-    val opt_field_ref_span_at_recv: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, recv, ?buf, key);
-    if (sel opt_field_ref_span_at_recv.some) { fail = true; }
-
-    free_sema(?pa, ?sr);
-    type.dnit(?ti);
-    ast.dnit(?a);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test field_ref_span_at_matches_a_struct_literal_field_init {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
-    var ti:            type.TypeInterner;
-    val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel err_type_made.err) { ret 1; }
-    val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(1), t_owner(3), type_kind.TYPE_REC);
-    if (sel res_recp.err) { ret 1; }
-    val recp:  type_kind.TypeId = res_recp.ok;
-    var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
-    var buf:   src.SourceFile   = stub_file("P{ x: 1 }"); # init "x" at offset 3
-
-    # expr 0 = the struct literal itself, typed P; its single init names "x"@3
-    val lit: id.ExprId               = add_struct_lit(?a, 3, 1);
-    var sr:  sema_product.SemaResult = mk_sema(?pa, 1);
-    sr.expr_type[id.expr_index(lit)] = recp;
-
-    val key:                   FieldKey      = fk(3, 1, ?declf, 8, 1);
-    var fail:                  bool          = false;
-    val opt_field_ref_span_at: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, lit, ?buf, key);
-    if (sel opt_field_ref_span_at.some) {
-        val sp: src.Span = opt_field_ref_span_at.some;
-        if (sp.offset != 3 || sp.len != 1) { fail = true; }
-    }
-    or { fail = true; }
-
-    free_sema(?pa, ?sr);
-    type.dnit(?ti);
-    ast.dnit(?a);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test field_ref_span_at_rejects_a_different_record_and_a_different_field {
-    var pa: Allocator;
-    page.make(?pa);
-    var a:             ast.Ast        = ast.init(?pa, src.file_id(0));
-    var ti:            type.TypeInterner;
-    val err_type_made: err[fail.Fail] = type.init(?ti, ?pa);
-    if (sel err_type_made.err) { ret 1; }
-    val res_recp: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
-    if (sel res_recp.err) { ret 1; }
-    val recp:  type_kind.TypeId = res_recp.ok;
-    var declf: src.SourceFile   = stub_file("rec P { x: i32; }"); # "x" at offset 8
-    var buf:   src.SourceFile   = stub_file("p.x");
-
-    val recv: id.ExprId               = add_ident(?a, 0, 1);
-    val mem:  id.ExprId               = add_member(?a, recv, 2, 1);
-    var sr:   sema_product.SemaResult = mk_sema(?pa, 2);
-    sr.expr_type[id.expr_index(recv)] = recp;
-
-    var fail: bool = false;
-    # right record, wrong field name ("y" vs the access "x"): no match
-    var decly:                 src.SourceFile = stub_file("y");
-    val opt_field_ref_span_at: opt[src.Span]  = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1));
-    if (sel opt_field_ref_span_at.some) { fail = true; }
-    # right field name, wrong record identity (decl 9): no match.
-    val opt_field_ref_span_at_mem: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1));
-    if (sel opt_field_ref_span_at_mem.some) { fail = true; }
-    # receiver untyped (TYPE_NIL): no match.
+    val key:  FieldKey = fk(2, 4, ?declf, 8, 1);
+    var fail: bool     = false;
+    if (!ref_is(?a, ?sr, ?ti, mem, ?buf, key, 2, 1))                    { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, lit, ?buf, key, 7, 1))                    { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, recv, ?buf, key, 0, 0))                   { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?decly, 0, 1), 0, 0)) { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, lit, ?buf, fk(2, 4, ?decly, 0, 1), 0, 0)) { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, mem, ?buf, fk(2, 9, ?declf, 8, 1), 0, 0)) { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, lit, ?buf, fk(2, 9, ?declf, 8, 1), 0, 0)) { fail = true; }
     sr.expr_type[id.expr_index(recv)] = type_kind.TYPE_NIL;
-    val opt_field_ref_span_at_buf: opt[src.Span] = field_ref_span_at(?a, ?sr, ?ti, mem, ?buf, fk(2, 4, ?declf, 8, 1));
-    if (sel opt_field_ref_span_at_buf.some) { fail = true; }
+    if (!ref_is(?a, ?sr, ?ti, mem, ?buf, key, 0, 0)) { fail = true; }
 
     free_sema(?pa, ?sr);
     type.dnit(?ti);
