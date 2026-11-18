@@ -306,8 +306,9 @@ beside them as a flat closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`,
 server and the compiler it links share one std.
 
 That mach is the v7 language ahead of its release, so it still reports version
-6.10.1 and `[project].mach` stays `^6`. The source is on v7 spellings, which a
-6.x release refuses: build it with a compiler built from the `dep/mach` tree.
+6.10.1 and `[project].mach` admits 6.10.1 and every 7.x (`>=6, <8`). The source
+is on v7 spellings, which a 6.x release refuses: build it with a compiler built
+from the `dep/mach` tree.
 
 ### Compiler compatibility
 
