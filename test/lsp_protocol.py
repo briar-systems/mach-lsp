@@ -1976,7 +1976,7 @@ need = []
             builds.settle(1, "the rebuild that adds the opened orphan")
             published = session.diagnostics(orphan.as_uri(), 1)
             found = published["params"]["diagnostics"]
-            require(len(found) == 1 and "does not require" in found[0].get("message", ""),
+            require(len(found) == 1 and "does not need" in found[0].get("message", ""),
                     f"an output no artifact requires is not refused: {messages(found)!r}")
             session.finish()
             finished = True
@@ -4263,7 +4263,7 @@ abi = "sysv64"
 [target.darwin-aarch64]
 arch = "aarch64"
 sys = "darwin"
-abi = "aapcs64"
+abi = "darwinpcs"
 
 [dep.std]
 path = "dep/std"
@@ -5619,6 +5619,10 @@ def run_code_actions(server: Path, timeout: float) -> None:
             entries = published["params"]["diagnostics"]
             require(entries, "the misspelling produced no diagnostic")
             target = next((d for d in entries if "helpr" in d["message"]), entries[0])
+            # the help rides the message in the terminal's `help text` form, and
+            # the fix is the action below, never a line of the message
+            require(target["message"] == "unresolved identifier `helpr`\nhelp did you mean `helper`?",
+                    f"the message is not the compiler's with its help line: {target['message']!r}")
 
             def actions(rng: dict[str, Any], only: list[str] | None = None) -> list[dict[str, Any]]:
                 ctx: dict[str, Any] = {"diagnostics": [target]}
