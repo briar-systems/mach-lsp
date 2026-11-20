@@ -157,8 +157,8 @@ fun buf_write(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
 # b: the buffer to wrap
 # w: writer initialized in place; borrows `b`, which must outlive it
 pub fun buf_writer(b: *Buf, w: *writer.Writer) {
-    w.ctx     = b::ptr;
-    w.f_write = buf_write;
+    w.ctx      = b::ptr;
+    w.fn_write = buf_write;
 }
 
 # append `s` as a quoted JSON string, escaped by the std emitter
