@@ -113,7 +113,7 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
         # the module that declares it, so a name appears once per declaration
         # rather than once per importer
         if (lmodule.stable_same(sym.origin, mid) && features.completion_candidate(mv.rr, rslv.symbol_id(i))) {
-            val opt_interner_entry: opt[str] = intern.get(?root.s.interner, sym.name);
+            val opt_interner_entry: opt[str] = intern.get(root.s.interner, sym.name);
             if (sel opt_interner_entry.some) {
                 val name: str = opt_interner_entry.some;
                 if (match_tier(query, name) == tier) {

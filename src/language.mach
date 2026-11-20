@@ -2837,7 +2837,7 @@ fun emit_module_members(ws: *project.Workspace, root: *project.Root, pfile: *src
     var i:       u32   = 0;
     for (i < mv.rr.pub_count) {
         val sym:                *rslv.Symbol = ?mv.rr.symbols[i];
-        val opt_interner_entry: opt[str]     = intern.get(?root.s.interner, sym.name);
+        val opt_interner_entry: opt[str]     = intern.get(root.s.interner, sym.name);
         if (sel opt_interner_entry.some) {
             val name: str = opt_interner_entry.some;
             if (span_is_prefix_of(pfile, prefix, name)) {

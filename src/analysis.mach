@@ -103,7 +103,7 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     if (out.rr == nil)                                            { ret false; }
     val opt_sources_entry: opt[*src.SourceFile] = src.get(es.s.sources, doc.file_id);
     if (sel opt_sources_entry.none) { ret false; }
-    out.interner = ?es.s.interner;
+    out.interner = es.s.interner;
     out.text     = positions.text_of(opt_sources_entry.some);
     out.root     = nil;
     out.own      = buffer_module(es, doc.file_id);
@@ -119,7 +119,7 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
 fun buffer_module(es: *editor.EditorSession, fid: src.FileId) lmodule.StableModuleId {
     val opt_sources_entry: opt[*src.SourceFile] = src.get(es.s.sources, fid);
     if (sel opt_sources_entry.none) { ret lmodule.STABLE_MODULE_NIL; }
-    val res_name: res[intern.StrId, A.Error] = intern.add(?es.s.interner, opt_sources_entry.some.path);
+    val res_name: res[intern.StrId, A.Error] = intern.add(es.s.interner, opt_sources_entry.some.path);
     if (sel res_name.err) { ret lmodule.STABLE_MODULE_NIL; }
     ret lmodule.stable_module_id_lookup(?es.s.modules, res_name.ok);
 }

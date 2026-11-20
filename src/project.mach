@@ -255,14 +255,14 @@ pub fun start_builder(w: *Workspace, wake: build.WakeFn, ctx: ptr) bool {
 # root: governing compiler root
 # ret:  the session's type interner
 pub fun type_interner(w: *Workspace, root: *Root) *type.TypeInterner {
-    if (root != nil && root.s != nil) { ret ?root.s.types; }
-    ret ?w.s.types;
+    if (root != nil && root.s != nil) { ret root.s.types; }
+    ret w.s.types;
 }
 
 # the governing root's string interner, or the standalone fallback when root is nil
 pub fun interner(w: *Workspace, root: *Root) *intern.Interner {
-    if (root != nil && root.s != nil) { ret ?root.s.interner; }
-    ret ?w.s.interner;
+    if (root != nil && root.s != nil) { ret root.s.interner; }
+    ret w.s.interner;
 }
 
 # the workspace's current load epoch - a counter bumped on every
@@ -1351,7 +1351,7 @@ fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, in: *BuildInput, sn
             free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
             ret res[bool, str].err{fail.describe(res_project_module_fqn.err)};
         }
-        val res_interner_added: res[intern.StrId, allocator.Error] = intern.add(?sn.interner, res_project_module_fqn.ok);
+        val res_interner_added: res[intern.StrId, allocator.Error] = intern.add(sn.interner, res_project_module_fqn.ok);
         if (sel res_interner_added.err) {
             free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
             ret res[bool, str].err{lalloc.text(res_interner_added.err)};
@@ -2037,7 +2037,7 @@ fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[Docum
     v.stale  = d.revision > root.snapshot_revision;
     v.text   = positions.text_of(opt_module_source.some);
     if (v.stale) { v.text = positions.text_against(opt_module_source.some, documents.live_file(w.docs, d), module_windows(w, root, mi, opt_module_source.some, d)); }
-    v.interner = ?root.s.interner;
+    v.interner = root.s.interner;
     v.revision = root.snapshot_revision;
     v.file_id  = root.mod_files[mi];
     v.parse_ok = module_parse_ok(root, mi);
@@ -2272,7 +2272,7 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type_kind.TypeId) opt[Recor
     if (sel opt_module_for_file.none) { ret opt[RecordSite].none{}; }
     val opt_module_source: opt[*src.SourceFile] = module_source(root, opt_module_for_file.some);
     if (sel opt_module_source.none) { ret opt[RecordSite].none{}; }
-    val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(module_ast(root, opt_module_for_file.some), positions.text_of(opt_module_source.some), ?root.s.interner, n);
+    val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(module_ast(root, opt_module_for_file.some), positions.text_of(opt_module_source.some), root.s.interner, n);
     if (sel opt_decl.none) { ret opt[RecordSite].none{}; }
     ret record_site_from(root.mod_ids[opt_module_for_file.some], opt_decl.some, root.mod_files[opt_module_for_file.some], n.name, module_ast(root, opt_module_for_file.some), module_text(w, root, opt_module_for_file.some, opt_module_source.some));
 }
@@ -2324,7 +2324,7 @@ pub fun type_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: s
     var i: u32 = 0;
     for (i < mv.rr.pub_count) {
         val sym:                *rslv.Symbol = ?mv.rr.symbols[i];
-        val opt_interner_entry: opt[str]     = intern.get(?root.s.interner, sym.name);
+        val opt_interner_entry: opt[str]     = intern.get(root.s.interner, sym.name);
         if (sel opt_interner_entry.some) {
             if (str_equals(opt_interner_entry.some, type_name)) {
                 val opt_site: opt[TypeSite] = type_site_for_symbol(w, root, opt_module_by_fqn.some, mv, sym);
@@ -2438,7 +2438,7 @@ pub fun type_site_in(w: *Workspace, root: *Root, own: lmodule.StableModuleId, ow
     if (sel opt_module_for_file.none) { ret opt[TypeSite].none{}; }
     val opt_module_source: opt[*src.SourceFile] = module_source(root, opt_module_for_file.some);
     if (sel opt_module_source.none) { ret opt[TypeSite].none{}; }
-    val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(module_ast(root, opt_module_for_file.some), positions.text_of(opt_module_source.some), ?root.s.interner, n);
+    val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(module_ast(root, opt_module_for_file.some), positions.text_of(opt_module_source.some), root.s.interner, n);
     if (sel opt_decl.none) { ret opt[TypeSite].none{}; }
     ret type_site_from(root.mod_ids[opt_module_for_file.some], opt_decl.some, root.mod_files[opt_module_for_file.some], module_ast(root, opt_module_for_file.some), module_text(w, root, opt_module_for_file.some, opt_module_source.some));
 }
