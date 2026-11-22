@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+  merge_group:
   workflow_dispatch:
     inputs:
       runners:
@@ -31,7 +32,7 @@ jobs:
   compiler:
     name: compiler (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -55,11 +56,17 @@ jobs:
           MACH_REF: ${{ steps.mach.outputs.ref }}
         run: |
           src=$RUNNER_TEMP/mach-src
+          rm -rf "$src"
           git init --quiet "$src"
           git -C "$src" remote add origin https://github.com/briar-systems/mach
           git -C "$src" fetch --quiet --depth 1 origin "$MACH_REF"
           git -C "$src" checkout --quiet FETCH_HEAD
-          echo "chain=$(sha256sum "$src/.github/bootstrap-chain" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+          if command -v sha256sum >/dev/null; then
+            chain=$(sha256sum "$src/.github/bootstrap-chain" | awk '{print $1}')
+          else
+            chain=$(shasum -a 256 "$src/.github/bootstrap-chain" | awk '{print $1}')
+          fi
+          echo "chain=$chain" >> "$GITHUB_OUTPUT"
       # mach's own bootstrap chain builds its tree from the last seed release.
       # its steps are cached by the chain file, as mach's ci does
       - id: chain
@@ -68,6 +75,8 @@ jobs:
         with:
           path: ${{ runner.temp }}/chain
           key: chain-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.chain }}
+          restore-keys: |
+            chain-${{ runner.os }}-${{ runner.arch }}-
       - name: bootstrap mach
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -114,6 +123,7 @@ jobs:
       - if: strategy.job-index == 0
         run: mach fmt --check .
       - run: mach build . --all -p "$PROFILE"
+      - run: mach test . --all -p "$PROFILE"
 
   gate:
     if: always()

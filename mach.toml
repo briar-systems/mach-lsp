@@ -26,6 +26,12 @@ sys  = "windows"
 abi  = "win64"
 env  = "msvc"
 
+[target.windows-aarch64]
+arch = "aarch64"
+sys  = "windows"
+abi  = "aapcs64win"
+env  = "msvc"
+
 [target.darwin-x86_64]
 arch = "x86_64"
 sys = "darwin"
