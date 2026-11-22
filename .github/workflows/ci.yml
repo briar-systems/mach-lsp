@@ -62,9 +62,9 @@ jobs:
           git -C "$src" fetch --quiet --depth 1 origin "$MACH_REF"
           git -C "$src" checkout --quiet FETCH_HEAD
           if command -v sha256sum >/dev/null; then
-            chain=$(sha256sum "$src/.github/bootstrap-chain" | awk '{print $1}')
+            chain=$(sha256sum < "$src/.github/bootstrap-chain" | awk '{print $1}')
           else
-            chain=$(shasum -a 256 "$src/.github/bootstrap-chain" | awk '{print $1}')
+            chain=$(shasum -a 256 < "$src/.github/bootstrap-chain" | awk '{print $1}')
           fi
           echo "chain=$chain" >> "$GITHUB_OUTPUT"
       # mach's own bootstrap chain builds its tree from the last seed release.
