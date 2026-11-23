@@ -1,9 +1,9 @@
 [project]
 id = "mls"
-version = "2.1.0"
+version = "3.0.0"
 src = "src"
 work = "out/{target.name}/{profile.name}"
-mach = "^7.0.0-rc.1"
+mach = "^7"
 
 [target.linux-x86_64]
 arch = "x86_64"
@@ -65,16 +65,16 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/dev"
+version = "^10.0.0"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "branch/dev"
+ref = "tag/v7.0.0"
 
 [dep.toml]
 git = "https://github.com/briar-systems/mach-toml"
-ref = "branch/dev"
+version = "^0.1.0"
 
 [dep.json]
 git = "https://github.com/briar-systems/mach-json"
-ref = "branch/dev"
+version = "^0.1.0"

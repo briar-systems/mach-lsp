@@ -296,17 +296,18 @@ the log will then contain fragments of whatever you have open.
 ## How the compiler dependency is wired
 
 `dep/mach` (id `mach`) provides the `mach.*` compiler and retained frontend
-surfaces this server binds to; `dep/std` (id `std`) provides `std.*`. Both are
-declared as git dependencies in `mach.toml` following their `dev` branches
-(`ref = "branch/dev"`), and fetched by `mach dep pull .`. The committed gitlinks
-under `dep/` are the pins; there is no lockfile. The pinned versions are mach
-dev at `c8d19eb` and std 9.5.0 at `ffee015`, with mach's own dependencies pinned
-beside them as a flat closure (`dep/mink`, `dep/masc`, `dep/mirl`, `dep/yaml`,
-`dep/deflate`, `dep/zstd`). std is the one mach's own pin names, because the
-server and the compiler it links share one std.
+surfaces this server binds to, `dep/std` (id `std`) provides `std.*`, and
+`dep/toml` and `dep/json` provide TOML and JSON parsing. They are declared as
+git dependencies in `mach.toml` (`mach` at `tag/v7.0.0`, `std` at `^10.0.0`,
+and `toml` and `json` at `^0.1.0`), and fetched by `mach dep pull .`. The
+committed gitlinks under `dep/` are the pins, with no lockfile. `mach`'s own
+dependencies are pinned beside them as a flat closure (`dep/mink`, `dep/masc`,
+`dep/mirl`, `dep/yaml`, `dep/deflate`, `dep/zstd`, `dep/crypto`). `std` is the
+one `mach`'s own pin names, because the server and the compiler it links share
+one `std`.
 
-That mach is v7, reporting version 7.0.0, and `[project].mach` is `^7`. A 6.x
-release refuses the source and the range: build it with a 7.x compiler.
+The linked `mach` is v7.0.0, and `[project].mach` is `^7`. A 6.x release
+refuses the source and the range: build it with a 7.x compiler.
 
 ### Compiler compatibility
 

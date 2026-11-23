@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-23
+
+`mls` links the `mach` 7.0.0 front end and `std` 10.0.0, and adds a prebuilt
+`aarch64-windows` release archive alongside `x86_64-linux`, `aarch64-linux`,
+`x86_64-darwin`, `aarch64-darwin`, and `x86_64-windows`.
+
+### Added
+- `textDocument/formatting` powered by `mach`'s source formatter.
+- Multiline string syntax highlighting and folding as a single string token (#407).
+- Refused-project diagnostics surfaced directly on open buffers and on `use` lines importing a refused module (#375, #406).
+- Prebuilt `mls-3.0.0-aarch64-windows.zip` release archive and `windows-aarch64` build target.
+
+### Changed
+- **Breaking:** The linked compiler moves to `mach` v7.0.0 (`[project].mach = "^7"`) and `std` to v10.0.0 (`^10.0.0`), with TOML and JSON read through `mach-toml` and `mach-json` (`^0.1.0`) (#401, #403, #406). Projects written for `mach` 6 must be migrated to `mach` 7 or opened with `mls` 2.1.0 (`RELEASES.json` continues to list the matching `mls` for each `mach` version).
+- Open project snapshots load through `editor.project_open` and renamed files re-parse through `editor.parse_text`, running on the 8 MiB frontend stack (#401, #403).
+- Hover documentation rendering follows `mach` 7's doc-comment interface and diagnostic notes/help format.
+
+### Fixed
+- Manifest diagnostics are published at the exact range `mach` reports (#287).
+- Stale buffer diagnostics survive past name-resolution errors and documents in a refused project are republished cleanly without fallback semantics (#375, #403).
+- Workspace symbol ranking orders each symbol by the best tier any occurrence earns.
+
 ## [2.1.0] - 2026-09-26
 
 mls links the mach 6.3.0 front end and std 9, and a diagnostic's `code` is
