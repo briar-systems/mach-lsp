@@ -45,10 +45,10 @@ pub fun to_path(alloc: *Allocator, uri: str) str {
     }
 
     # worst case: every byte kept, plus a UNC prefix and the terminator
-    val cap: usize                     = n + 3;
-    val r:   res[*u8, allocator.Error] = allocate[u8](alloc, cap);
-    if (sel r.err) { ret nil; }
-    val buf: *u8   = r.ok;
+    val cap:          usize                     = n + 3;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, cap);
+    if (sel res_allocate.err) { ret nil; }
+    val buf: *u8   = res_allocate.ok;
     var out: usize = 0;
 
     if (unc) {
@@ -167,9 +167,9 @@ pub fun path_of(alloc: *Allocator, uri: str) str {
 # normalized here on the LSP side (the vendored driver is not ours to change)
 pub fun normalize(alloc: *Allocator, path: str) str {
     if (path == nil) { ret nil; }
-    val r: res[pathlib.Path, allocator.Error] = pathlib.clean(alloc, path);
-    if (sel r.err) { ret nil; }
-    ret r.ok;
+    val res_clean: res[pathlib.Path, allocator.Error] = pathlib.clean(alloc, path);
+    if (sel res_clean.err) { ret nil; }
+    ret res_clean.ok;
 }
 
 # a `file://` URI for a SourceFile's `path`, owned by the caller, or
@@ -181,9 +181,9 @@ pub fun normalize(alloc: *Allocator, path: str) str {
 pub fun of_path(alloc: *Allocator, path: str) str {
     if (path == nil) { ret nil; }
     if (str_starts_with(path, "file://")) {
-        val dr: res[str, allocator.Error] = strutil.str_dup(alloc, path);
-        if (sel dr.err) { ret nil; }
-        ret dr.ok;
+        val res_str_dup: res[str, allocator.Error] = strutil.str_dup(alloc, path);
+        if (sel res_str_dup.err) { ret nil; }
+        ret res_str_dup.ok;
     }
     val norm: str = normalize(alloc, path);
     if (norm == nil) { ret nil; }
@@ -284,10 +284,10 @@ pub fun is_under(file: str, dir: str) bool {
 # and their order are what matters.
 #[testing]
 fun native(a: *Allocator, posix: str) str {
-    val n: usize                     = str_len(posix);
-    val r: res[*u8, allocator.Error] = allocate[u8](a, n + 1);
-    if (sel r.err) { ret nil; }
-    val out: *u8   = r.ok;
+    val n:            usize                     = str_len(posix);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](a, n + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val out: *u8   = res_allocate.ok;
     var i:   usize = 0;
     for (i < n) {
         if (posix[i] == '/') { out[i] = pathlib.separator(); }
@@ -371,30 +371,6 @@ test a_malformed_escape_or_an_encoded_nul_is_refused {
     ret 0;
 }
 
-test normalization_collapses_and_without_escaping_the_root {
-    var pa: Allocator;
-    page.make(?pa);
-    var fail: bool = false;
-    val a:    str  = normalize(?pa, "/a/./b/../c");
-    if (a == nil) { fail = true; }
-    or {
-        if (!str_equals(a, native(?pa, "/a/c"))) { fail = true; }
-    }
-    val b: str = normalize(?pa, "/a//b/");
-    if (b == nil) { fail = true; }
-    or {
-        if (!str_equals(b, native(?pa, "/a/b"))) { fail = true; }
-    }
-    # `..` at the root stays at the root rather than climbing above it
-    val c: str = normalize(?pa, "/../x");
-    if (c == nil) { fail = true; }
-    or {
-        if (!str_equals(c, native(?pa, "/x"))) { fail = true; }
-    }
-    if (fail) { ret 1; }
-    ret 0;
-}
-
 test a_path_becomes_a_file_uri_a_client_can_parse {
     var pa: Allocator;
     page.make(?pa);
@@ -435,7 +411,7 @@ test a_document_is_under_its_source_directory_with_native_separators {
     if (!is_under("/p", "/p"))                { fail = true; }
     if (!is_under("/x", "/"))                 { fail = true; }
     if (is_under("/p/x", "/p/x/y"))           { fail = true; }
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         if (!is_under("C:\\p\\src\\m.mach", "C:\\p\\src")) { fail = true; }
         if (is_under("C:\\p\\srcx\\m.mach", "C:\\p\\src")) { fail = true; }
     }

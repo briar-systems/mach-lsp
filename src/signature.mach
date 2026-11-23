@@ -20,15 +20,14 @@ use std.types.string.str;
 
 use std.allocator.Allocator;
 
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.id;
-use atype: mach.lang.fe.ast.type;
-use rslv:  mach.lang.fe.resolve;
-use mach.lang.fe.token;
-use src: mach.lang.source;
-use sj:  std.data.json;
+use sj:  json.value;
+use src: mach.base.source;
+use mach.editor;
+use mach.front.ast;
+use mach.front.ast.decl;
+use mach.front.ast.id;
+use atype: mach.front.ast.type;
+use rslv:  mach.front.resolve;
 
 use mls.analysis;
 use mls.documents;
@@ -53,50 +52,50 @@ pub fun signature_help(ws: *project.Workspace, es: *editor.EditorSession, alloc:
     val id_raw: str = json.id_text(req_id, alloc);
     if (id_raw == nil) { ret; }
 
-    var an:    analysis.Analyzed;
-    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
-    if (sel off_o.none) {
+    var an:      analysis.Analyzed;
+    val opt_off: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (sel opt_off.none) {
         render.reply_null(alloc, id_raw);
         ret;
     }
-    val offset: usize = off_o.some;
+    val offset: usize = opt_off.some;
 
-    val co: opt[CallSite] = enclosing_call(an.text, offset);
-    if (sel co.none) {
+    val opt_enclosing_call: opt[CallSite] = enclosing_call(an.text, offset);
+    if (sel opt_enclosing_call.none) {
         render.reply_null(alloc, id_raw);
         ret;
     }
-    val call: CallSite = co.some;
+    val call: CallSite = opt_enclosing_call.some;
 
-    val ro: opt[features.SymbolRef] =
+    val opt_ref_at: opt[features.SymbolRef] =
         features.ref_at(an.a, an.rr, an.own, an.text.file, call.callee_offset);
-    if (sel ro.none) {
+    if (sel opt_ref_at.none) {
         render.reply_null(alloc, id_raw);
         ret;
     }
-    val sr: features.SymbolRef = ro.some;
+    val sr: features.SymbolRef = opt_ref_at.some;
 
-    val so: opt[*rslv.Symbol] = features.symbol(an.rr, sr.sym_id);
-    if (sel so.none) {
+    val opt_symbol: opt[*rslv.Symbol] = features.symbol(an.rr, sr.sym_id);
+    if (sel opt_symbol.none) {
         render.reply_null(alloc, id_raw);
         ret;
     }
-    val sym: *rslv.Symbol = so.some;
+    val sym: *rslv.Symbol = opt_symbol.some;
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
-    if (sel site_o.none) {
+    val opt_site: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
+    if (sel opt_site.none) {
         render.reply_null(alloc, id_raw);
         ret;
     }
-    var site: project.Site = site_o.some;
+    var site: project.Site = opt_site.some;
 
-    val d_opt: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
-    if (sel d_opt.none) {
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
+    if (sel opt_decl.none) {
         project.free_site(ws, ?site);
         render.reply_null(alloc, id_raw);
         ret;
     }
-    val d: *decl.Decl = d_opt.some;
+    val d: *decl.Decl = opt_decl.some;
     if (d.kind != decl.DECL_KIND_FUN) {
         project.free_site(ws, ?site);
         render.reply_null(alloc, id_raw);
@@ -175,17 +174,17 @@ fun emit(alloc: *Allocator, id_raw: str, a: *ast.Ast, file: positions.Text,
 
 # `name: Type` for the parameter in `typed_names` slot `slot`
 fun push_param_text(b: *json.Buf, a: *ast.Ast, file: positions.Text, slot: u32, alloc: *Allocator) {
-    if (a.typed_names == nil) { ret; }
-    val tn:    *decl.TypedName = ?a.typed_names[slot::usize];
+    if (a.typed_names.data == nil) { ret; }
+    val tn:    *decl.TypedName = ?a.typed_names.data[slot::usize];
     val pname: str             = positions.span_text(file, tn.name, alloc);
     if (pname != nil) {
         json.buf_push(b, pname);
         json.free_str(pname, alloc);
     }
-    if (tn.ty != id.TYPE_NIL) {
-        val to: opt[*atype.Type] = ast.get_type(a, tn.ty);
-        if (sel to.some) {
-            val tt: str = positions.span_text(file, to.some.span, alloc);
+    if (!id.type_is_nil(tn.ty)) {
+        val opt_type: opt[*atype.Type] = ast.get_type(a, tn.ty);
+        if (sel opt_type.some) {
+            val tt: str = positions.span_text(file, opt_type.some.span, alloc);
             if (tt != nil) {
                 json.buf_push(b, ": ");
                 json.buf_push(b, tt);
@@ -197,17 +196,17 @@ fun push_param_text(b: *json.Buf, a: *ast.Ast, file: positions.Text, slot: u32, 
 
 # the declared return type as written, or nil when there is none
 fun return_type_text(a: *ast.Ast, file: positions.Text, d: *decl.Decl, alloc: *Allocator) str {
-    if (d.data.fun_.return_type == id.TYPE_NIL) { ret nil; }
-    val to: opt[*atype.Type] = ast.get_type(a, d.data.fun_.return_type);
-    if (sel to.none) { ret nil; }
-    ret positions.span_text(file, to.some.span, alloc);
+    if (id.type_is_nil(d.data.fun_.return_type)) { ret nil; }
+    val opt_type: opt[*atype.Type] = ast.get_type(a, d.data.fun_.return_type);
+    if (sel opt_type.none) { ret nil; }
+    ret positions.span_text(file, opt_type.some.span, alloc);
 }
 
 # the function's own name as written
 fun decl_name_text(file: positions.Text, d: *decl.Decl, alloc: *Allocator) str {
-    val nso: opt[token.Span] = features.decl_name_span(d);
-    if (sel nso.none) { ret nil; }
-    ret positions.span_text(file, nso.some, alloc);
+    val opt_decl_name_span: opt[src.Span] = features.decl_name_span(d);
+    if (sel opt_decl_name_span.none) { ret nil; }
+    ret positions.span_text(file, opt_decl_name_span.some, alloc);
 }
 
 # find the call the cursor is inside by scanning back for an unclosed `(`
@@ -247,10 +246,10 @@ fun enclosing_call(t: positions.Text, offset: usize) opt[CallSite] {
         or (c == ')') { depth = depth + 1; }
         or (c == '(') {
             if (depth == 0) {
-                val co: opt[usize] = ident_end_before(text, i);
-                if (sel co.none) { ret opt[CallSite].none{}; }
+                val opt_ident_end_before: opt[usize] = ident_end_before(text, i);
+                if (sel opt_ident_end_before.none) { ret opt[CallSite].none{}; }
                 var call: CallSite;
-                call.callee_offset = co.some;
+                call.callee_offset = opt_ident_end_before.some;
                 call.active        = commas;
                 ret opt[CallSite].some{call};
             }
@@ -294,9 +293,9 @@ fun ident_end_before(text: str, paren: usize) opt[usize] {
         val c: u8 = text[i];
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { i = i; }
         or (c == ']' && !skipped_generics) {
-            val bo: opt[usize] = matching_bracket_before(text, i);
-            if (sel bo.none) { ret opt[usize].none{}; }
-            i                = bo.some;
+            val opt_matching_bracket_before: opt[usize] = matching_bracket_before(text, i);
+            if (sel opt_matching_bracket_before.none) { ret opt[usize].none{}; }
+            i                = opt_matching_bracket_before.some;
             skipped_generics = true;
         }
         or (is_ident_byte(c)) { ret opt[usize].some{i}; }

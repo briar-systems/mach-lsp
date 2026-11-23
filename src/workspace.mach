@@ -22,11 +22,11 @@ use std.types.string.str_len;
 
 use std.allocator.Allocator;
 
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.token;
-use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use mach.base.intern;
+use src:     mach.base.source;
+use rslv:    mach.front.resolve;
+use sess:    mach.session;
+use lmodule: mach.session.module;
 
 use mls.features;
 use mls.json;
@@ -83,10 +83,10 @@ fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
     val n:       u32   = project.module_count(root);
     var mi:      u32   = 0;
     for (mi < n && emitted < MAX_RESULTS) {
-        val mid: sess.ModuleId           = mi::sess.ModuleId;
-        val mvo: opt[project.ModuleView] = project.module_view(ws, root, mid);
-        if (sel mvo.some) {
-            val mv: project.ModuleView = mvo.some;
+        val mid:             lmodule.StableModuleId  = project.module_id_at(root, mi);
+        val opt_module_view: opt[project.ModuleView] = project.module_view(ws, root, mid);
+        if (sel opt_module_view.some) {
+            val mv: project.ModuleView = opt_module_view.some;
             if (mv.rr != nil && mv.a != nil) {
                 val uri: str = project.module_uri(ws, root, mid);
                 if (uri != nil) {
@@ -103,7 +103,7 @@ fun push_root_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
 
 # append every matching symbol `mid` declares, returning the new count
 fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Root,
-    mid: sess.ModuleId, mv: project.ModuleView, uri: str, fqn: str,
+    mid: lmodule.StableModuleId, mv: project.ModuleView, uri: str, fqn: str,
     query: str, tier: u8, start_count: usize) usize {
     var emitted: usize = start_count;
     var i:       u32   = 0;
@@ -112,14 +112,14 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
         # only declarations this module owns: an imported symbol is reported by
         # the module that declares it, so a name appears once per declaration
         # rather than once per importer
-        if (sym.origin == mid && features.completion_candidate(mv.rr, i)) {
-            val no: opt[str] = intern.lookup(?root.s.interner, sym.name);
-            if (sel no.some) {
-                val name: str = no.some;
+        if (lmodule.stable_same(sym.origin, mid) && features.completion_candidate(mv.rr, rslv.symbol_id(i))) {
+            val opt_interner_entry: opt[str] = intern.get(root.s.interner, sym.name);
+            if (sel opt_interner_entry.some) {
+                val name: str = opt_interner_entry.some;
                 if (match_tier(query, name) == tier) {
-                    val spo: opt[token.Span] = features.decl_name_span_of(mv.a, sym);
-                    if (sel spo.some) {
-                        if (push_symbol(b, mv.text, uri, spo.some, name,
+                    val opt_decl_name_span_of: opt[src.Span] = features.decl_name_span_of(mv.a, sym);
+                    if (sel opt_decl_name_span_of.some) {
+                        if (push_symbol(b, mv.text, uri, opt_decl_name_span_of.some, name,
                             features.lsp_symbol_kind(sym.kind), fqn, emitted > 0)) {
                             emitted = emitted + 1;
                         }
@@ -138,7 +138,7 @@ fun push_module_symbols(b: *json.Buf, ws: *project.Workspace, root: *project.Roo
 # identically-named symbols distinguishable - and roots with colliding FQNs are
 # explicitly supported, so this is not cosmetic. a declaration whose name
 # span cannot be reported in the client's buffer is left out
-fun push_symbol(b: *json.Buf, text: positions.Text, uri: str, span: token.Span,
+fun push_symbol(b: *json.Buf, text: positions.Text, uri: str, span: src.Span,
     name: str, kind: i64, container: str, comma: bool) bool {
     if (!positions.maps(text, span)) { ret false; }
     if (comma)                       { json.buf_push_byte(b, ','); }
@@ -167,10 +167,12 @@ val MATCH_WORD:     u8 = 1;
 val MATCH_INTERIOR: u8 = 2;
 val MATCH_NONE:     u8 = 3;
 
+# the best tier any occurrence of `query` in `name` earns
 fun match_tier(query: str, name: str) u8 {
     val qn: usize = str_len(query);
     val nn: usize = str_len(name);
     if (qn == 0 || qn > nn) { ret MATCH_NONE; }
+    var best:  u8    = MATCH_NONE;
     var start: usize = 0;
     for (start + qn <= nn) {
         var i:    usize = 0;
@@ -182,11 +184,11 @@ fun match_tier(query: str, name: str) u8 {
         if (same) {
             if (start == 0)             { ret MATCH_PREFIX; }
             if (name[start - 1] == '_') { ret MATCH_WORD; }
-            ret MATCH_INTERIOR;
+            best = MATCH_INTERIOR;
         }
         start = start + 1;
     }
-    ret MATCH_NONE;
+    ret best;
 }
 
 # ASCII lowercase; identifiers are ASCII in Mach
@@ -202,6 +204,7 @@ test match_rank_prefers_leading_over_interior_hits {
     if (match_tier("buf", "json_buf_push") != MATCH_WORD)    { fail = true; }
     if (match_tier("push", "json_buf_push") != MATCH_WORD)   { fail = true; }
     if (match_tier("uf", "json_buf_push") != MATCH_INTERIOR) { fail = true; }
+    if (match_tier("ab", "xab_ab") != MATCH_WORD)            { fail = true; }
     # the case that made raw substring matching noisy
     if (match_tier("read_", "thread_spawn") != MATCH_INTERIOR) { fail = true; }
     if (match_tier("zzz", "json_buf_push") != MATCH_NONE)      { fail = true; }

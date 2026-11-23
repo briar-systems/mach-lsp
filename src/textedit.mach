@@ -22,7 +22,7 @@ use std.types.string.str_len;
 
 use std.allocator.Allocator;
 
-use sj: std.data.json;
+use sj: json.value;
 
 use mls.json;
 use mls.positions;
@@ -89,12 +89,12 @@ pub fun apply_changes(alloc: *Allocator, base: str, changes: *sj.Value, n: usize
 # piece: the replacement text
 # ret:   owned patched text, or nil when the range does not resolve
 pub fun splice(alloc: *Allocator, from: str, range: *sj.Value, piece: str) str {
-    val so: opt[usize] = offset_of_position(from, json.member(range, "start"));
-    val eo: opt[usize] = offset_of_position(from, json.member(range, "end"));
-    if (sel so.none) { ret nil; }
-    if (sel eo.none) { ret nil; }
-    var lo: usize = so.some;
-    var hi: usize = eo.some;
+    val opt_offset_of_position:      opt[usize] = offset_of_position(from, json.member(range, "start"));
+    val opt_offset_of_position_from: opt[usize] = offset_of_position(from, json.member(range, "end"));
+    if (sel opt_offset_of_position.none)      { ret nil; }
+    if (sel opt_offset_of_position_from.none) { ret nil; }
+    var lo: usize = opt_offset_of_position.some;
+    var hi: usize = opt_offset_of_position_from.some;
     if (hi < lo) { hi = lo; }
 
     var b: json.Buf = json.buf_init(alloc);

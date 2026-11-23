@@ -18,19 +18,20 @@ use std.types.result.res;
 use std.allocator.Allocator;
 use std.allocator.page;
 
-use mach.lang.fe.ast;
-use adecl: mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.id;
-use mach.lang.fe.ast.module;
-use mach.lang.fe.sema;
-use mach.lang.fe.token;
-use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
-use mach.lang.type;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.front.ast;
+use adecl: mach.front.ast.decl;
+use mach.front.ast.id;
+use mach.front.ast.module;
+use sema_product: mach.front.sema.product;
+use sess:         mach.session;
+use lmodule:      mach.session.module;
+use mach.type;
+use type_kind: mach.type.kind;
 use mls.positions;
 
-use mach.lang.fail;
+use mach.base.fail;
 use std.types.error.err;
 
 # the declaration site a record / union / tag TypeId nominally refers to -
@@ -45,7 +46,7 @@ use std.types.error.err;
 pub rec Nominal {
     file: src.FileId;
     name: intern.StrId;
-    kind: type.TypeKind;
+    kind: type_kind.TypeKind;
 }
 
 # the semantic type of expression `eid` in `sr`, or TYPE_NIL when `sr`
@@ -55,10 +56,10 @@ pub rec Nominal {
 # sr:  the module's / buffer's SemaResult, or nil
 # eid: the expression id to type
 # ret: the expression's TypeId, or TYPE_NIL when unavailable
-pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
-    if (sr == nil || sr.expr_type == nil) { ret type.TYPE_NIL; }
-    if (eid::u32 >= sr.expr_count)        { ret type.TYPE_NIL; }
-    ret sr.expr_type[eid];
+pub fun type_of(sr: *sema_product.SemaResult, eid: id.ExprId) type_kind.TypeId {
+    if (sr == nil || sr.expr_type == nil)    { ret type_kind.TYPE_NIL; }
+    if (id.expr_index(eid) >= sr.expr_count) { ret type_kind.TYPE_NIL; }
+    ret sr.expr_type[id.expr_index(eid)];
 }
 
 # the declared (or inferred) type of decl `did` in `sr`, or
@@ -68,10 +69,10 @@ pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
 # sr:  the module's / buffer's SemaResult, or nil
 # did: the declaration id to type
 # ret: the declaration's TypeId, or TYPE_NIL when unavailable
-pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
-    if (sr == nil || sr.decl_type == nil) { ret type.TYPE_NIL; }
-    if (did::u32 >= sr.decl_count)        { ret type.TYPE_NIL; }
-    ret sr.decl_type[did];
+pub fun decl_type_of(sr: *sema_product.SemaResult, did: id.DeclId) type_kind.TypeId {
+    if (sr == nil || sr.decl_type == nil)    { ret type_kind.TYPE_NIL; }
+    if (id.decl_index(did) >= sr.decl_count) { ret type_kind.TYPE_NIL; }
+    ret sr.decl_type[id.decl_index(did)];
 }
 
 # the semantic type an Ast type node denotes, or TYPE_NIL when `sr`
@@ -83,10 +84,10 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
 # sr:  the module's / buffer's SemaResult, or nil
 # tid: the Ast type id to resolve
 # ret: the written type's TypeId, or TYPE_NIL when unavailable
-pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
-    if (sr == nil || sr.type_resolved_ty == nil) { ret type.TYPE_NIL; }
-    if (tid::u32 >= sr.type_count)               { ret type.TYPE_NIL; }
-    ret sr.type_resolved_ty[tid];
+pub fun type_ref_of(sr: *sema_product.SemaResult, tid: id.TypeId) type_kind.TypeId {
+    if (sr == nil || sr.type_resolved_ty == nil) { ret type_kind.TYPE_NIL; }
+    if (id.type_index(tid) >= sr.type_count)     { ret type_kind.TYPE_NIL; }
+    ret sr.type_resolved_ty[id.type_index(tid)];
 }
 
 # the declaration site a record / union TypeId nominally refers to,
@@ -99,27 +100,27 @@ pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
 # ti:  the session's type interner
 # tid: the TypeId to resolve
 # ret: some(Nominal) for a nominal / instance type, none otherwise
-pub fun nominal_of(ti: *type.TypeInterner, tid: type.TypeId) opt[Nominal] {
-    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret opt[Nominal].none{}; }
-    val t_opt: opt[*type.Type] = type.get(ti, tid);
-    if (sel t_opt.none) { ret opt[Nominal].none{}; }
-    val t: *type.Type = t_opt.some;
+pub fun nominal_of(ti: *type.TypeInterner, tid: type_kind.TypeId) opt[Nominal] {
+    if (type_kind.is_nil(tid) || type_kind.is_error(tid)) { ret opt[Nominal].none{}; }
+    val opt_tid_entry: opt[*type.Type] = type.get(ti, tid);
+    if (sel opt_tid_entry.none) { ret opt[Nominal].none{}; }
+    val t: *type.Type = opt_tid_entry.some;
 
     # peel a single pointer level: a field access through `*T` resolves to T's decl.
-    if (t.kind == type.TYPE_POINTER) {
+    if (t.kind == type_kind.TYPE_POINTER) {
         ret nominal_of(ti, t.data.pointer.base);
     }
-    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_TAG) {
+    if (t.kind == type_kind.TYPE_REC || t.kind == type_kind.TYPE_UNI || t.kind == type_kind.TYPE_TAG) {
         var n: Nominal;
         n.file = t.data.nominal.owner.file;
         n.name = t.data.nominal.name;
         n.kind = t.kind;
         ret opt[Nominal].some{n};
     }
-    if (t.kind == type.TYPE_INSTANCE) {
-        val inner: opt[Nominal] = nominal_of(ti, t.data.instance.nominal);
-        if (sel inner.none) { ret inner; }
-        var n: Nominal = inner.some;
+    if (t.kind == type_kind.TYPE_INSTANCE) {
+        val opt_inner: opt[Nominal] = nominal_of(ti, t.data.instance.nominal);
+        if (sel opt_inner.none) { ret opt_inner; }
+        var n: Nominal = opt_inner.some;
         n.kind = t.kind;
         ret opt[Nominal].some{n};
     }
@@ -138,136 +139,83 @@ pub fun nominal_of(ti: *type.TypeInterner, tid: type.TypeId) opt[Nominal] {
 # ret:  the DeclId, or none
 pub fun nominal_decl(a: *ast.Ast, text: positions.Text, itn: *intern.Interner, n: Nominal) opt[id.DeclId] {
     if (a == nil || itn == nil) { ret opt[id.DeclId].none{}; }
-    val want: opt[str] = intern.lookup(itn, n.name);
-    if (sel want.none) { ret opt[id.DeclId].none{}; }
-    val mo: opt[*module.Module] = ast.get_module(a, a.root_module);
-    if (sel mo.none) { ret opt[id.DeclId].none{}; }
-    val m: *module.Module = mo.some;
+    val opt_want: opt[str] = intern.get(itn, n.name);
+    if (sel opt_want.none) { ret opt[id.DeclId].none{}; }
+    val opt_module: opt[*module.Module] = ast.get_module(a, a.root_module);
+    if (sel opt_module.none) { ret opt[id.DeclId].none{}; }
+    val m: *module.Module = opt_module.some;
     var i: u32            = 0;
     for (i < m.decls_len) {
-        val did:   id.DeclId        = a.decl_ids[m.decls_start + i];
-        val d_opt: opt[*adecl.Decl] = ast.get_decl(a, did);
-        if (sel d_opt.some) {
-            val d:     *adecl.Decl = d_opt.some;
-            var name:  token.Span;
+        val did:      id.DeclId        = a.decl_ids.data[m.decls_start + i];
+        val opt_decl: opt[*adecl.Decl] = ast.get_decl(a, did);
+        if (sel opt_decl.some) {
+            val d:     *adecl.Decl = opt_decl.some;
+            var name:  src.Span;
             var named: bool        = true;
-            if (d.kind == adecl.DECL_KIND_REC)                         { name = d.data.rec_.name; }
-            or (d.kind == adecl.DECL_KIND_UNI)                         { name = d.data.uni_.name; }
-            or (d.kind == adecl.DECL_KIND_TAG)                         { name = d.data.tag_.name; }
-            or                                                         { named = false; }
-            if (named && positions.span_equals(text, name, want.some)) { ret opt[id.DeclId].some{did}; }
+            if (d.kind == adecl.DECL_KIND_REC)                             { name = d.data.rec_.name; }
+            or (d.kind == adecl.DECL_KIND_UNI)                             { name = d.data.uni_.name; }
+            or (d.kind == adecl.DECL_KIND_TAG)                             { name = d.data.tag_.name; }
+            or                                                             { named = false; }
+            if (named && positions.span_equals(text, name, opt_want.some)) { ret opt[id.DeclId].some{did}; }
         }
         i = i + 1;
     }
     ret opt[id.DeclId].none{};
 }
 
-test nominal_of_peels_a_pointer_to_the_pointee_record {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-
-    val reco: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 4::intern.StrId, t_owner(2), type.TYPE_REC);
-    if (sel reco.err) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val rec:  type.TypeId                 = reco.ok;
-    val ptro: res[type.TypeId, fail.Fail] = type.intern_pointer(?ti, rec);
-    if (sel ptro.err) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val ptr: type.TypeId = ptro.ok;
-
-    val no:   opt[Nominal] = nominal_of(?ti, ptr);
-    var fail: bool         = false;
-    if (sel no.some) {
-        val n: Nominal = no.some;
-        if (n.file != 2::src.FileId)   { fail = true; }
-        if (n.name != 4::intern.StrId) { fail = true; }
-        if (n.kind != type.TYPE_REC)   { fail = true; }
-    }
-    or { fail = true; }
-
-    type.dnit(?ti);
-    if (fail) { ret 1; }
-    ret 0;
+# whether `tid` resolves to the nominal declared as `name` in `file`, as `kind`
+#[testing]
+fun nominal_is(ti: *type.TypeInterner, tid: type_kind.TypeId, file: u32, name: u32, kind: type_kind.TypeKind) bool {
+    val opt_nominal_of: opt[Nominal] = nominal_of(ti, tid);
+    if (sel opt_nominal_of.none) { ret false; }
+    val n: Nominal = opt_nominal_of.some;
+    ret src.file_same(n.file, src.file_id(file)) && intern.str_same(n.name, intern.str_id(name)) && n.kind == kind;
 }
 
-test nominal_of_maps_a_generic_instance_to_its_template {
+# a pointer is peeled to its pointee record, a generic instance maps to its
+# template's declaration keeping the instance kind, and a primitive, nil or
+# error type is not nominal
+test nominal_of_resolves_pointers_and_instances_to_their_declaration {
     var pa: Allocator;
     page.make(?pa);
     var ti: type.TypeInterner;
     if (!type_init_ok(?ti, ?pa)) { ret 1; }
+    fin { type.dnit(?ti); }
 
-    val i32o: opt[type.TypeId] = type.prim(?ti, type.TYPE_I32);
-    if (sel i32o.none) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val i32t: type.TypeId = i32o.some;
-    var args: [1]type.TypeId;
-    args[0] = i32t;
-    val reco: res[type.TypeId, fail.Fail] = type.intern_nominal(?ti, 8::intern.StrId, t_owner(5), type.TYPE_REC);
-    if (sel reco.err) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val insto: res[type.TypeId, fail.Fail] = type.intern_instance(?ti, reco.ok, ?args[0], 1);
-    if (sel insto.err) {
-        type.dnit(?ti);
-        ret 1;
-    }
-    val inst: type.TypeId = insto.ok;
+    val res_intern_nominal: res[type_kind.TypeId, fail.Fail] = type.intern_nominal(?ti, intern.str_id(4), t_owner(2), type_kind.TYPE_REC);
+    if (sel res_intern_nominal.err) { ret 2; }
+    val rec:                type_kind.TypeId                 = res_intern_nominal.ok;
+    val res_intern_pointer: res[type_kind.TypeId, fail.Fail] = type.intern_pointer(?ti, rec);
+    if (sel res_intern_pointer.err)                                        { ret 3; }
+    if (!nominal_is(?ti, res_intern_pointer.ok, 2, 4, type_kind.TYPE_REC)) { ret 4; }
 
-    val no:   opt[Nominal] = nominal_of(?ti, inst);
-    var fail: bool         = false;
-    if (sel no.some) {
-        val n: Nominal = no.some;
-        if (n.file != 5::src.FileId)      { fail = true; }
-        if (n.name != 8::intern.StrId)    { fail = true; }
-        if (n.kind != type.TYPE_INSTANCE) { fail = true; }
-    }
-    or { fail = true; }
+    val opt_prim: opt[type_kind.TypeId] = type.prim(?ti, type_kind.TYPE_I32);
+    if (sel opt_prim.none) { ret 5; }
+    var args: [1]type_kind.TypeId;
+    args[0] = opt_prim.some;
+    val res_intern_instance: res[type_kind.TypeId, fail.Fail] = type.intern_instance(?ti, rec, ?args[0], 1);
+    if (sel res_intern_instance.err)                                             { ret 6; }
+    if (!nominal_is(?ti, res_intern_instance.ok, 2, 4, type_kind.TYPE_INSTANCE)) { ret 7; }
 
-    type.dnit(?ti);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test nominal_of_returns_none_for_a_type_that_is_not_nominal {
-    var pa: Allocator;
-    page.make(?pa);
-    var ti: type.TypeInterner;
-    if (!type_init_ok(?ti, ?pa)) { ret 1; }
-    var fail: bool             = false;
-    val i32o: opt[type.TypeId] = type.prim(?ti, type.TYPE_I32);
-    if (sel i32o.some) {
-        val prim_o: opt[Nominal] = nominal_of(?ti, i32o.some);
-        if (sel prim_o.some) { fail = true; }
-    }
-    or { fail = true; }
-    val nil_o: opt[Nominal] = nominal_of(?ti, type.TYPE_NIL);
-    val err_o: opt[Nominal] = nominal_of(?ti, type.TYPE_ERROR);
-    if (sel nil_o.some) { fail = true; }
-    if (sel err_o.some) { fail = true; }
-    type.dnit(?ti);
-    if (fail) { ret 1; }
+    val opt_not_nominal: opt[Nominal] = nominal_of(?ti, opt_prim.some);
+    if (sel opt_not_nominal.some) { ret 8; }
+    val opt_nil: opt[Nominal] = nominal_of(?ti, type_kind.TYPE_NIL);
+    if (sel opt_nil.some) { ret 9; }
+    val opt_error: opt[Nominal] = nominal_of(?ti, type_kind.TYPE_ERROR);
+    if (sel opt_error.some) { ret 10; }
     ret 0;
 }
 
 #[testing]
 fun type_init_ok(ti: *type.TypeInterner, pa: *Allocator) bool {
-    val r: err[fail.Fail] = type.init(ti, pa);
-    ret sel r.ok;
+    val err_type_made: err[fail.Fail] = type.init(ti, pa);
+    ret sel err_type_made.ok;
 }
 
 #[testing]
 fun t_owner(file: u32) type.TypeOwner {
     var o: type.TypeOwner;
-    o.module = file;
-    o.file   = file::src.FileId;
+    o.module = lmodule.stable_id(file);
+    o.file   = src.file_id(file);
     ret o;
 }

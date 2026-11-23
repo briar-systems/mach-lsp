@@ -51,13 +51,13 @@ use std.types.string.str_equals;
 
 use std.allocator.Allocator;
 
-use std.process.env;
 use std.process.exec;
 use std.sync.atomic;
 use std.sync.mutex;
 use std.sync.thread;
 use std.system.os;
 
+use sj: json.value;
 use mls.json;
 use mls.mirror;
 use mls.pending;
@@ -65,7 +65,6 @@ use mls.settings;
 use mls.sideband;
 use mls.trace;
 use mls.transport;
-use sj: std.data.json;
 
 # the argument that selects the worker role
 #
@@ -213,12 +212,12 @@ pub fun run(alloc: *Allocator, self: str) i64 {
 
         var child: exec.Child;
         child.pid = pid;
-        val wr: res[exec.ExitStatus, exec.Error] = exec.wait(child);
-        if (sel wr.err) {
+        val res_wait: res[exec.ExitStatus, exec.Error] = exec.wait(child);
+        if (sel res_wait.err) {
             code = 1;
             brk;
         }
-        var status: exec.ExitStatus = wr.ok;
+        var status: exec.ExitStatus = res_wait.ok;
 
         if (!exec.signaled(status)) {
             # a clean or self-reported exit is the worker's own decision - a
@@ -331,7 +330,7 @@ fun start_worker(self: str, to: *usize, from: *usize) i64 {
     argv[1] = WORKER_FLAG::*u8;
     argv[2] = nil;
 
-    # the worker inherits this process's environment. Handing it nil gives the
+    # the worker inherits this process's environment. Handing it an empty list gives the
     # child an EMPTY environment, which silently drops everything a tool reads
     # from it - PATH, locale, MLS_TRACE - and leaves the difference invisible
     # until something that depends on one of them stops working.
@@ -339,7 +338,7 @@ fun start_worker(self: str, to: *usize, from: *usize) i64 {
     # the worker's stderr is inherited, which std spells INVALID_HANDLE. passing
     # stderr asks for dup3(2, 2), which aarch64 and riscv64 reject, and the child
     # then dies before exec
-    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], env.environ(),
+    val pid: i64 = os.spawn_redirected(self::*u8, ?argv[0], os.Environment.inherit{},
         child_in, child_out, os.INVALID_HANDLE);
     os.close(child_in);
     os.close(child_out);
@@ -445,8 +444,8 @@ fun apply_settings(r: *Relay, body: str, len: usize) {
             settings.dnit(?st, r.alloc);
         }
         or (json.text_equals(method, "$/setTrace", r.alloc)) {
-            val lo: opt[u8] = settings.lsp_level(json.member(params, "value"), r.alloc);
-            if (sel lo.some) { trace.set_level(lo.some); }
+            val opt_lsp_level: opt[u8] = settings.lsp_level(json.member(params, "value"), r.alloc);
+            if (sel opt_lsp_level.some) { trace.set_level(opt_lsp_level.some); }
         }
     }
     json.release(?rd);

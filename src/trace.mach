@@ -232,9 +232,9 @@ pub fun frame(label: str, body: str, len: usize) {
 # ---
 # ret: the monotonic clock reading in nanoseconds
 pub fun now_ns() i64 {
-    val c: chrono.InstantClock = chrono.instant();
-    if (sel c.err) { ret 0; }
-    ret c.ok.sec * 1000000000 + c.ok.nsec;
+    val res_instant: chrono.InstantClock = chrono.instant();
+    if (sel res_instant.err) { ret 0; }
+    ret res_instant.ok.sec * 1000000000 + res_instant.ok.nsec;
 }
 
 # writer sink appending to the trace destination
@@ -258,8 +258,8 @@ pub fun logf(fmt: str, va: ...) {
         mutex.lock(?MU);
         if (!settled()) {
             var e: writer.Writer;
-            e.ctx     = nil;
-            e.f_write = early_sink;
+            e.ctx      = nil;
+            e.fn_write = early_sink;
             fmtstr.vformat(?e, fmt, va...);
             keep("\n"::*u8, 1);
             mutex.unlock(?MU);
@@ -269,8 +269,8 @@ pub fun logf(fmt: str, va: ...) {
     }
     if (!enabled()) { ret; }
     var w: writer.Writer;
-    w.ctx     = nil;
-    w.f_write = trace_sink;
+    w.ctx      = nil;
+    w.fn_write = trace_sink;
     fmtstr.vformat(?w, fmt, va...);
     os.write(LOG_FD, "\n"::*u8, 1);
 }

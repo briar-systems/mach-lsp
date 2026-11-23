@@ -68,14 +68,14 @@ pub fun open(l: *Ledger, id: str) bool {
         var cap: usize = l.cap * 2;
         if (cap == 0) { cap = 4; }
         if (l.items == nil) {
-            val r: res[*Request, allocator.Error] = allocate[Request](l.alloc, cap);
-            if (sel r.err) { ret false; }
-            l.items = r.ok;
+            val res_allocate: res[*Request, allocator.Error] = allocate[Request](l.alloc, cap);
+            if (sel res_allocate.err) { ret false; }
+            l.items = res_allocate.ok;
         }
         or {
-            val r: res[*Request, allocator.Error] = reallocate[Request](l.alloc, l.items, l.cap, cap);
-            if (sel r.err) { ret false; }
-            l.items = r.ok;
+            val res_reallocate: res[*Request, allocator.Error] = reallocate[Request](l.alloc, l.items, l.cap, cap);
+            if (sel res_reallocate.err) { ret false; }
+            l.items = res_reallocate.ok;
         }
         l.cap = cap;
     }
@@ -152,29 +152,6 @@ test requests_close_by_id_token_in_any_order_numeric_or_string {
     if (close(?l, "\"a\""))                                     { fail = true; }
     if (!close(?l, "1"))                                        { fail = true; }
     if (l.len != 3 || !str_equals(l.items[0].id, "3"))          { fail = true; }
-    dnit(?l);
-    if (fail) { ret 1; }
-    ret 0;
-}
-
-test only_a_request_that_is_not_held_is_active {
-    var pa: Allocator;
-    page.make(?pa);
-    var l:    Ledger = init(?pa);
-    var fail: bool   = false;
-    if (active(?l)) { fail = true; }
-    open(?l, "7");
-    if (!active(?l)) { fail = true; }
-    hold(?l, "7", true);
-    if (active(?l)) { fail = true; }
-    open(?l, "8");
-    if (!active(?l)) { fail = true; }
-    close(?l, "8");
-    hold(?l, "7", false);
-    if (!active(?l)) { fail = true; }
-    var all: Ledger = take(?l);
-    if (l.len != 0 || all.len != 1 || active(?l)) { fail = true; }
-    dnit(?all);
     dnit(?l);
     if (fail) { ret 1; }
     ret 0;

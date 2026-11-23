@@ -24,11 +24,11 @@ use std.allocator.reallocate;
 
 use strutil: std.text.string;
 
-use mach.lang.editor;
-use src: mach.lang.source;
+use src: mach.base.source;
+use mach.editor;
 
-use mach.lang.build.outcome;
-use mach.lang.fail;
+use lalloc: mach.base.alloc;
+use mach.base.fail;
 use std.allocator;
 
 # one tracked open document
@@ -111,34 +111,34 @@ pub fun open(st: *Store, uri: str, path: str, text: str, version: i64) res[*Docu
         ret replace(st, existing, path, text, version);
     }
 
-    val slot_r: res[*Document, str] = ensure_slot(st);
-    if (sel slot_r.err) { ret slot_r; }
-    val d: *Document = slot_r.ok;
+    val res_slot: res[*Document, str] = ensure_slot(st);
+    if (sel res_slot.err) { ret res_slot; }
+    val d: *Document = res_slot.ok;
 
-    val dup_uri: res[str, allocator.Error] = strutil.str_dup(st.alloc, uri);
-    if (sel dup_uri.err) { ret res[*Document, str].err{"documents: failed to copy uri"}; }
-    val dup_path: res[str, allocator.Error] = strutil.str_dup(st.alloc, path);
-    if (sel dup_path.err) {
-        strutil.str_free(st.alloc, dup_uri.ok);
+    val res_dup_uri: res[str, allocator.Error] = strutil.str_dup(st.alloc, uri);
+    if (sel res_dup_uri.err) { ret res[*Document, str].err{"documents: failed to copy uri"}; }
+    val res_dup_path: res[str, allocator.Error] = strutil.str_dup(st.alloc, path);
+    if (sel res_dup_path.err) {
+        strutil.str_free(st.alloc, res_dup_uri.ok);
         ret res[*Document, str].err{"documents: failed to copy path"};
     }
-    val dup_text: res[str, allocator.Error] = strutil.str_dup(st.alloc, text);
-    if (sel dup_text.err) {
-        strutil.str_free(st.alloc, dup_uri.ok);
-        strutil.str_free(st.alloc, dup_path.ok);
+    val res_dup_text: res[str, allocator.Error] = strutil.str_dup(st.alloc, text);
+    if (sel res_dup_text.err) {
+        strutil.str_free(st.alloc, res_dup_uri.ok);
+        strutil.str_free(st.alloc, res_dup_path.ok);
         ret res[*Document, str].err{"documents: failed to copy text"};
     }
-    val fr: res[src.FileId, fail.Fail] = editor.open(st.es, path, text);
-    if (sel fr.err) {
-        strutil.str_free(st.alloc, dup_uri.ok);
-        strutil.str_free(st.alloc, dup_path.ok);
-        strutil.str_free(st.alloc, dup_text.ok);
-        ret res[*Document, str].err{fail.describe(fr.err)};
+    val res_editor_made: res[src.FileId, fail.Fail] = editor.open(st.es, path, text);
+    if (sel res_editor_made.err) {
+        strutil.str_free(st.alloc, res_dup_uri.ok);
+        strutil.str_free(st.alloc, res_dup_path.ok);
+        strutil.str_free(st.alloc, res_dup_text.ok);
+        ret res[*Document, str].err{fail.describe(res_editor_made.err)};
     }
-    val fid: src.FileId = fr.ok;
-    d.uri       = dup_uri.ok;
-    d.path      = dup_path.ok;
-    d.text      = dup_text.ok;
+    val fid: src.FileId = res_editor_made.ok;
+    d.uri       = res_dup_uri.ok;
+    d.path      = res_dup_path.ok;
+    d.text      = res_dup_text.ok;
     d.file_id   = fid;
     st.revision = st.revision + 1;
     d.revision  = st.revision;
@@ -159,15 +159,15 @@ pub fun change(st: *Store, uri: str, text: str, version: i64) res[*Document, str
     if (version >= 0 && d.version >= 0 && version <= d.version) {
         ret res[*Document, str].err{"documents: stale document version"};
     }
-    val dup: res[str, allocator.Error] = strutil.str_dup(st.alloc, text);
-    if (sel dup.err) { ret res[*Document, str].err{"documents: failed to copy text"}; }
-    val ur: res[bool, fail.Fail] = editor.update(st.es, d.file_id, text);
-    if (sel ur.err) {
-        strutil.str_free(st.alloc, dup.ok);
-        ret res[*Document, str].err{fail.describe(ur.err)};
+    val res_dup: res[str, allocator.Error] = strutil.str_dup(st.alloc, text);
+    if (sel res_dup.err) { ret res[*Document, str].err{"documents: failed to copy text"}; }
+    val res_update: res[bool, fail.Fail] = editor.update(st.es, d.file_id, text);
+    if (sel res_update.err) {
+        strutil.str_free(st.alloc, res_dup.ok);
+        ret res[*Document, str].err{fail.describe(res_update.err)};
     }
     strutil.str_free(st.alloc, d.text);
-    d.text      = dup.ok;
+    d.text      = res_dup.ok;
     st.revision = st.revision + 1;
     d.revision  = st.revision;
     d.version   = version;
@@ -177,23 +177,23 @@ pub fun change(st: *Store, uri: str, text: str, version: i64) res[*Document, str
 # replace a reopened document's owned path and text after updating the fallback
 # editor buffer
 fun replace(st: *Store, d: *Document, path: str, text: str, version: i64) res[*Document, str] {
-    val dp: res[str, allocator.Error] = strutil.str_dup(st.alloc, path);
-    if (sel dp.err) { ret res[*Document, str].err{"documents: failed to copy path"}; }
-    val dt: res[str, allocator.Error] = strutil.str_dup(st.alloc, text);
-    if (sel dt.err) {
-        strutil.str_free(st.alloc, dp.ok);
+    val res_str_dup: res[str, allocator.Error] = strutil.str_dup(st.alloc, path);
+    if (sel res_str_dup.err) { ret res[*Document, str].err{"documents: failed to copy path"}; }
+    val res_str_dup_alloc: res[str, allocator.Error] = strutil.str_dup(st.alloc, text);
+    if (sel res_str_dup_alloc.err) {
+        strutil.str_free(st.alloc, res_str_dup.ok);
         ret res[*Document, str].err{"documents: failed to copy text"};
     }
-    val ur: res[bool, fail.Fail] = editor.update(st.es, d.file_id, text);
-    if (sel ur.err) {
-        strutil.str_free(st.alloc, dp.ok);
-        strutil.str_free(st.alloc, dt.ok);
-        ret res[*Document, str].err{fail.describe(ur.err)};
+    val res_update: res[bool, fail.Fail] = editor.update(st.es, d.file_id, text);
+    if (sel res_update.err) {
+        strutil.str_free(st.alloc, res_str_dup.ok);
+        strutil.str_free(st.alloc, res_str_dup_alloc.ok);
+        ret res[*Document, str].err{fail.describe(res_update.err)};
     }
     strutil.str_free(st.alloc, d.path);
     strutil.str_free(st.alloc, d.text);
-    d.path      = dp.ok;
-    d.text      = dt.ok;
+    d.path      = res_str_dup.ok;
+    d.text      = res_str_dup_alloc.ok;
     st.revision = st.revision + 1;
     d.revision  = st.revision;
     d.version   = version;
@@ -210,8 +210,8 @@ fun replace(st: *Store, d: *Document, path: str, text: str, version: i64) res[*D
 # ret: the buffer's source file, or nil
 pub fun live_file(st: *Store, d: *Document) *src.SourceFile {
     if (st == nil || d == nil) { ret nil; }
-    val fo: opt[*src.SourceFile] = src.get(?st.es.s.sources, d.file_id);
-    if (sel fo.some) { ret fo.some; }
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(st.es.s.sources, d.file_id);
+    if (sel opt_sources_entry.some) { ret opt_sources_entry.some; }
     ret nil;
 }
 
@@ -300,14 +300,14 @@ fun ensure_slot(st: *Store) res[*Document, str] {
     var new_len: usize = st.len * 2;
     if (new_len == 0) { new_len = 8; }
     if (st.docs == nil) {
-        val r: res[*Document, allocator.Error] = allocate[Document](st.alloc, new_len);
-        if (sel r.err) { ret res[*Document, str].err{outcome.alloc_text(r.err)}; }
-        st.docs = r.ok;
+        val res_allocate: res[*Document, allocator.Error] = allocate[Document](st.alloc, new_len);
+        if (sel res_allocate.err) { ret res[*Document, str].err{lalloc.text(res_allocate.err)}; }
+        st.docs = res_allocate.ok;
     }
     or {
-        val r: res[*Document, allocator.Error] = reallocate[Document](st.alloc, st.docs, st.len, new_len);
-        if (sel r.err) { ret res[*Document, str].err{outcome.alloc_text(r.err)}; }
-        st.docs = r.ok;
+        val res_reallocate: res[*Document, allocator.Error] = reallocate[Document](st.alloc, st.docs, st.len, new_len);
+        if (sel res_reallocate.err) { ret res[*Document, str].err{lalloc.text(res_reallocate.err)}; }
+        st.docs = res_reallocate.ok;
     }
 
     var z: usize = st.len;
@@ -316,7 +316,7 @@ fun ensure_slot(st: *Store) res[*Document, str] {
         nb.uri      = nil;
         nb.path     = nil;
         nb.text     = nil;
-        nb.file_id  = 0::src.FileId;
+        nb.file_id  = src.file_id(0);
         nb.revision = 0;
         nb.version  = 0 - 1;
         nb.in_use   = false;

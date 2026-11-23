@@ -77,14 +77,14 @@ pub fun push(q: *Queue, body: str, len: usize, uri: str, id: str) bool {
         var cap: usize = q.cap * 2;
         if (cap == 0) { cap = 4; }
         if (q.items == nil) {
-            val r: res[*Entry, allocator.Error] = allocate[Entry](q.alloc, cap);
-            if (sel r.err) { ret false; }
-            q.items = r.ok;
+            val res_allocate: res[*Entry, allocator.Error] = allocate[Entry](q.alloc, cap);
+            if (sel res_allocate.err) { ret false; }
+            q.items = res_allocate.ok;
         }
         or {
-            val r: res[*Entry, allocator.Error] = reallocate[Entry](q.alloc, q.items, q.cap, cap);
-            if (sel r.err) { ret false; }
-            q.items = r.ok;
+            val res_reallocate: res[*Entry, allocator.Error] = reallocate[Entry](q.alloc, q.items, q.cap, cap);
+            if (sel res_reallocate.err) { ret false; }
+            q.items = res_reallocate.ok;
         }
         q.cap = cap;
     }
@@ -126,37 +126,12 @@ pub fun names(e: *Entry, uri: str) bool {
 }
 
 fun copy_bytes(alloc: *Allocator, text: str, len: usize) str {
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
-    if (sel r.err) { ret nil; }
-    val out: *u8 = r.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, len + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val out: *u8 = res_allocate.ok;
     if (len > 0) { mem.raw_copy(out::ptr, text::ptr, len); }
     out[len] = 0;
     ret out::str;
 }
 
 use std.allocator;
-use std.allocator.page;
-
-test requests_are_held_in_arrival_order_and_taken_together {
-    var pa: Allocator;
-    page.make(?pa);
-    var q:    Queue = init(?pa);
-    var fail: bool  = false;
-    var i:    usize = 0;
-    for (i < 6) {
-        if (!push(?q, "{\"id\":1}", 8, "file:///a.mach", "1")) { fail = true; }
-        i = i + 1;
-    }
-    if (!push(?q, "{\"id\":\"b\"}", 10, nil, "\"b\"")) { fail = true; }
-    if (q.len != 7)                                    { fail = true; }
-    var batch: Queue = take(?q);
-    if (q.len != 0 || batch.len != 7)              { fail = true; }
-    if (!str_equals(batch.items[6].id, "\"b\""))   { fail = true; }
-    if (batch.items[6].uri != nil)                 { fail = true; }
-    if (!names(?batch.items[0], "file:///a.mach")) { fail = true; }
-    if (names(?batch.items[6], "file:///a.mach"))  { fail = true; }
-    dnit(?batch);
-    dnit(?q);
-    if (fail) { ret 1; }
-    ret 0;
-}

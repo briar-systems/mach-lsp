@@ -1,11 +1,10 @@
 # retained per-root compiler snapshots for cross-module language features
 #
 # Each project root owns a separately allocated stable Session and at most one
-# live compiler Project. Open documents retain their own canonical path, text,
-# and revision; their text is mirrored into every governing Session as a
-# filesystem-path overlay. A snapshot is rebuilt through analyze_project with
-# all open source files as compiler-owned extra roots, so imports, comptime
-# context, resolve, sema, and diagnostics share the build's exact semantics.
+# live editor project snapshot. Open documents retain their own canonical path,
+# text, and revision; a snapshot is opened through editor.project_init with every
+# governing buffer read in place of its file, so imports, comptime context,
+# resolve, sema, and diagnostics share `mach check`'s exact semantics.
 #
 # ModuleId, FileId, interner, type, and query identities never cross Root
 # boundaries. Documents inside an already-loaded ancestor dependency graph route
@@ -20,6 +19,10 @@
 # a Session outlives the message that took it. A root with no snapshot at all
 # has nothing to serve, so its FIRST build still runs inline.
 
+use lalloc:  mach.base.alloc;
+use lfail:   mach.base.fail;
+use lsrc:    mach.base.source;
+use lmodule: mach.session.module;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -30,37 +33,41 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.string.str_starts_with;
 
 use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
 
-use chrono: std.chrono.time;
-use std.data.toml;
-use fs:      std.filesystem;
-use strutil: std.text.string;
-use pathlib: std.types.path;
+use chrono:      std.chrono.time;
+use fs:          std.filesystem;
+use strutil:     std.text.string;
+use pathlib:     std.types.path;
+use toml_error:  toml.error;
+use toml_lookup: toml.lookup;
+use toml_parse:  toml.parse;
+use toml_tree:   toml.tree;
+use toml_value:  toml.value;
 
 use std.allocator.page;
 use mem: std.memory;
 
-use mach.lang.build.outcome;
-use mach.lang.build.request;
-use mach.lang.driver;
-use dproject: mach.lang.driver.project;
-use mach.lang.fe.ast;
-use adecl: mach.lang.fe.ast.decl;
-use mach.lang.fe.ast.id;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.sema;
-use mach.lang.intern;
-use mach.lang.manifest;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
-use mach.lang.type;
-use std.collections.vector;
+use diag: mach.base.diagnostic;
+use mach.base.intern;
+use src:          mach.base.source;
+use mach_compile: mach.compile;
+use dfront:       mach.compile.frontend;
+use dproject:     mach.compile.project;
+use mach.editor;
+use mach.front.ast;
+use adecl: mach.front.ast.decl;
+use mach.front.ast.id;
+use rslv:         mach.front.resolve;
+use sema_product: mach.front.sema.product;
+use report_phase: mach.report.phase;
+use sess:         mach.session;
+use mach.type;
+use type_kind: mach.type.kind;
 
 use mls.build;
 use mls.documents;
@@ -75,8 +82,7 @@ use mls.transport;
 use mtypes: mls.types;
 use mls.uris;
 
-use mach.lang.fail;
-use mach.lang.fe.token;
+use mach.base.fail;
 use std.allocator;
 use io_error: std.io.error;
 
@@ -116,18 +122,20 @@ rec SourceFingerprint {
 # one project root and its compiler-owned semantic snapshot
 # ---
 # path:              owned absolute directory containing mach.toml
-# loaded:            whether p is live
-# p:                 retained frontend Project, valid only while loaded
-# mod_paths:         canonical source path per ModuleId
-# mod_path_count:    number of mod_paths entries
+# loaded:            whether snap is live
+# snap:              retained editor project snapshot, valid only while loaded
+# mod_paths:         canonical source path per snapshot module index
+# mod_ids:           stable module identity per snapshot module index
+# mod_files:         source FileId per snapshot module index
+# mod_path_count:    number of mod_paths, mod_ids and mod_files entries
 # mod_fingerprints:  on-disk fingerprint per mod_paths entry
 # man_mtime:         last observed manifest mtime
 # lock_mtime:        last observed lockfile mtime
 # vendored:          whether the root belongs to an ancestor dependency tree
-# s:                 serving Session, owning every identity `p` refers to
+# s:                 serving Session, owning every identity `snap` refers to
 # spare:             the idle Session the next build runs into
-# spare_p:           a dead Project still held by `spare`, released by that build
-# spare_has_p:       whether spare_p is live
+# spare_snap:        a dead snapshot still held by `spare`, released by that build
+# spare_has_snap:    whether spare_snap is live
 # spare_cold:        the spare has never built, so its first build is a cold one
 # input_revision:    newest covered document revision mirrored into s
 # snapshot_revision: input revision captured by p
@@ -145,8 +153,10 @@ pub rec Root {
     path:               str;
     loaded:             bool;
     analyzed_once:      bool;
-    p:                  driver.Project;
+    snap:               editor.ProjectSnapshot;
     mod_paths:          *str;
+    mod_ids:            *lmodule.StableModuleId;
+    mod_files:          *src.FileId;
     mod_path_count:     u32;
     mod_fingerprints:   *SourceFingerprint;
     man_mtime:          i64;
@@ -154,8 +164,8 @@ pub rec Root {
     vendored:           bool;
     s:                  *sess.Session;
     spare:              *sess.Session;
-    spare_p:            driver.Project;
-    spare_has_p:        bool;
+    spare_snap:         editor.ProjectSnapshot;
+    spare_has_snap:     bool;
     spare_cold:         bool;
     input_revision:     u64;
     snapshot_revision:  u64;
@@ -245,14 +255,14 @@ pub fun start_builder(w: *Workspace, wake: build.WakeFn, ctx: ptr) bool {
 # root: governing compiler root
 # ret:  the session's type interner
 pub fun type_interner(w: *Workspace, root: *Root) *type.TypeInterner {
-    if (root != nil && root.s != nil) { ret ?root.s.types; }
-    ret ?w.s.types;
+    if (root != nil && root.s != nil) { ret root.s.types; }
+    ret w.s.types;
 }
 
 # the governing root's string interner, or the standalone fallback when root is nil
 pub fun interner(w: *Workspace, root: *Root) *intern.Interner {
-    if (root != nil && root.s != nil) { ret ?root.s.interner; }
-    ret ?w.s.interner;
+    if (root != nil && root.s != nil) { ret root.s.interner; }
+    ret w.s.interner;
 }
 
 # the workspace's current load epoch - a counter bumped on every
@@ -319,9 +329,9 @@ pub fun root_for(w: *Workspace, uri: str) *Root {
     if (existing != nil) {
         strutil.str_free(w.alloc, doc_root);
         maybe_reload(w, existing);
-        val rr: res[bool, str] = refresh_inputs(w, existing);
-        if (sel rr.err)       { ret nil; }
-        if (!existing.loaded) { ret nil; }
+        val res_refresh_inputs: res[bool, str] = refresh_inputs(w, existing);
+        if (sel res_refresh_inputs.err) { ret nil; }
+        if (!existing.loaded)           { ret nil; }
         ret existing;
     }
     val outer: *Root = ancestor_root(w, uri, doc_root, doc_root);
@@ -373,9 +383,9 @@ pub fun root_for_loaded(w: *Workspace, uri: str) *Root {
 # skipped: a loaded one was already offered by containing_root, and a failed one
 # is not retried here. nil when no ancestor claims the document
 fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
-    val par_r: res[pathlib.Path, allocator.Error] = pathlib.parent(w.alloc, dir);
-    if (sel par_r.err) { ret nil; }
-    val par: str = par_r.ok;
+    val res_parent: res[pathlib.Path, allocator.Error] = pathlib.parent(w.alloc, dir);
+    if (sel res_parent.err) { ret nil; }
+    val par: str = res_parent.ok;
     if (str_equals(par, dir)) {
         strutil.str_free(w.alloc, par);
         ret nil;
@@ -426,42 +436,42 @@ fun ancestor_root(w: *Workspace, uri: str, doc_root: str, dir: str) *Root {
 # or parse vendors nothing. `get_str` and `table_key` borrow out of the table, so
 # it is torn down at scope exit rather than at the last read
 fun vendors_enclosing(w: *Workspace, root_path: str, dir: str) bool {
-    val mp_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, root_path, "mach.toml");
-    if (sel mp_r.err) { ret false; }
-    val mp:     str                  = mp_r.ok;
-    val text_r: res[str, fs.FsError] = fs.read_string(w.alloc, mp);
+    val res_join: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, root_path, "mach.toml");
+    if (sel res_join.err) { ret false; }
+    val mp:       str                  = res_join.ok;
+    val res_text: res[str, fs.FsError] = fs.read_string(w.alloc, mp);
     strutil.str_free(w.alloc, mp);
-    if (sel text_r.err) { ret false; }
-    val text: str                             = text_r.ok;
-    val t_r:  res[toml.Table, toml.TomlError] = toml.parse(w.alloc, text);
+    if (sel res_text.err) { ret false; }
+    val text:      str                                         = res_text.ok;
+    val res_parse: res[toml_value.Table, toml_error.TomlError] = toml_parse.parse(w.alloc, text);
     strutil.str_free(w.alloc, text);
-    if (sel t_r.err) { ret false; }
-    var t: toml.Table = t_r.ok;
-    fin { toml.dnit(w.alloc, ?t); }
+    if (sel res_parse.err) { ret false; }
+    var t: toml_value.Table = res_parse.ok;
+    fin { toml_tree.dnit(w.alloc, ?t); }
 
-    val deps_o: opt[*toml.Table] = toml.get_table(?t, "dep");
-    if (sel deps_o.none) { ret false; }
-    val deps:    *toml.Table = deps_o.some;
-    var dir_dep: str         = "dep";
-    val dir_o:   opt[str]    = toml.get_str(?t, "project.dep");
-    if (sel dir_o.some) { dir_dep = dir_o.some; }
+    val opt_deps: opt[*toml_value.Table] = toml_lookup.get_table(?t, "dep");
+    if (sel opt_deps.none) { ret false; }
+    val deps:    *toml_value.Table = opt_deps.some;
+    var dir_dep: str               = "dep";
+    val opt_dir: opt[str]          = toml_lookup.get_str(?t, "project.dep");
+    if (sel opt_dir.some) { dir_dep = opt_dir.some; }
 
     val want: str = uris.normalize(w.alloc, dir);
     if (want == nil) { ret false; }
 
     var found: bool  = false;
     var i:     usize = 0;
-    for (i < toml.table_len(deps) && !found) {
-        val alias_o: opt[str] = toml.table_key(deps, i);
-        if (sel alias_o.some) {
-            val alias:  str                                = alias_o.some;
-            val base_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, root_path, dir_dep);
-            if (sel base_r.ok) {
-                val base:   str                                = base_r.ok;
-                val cand_r: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, base, alias);
+    for (i < toml_lookup.table_len(deps) && !found) {
+        val opt_alias: opt[str] = toml_lookup.table_key(deps, i);
+        if (sel opt_alias.some) {
+            val alias:    str                                = opt_alias.some;
+            val res_base: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, root_path, dir_dep);
+            if (sel res_base.ok) {
+                val base:     str                                = res_base.ok;
+                val res_cand: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, base, alias);
                 strutil.str_free(w.alloc, base);
-                if (sel cand_r.ok) {
-                    val cand: str = cand_r.ok;
+                if (sel res_cand.ok) {
+                    val cand: str = res_cand.ok;
                     val norm: str = uris.normalize(w.alloc, cand);
                     strutil.str_free(w.alloc, cand);
                     if (norm != nil) {
@@ -558,15 +568,15 @@ fun containing_root_loaded(w: *Workspace, uri: str) *Root {
 # returned; on success the loaded Root pointer is returned
 # a separately allocated, initialized Session, or nil
 fun new_session(alloc: *Allocator) *sess.Session {
-    val p_r: res[*sess.Session, allocator.Error] = allocate[sess.Session](alloc, 1);
-    if (sel p_r.err) { ret nil; }
-    val sn: *sess.Session                = p_r.ok;
-    val sr: res[sess.Session, fail.Fail] = sess.init(alloc);
-    if (sel sr.err) {
+    val res_allocate: res[*sess.Session, allocator.Error] = allocate[sess.Session](alloc, 1);
+    if (sel res_allocate.err) { ret nil; }
+    val sn:            *sess.Session                = res_allocate.ok;
+    val res_sess_made: res[sess.Session, fail.Fail] = sess.init(alloc);
+    if (sel res_sess_made.err) {
         deallocate[sess.Session](alloc, sn, 1);
         ret nil;
     }
-    @sn = sr.ok;
+    @sn = res_sess_made.ok;
     ret sn;
 }
 
@@ -638,6 +648,8 @@ fun reset_slot(r: *Root) {
     r.loaded             = false;
     r.analyzed_once      = false;
     r.mod_paths          = nil;
+    r.mod_ids            = nil;
+    r.mod_files          = nil;
     r.mod_path_count     = 0;
     r.mod_fingerprints   = nil;
     r.man_mtime          = 0;
@@ -645,7 +657,7 @@ fun reset_slot(r: *Root) {
     r.vendored           = false;
     r.s                  = nil;
     r.spare              = nil;
-    r.spare_has_p        = false;
+    r.spare_has_snap     = false;
     r.spare_cold         = true;
     r.input_revision     = 0;
     r.snapshot_revision  = 0;
@@ -671,14 +683,14 @@ fun alloc_slot(w: *Workspace) *Root {
     if (new_cap == 0) { new_cap = 4; }
     or                { new_cap = new_cap * 2; }
     if (w.roots == nil) {
-        val r: res[*Root, allocator.Error] = allocate[Root](w.alloc, new_cap::usize);
-        if (sel r.err) { ret nil; }
-        w.roots = r.ok;
+        val res_allocate: res[*Root, allocator.Error] = allocate[Root](w.alloc, new_cap::usize);
+        if (sel res_allocate.err) { ret nil; }
+        w.roots = res_allocate.ok;
     }
     or {
-        val r: res[*Root, allocator.Error] = reallocate[Root](w.alloc, w.roots, old_cap::usize, new_cap::usize);
-        if (sel r.err) { ret nil; }
-        w.roots = r.ok;
+        val res_reallocate: res[*Root, allocator.Error] = reallocate[Root](w.alloc, w.roots, old_cap::usize, new_cap::usize);
+        if (sel res_reallocate.err) { ret nil; }
+        w.roots = res_reallocate.ok;
     }
     var z: u32 = old_cap;
     for (z < new_cap) {
@@ -692,57 +704,60 @@ fun alloc_slot(w: *Workspace) *Root {
 # everything one project analysis reads, captured on the analysis thread
 #
 # The worker gets this and nothing else. Every question whose answer lives in
-# the live workspace - which root mirrors this document, which root owns it -
-# is decided here, while the analysis thread still owns the answer, so what
-# crosses the thread boundary is a flat set of facts with no pointers back.
+# the live workspace - which root mirrors this document - is decided here,
+# while the analysis thread still owns the answer, so what crosses the thread
+# boundary is a flat set of facts with no pointers back.
 # ---
-# path:     canonical document path, owned
-# text:     the buffer's text at capture, owned
-# belongs:  whether the root mirrors this document into its session
-# own_root: whether the root is this document's own nearest project
+# path:    canonical document path, owned
+# text:    the buffer's text at capture, owned
+# belongs: whether the root reads this document in place of its file
 rec DocSnapshot {
-    path:     str;
-    text:     str;
-    belongs:  bool;
-    own_root: bool;
+    path:    str;
+    text:    str;
+    belongs: bool;
 }
 
 # one root's pending build, owned by whoever holds it
 # ---
-# alloc:       allocator backing this input and the result built from it
-# root_path:   owned copy of the root directory
-# docs:        owned document snapshots
-# doc_count:   live entries in docs
-# span:        docs allocation length, which is the store's slot count, not doc_count
-# revision:    the input revision this build covers
-# sn:          BORROWED idle Session to build into; the Root owns it throughout
-# stale_p:     a dead Project still held by `sn`
-# has_stale_p: whether stale_p must be released before building
+# alloc:          allocator backing this input and the result built from it
+# root_path:      owned copy of the root directory
+# docs:           owned document snapshots
+# doc_count:      live entries in docs
+# span:           docs allocation length, which is the store's slot count, not doc_count
+# revision:       the input revision this build covers
+# sn:             BORROWED idle Session to build into; the Root owns it throughout
+# stale_snap:     a dead snapshot still held by `sn`
+# has_stale_snap: whether stale_snap must be released before building
 rec BuildInput {
-    alloc:       *Allocator;
-    root_path:   str;
-    docs:        *DocSnapshot;
-    doc_count:   u32;
-    span:        usize;
-    revision:    u64;
-    sn:          *sess.Session;
-    stale_p:     driver.Project;
-    has_stale_p: bool;
-    warmup:      bool;
+    alloc:          *Allocator;
+    root_path:      str;
+    docs:           *DocSnapshot;
+    doc_count:      u32;
+    span:           usize;
+    revision:       u64;
+    sn:             *sess.Session;
+    stale_snap:     editor.ProjectSnapshot;
+    has_stale_snap: bool;
+    warmup:         bool;
 }
 
 # one finished build, owned by whoever holds it
 #
 # `message` is an owned copy rather than a borrow: a failure's text usually
-# points into a Fail or a manifest that is gone by the time the analysis thread
+# points into a Fail or a snapshot that is gone by the time the analysis thread
 # reads it, and the thread that may write to the client is not the thread that
 # produced the words.
 # ---
 # alloc:            allocator everything here came from
-# ok:               whether `p` and the path snapshot are valid
+# ok:               whether `snap` and the path snapshot are valid
 # s:                BORROWED Session the build ran into; the Root owns it
-# p:                the retained Project, valid only when ok
-# mod_paths:        canonical source path per ModuleId
+# snap:             the retained snapshot, valid only when ok
+# stale:            a snapshot `s` still holds because its release was refused,
+#                   handed back to the Root's spare
+# has_stale:        whether stale is live
+# mod_paths:        canonical source path per snapshot module index
+# mod_ids:          stable module identity per snapshot module index
+# mod_files:        source FileId per snapshot module index
 # mod_fingerprints: on-disk fingerprint per mod_paths entry
 # mod_path_count:   mod_paths length
 # man_mtime:        manifest mtime observed at build start
@@ -756,8 +771,12 @@ rec BuildOutput {
     alloc:            *Allocator;
     ok:               bool;
     s:                *sess.Session;
-    p:                driver.Project;
+    snap:             editor.ProjectSnapshot;
+    stale:            editor.ProjectSnapshot;
+    has_stale:        bool;
     mod_paths:        *str;
+    mod_ids:          *lmodule.StableModuleId;
+    mod_files:        *src.FileId;
     mod_fingerprints: *SourceFingerprint;
     mod_path_count:   u32;
     man_mtime:        i64;
@@ -771,9 +790,9 @@ rec BuildOutput {
 # an owned copy of `text`, or nil
 fun dup_str(alloc: *Allocator, text: str) str {
     if (text == nil) { ret nil; }
-    val r: res[str, allocator.Error] = strutil.str_dup(alloc, text);
-    if (sel r.err) { ret nil; }
-    ret r.ok;
+    val res_str_dup: res[str, allocator.Error] = strutil.str_dup(alloc, text);
+    if (sel res_str_dup.err) { ret nil; }
+    ret res_str_dup.ok;
 }
 
 # capture everything `r`'s next build needs, and record what it will cover
@@ -782,20 +801,20 @@ fun dup_str(alloc: *Allocator, text: str) str {
 # a later build result is compared against to decide whether input moved on
 # while it ran.
 fun capture_input(w: *Workspace, r: *Root) *BuildInput {
-    val ir: res[*BuildInput, allocator.Error] = allocate[BuildInput](w.alloc, 1);
-    if (sel ir.err) { ret nil; }
-    val in: *BuildInput = ir.ok;
-    in.alloc       = w.alloc;
-    in.root_path   = nil;
-    in.docs        = nil;
-    in.doc_count   = 0;
-    in.span        = 0;
-    in.revision    = r.input_revision;
-    in.sn          = r.spare;
-    in.has_stale_p = r.spare_has_p;
-    in.warmup      = false;
-    if (r.spare_has_p) { in.stale_p = r.spare_p; }
-    r.spare_has_p = false;
+    val res_allocate: res[*BuildInput, allocator.Error] = allocate[BuildInput](w.alloc, 1);
+    if (sel res_allocate.err) { ret nil; }
+    val in: *BuildInput = res_allocate.ok;
+    in.alloc          = w.alloc;
+    in.root_path      = nil;
+    in.docs           = nil;
+    in.doc_count      = 0;
+    in.span           = 0;
+    in.revision       = r.input_revision;
+    in.sn             = r.spare;
+    in.has_stale_snap = r.spare_has_snap;
+    in.warmup         = false;
+    if (r.spare_has_snap) { in.stale_snap = r.spare_snap; }
+    r.spare_has_snap = false;
 
     in.root_path = dup_str(w.alloc, r.path);
     if (in.root_path == nil) {
@@ -810,12 +829,12 @@ fun capture_input(w: *Workspace, r: *Root) *BuildInput {
         ret nil;
     }
     if (n > 0) {
-        val dr: res[*DocSnapshot, allocator.Error] = allocate[DocSnapshot](w.alloc, n);
-        if (sel dr.err) {
+        val res_allocate: res[*DocSnapshot, allocator.Error] = allocate[DocSnapshot](w.alloc, n);
+        if (sel res_allocate.err) {
             free_build_input(in);
             ret nil;
         }
-        in.docs = dr.ok;
+        in.docs = res_allocate.ok;
         in.span = n;
         var latest: u64   = r.input_revision;
         var i:      usize = 0;
@@ -823,10 +842,9 @@ fun capture_input(w: *Workspace, r: *Root) *BuildInput {
             val d: *documents.Document = documents.at(w.docs, i);
             if (d != nil && d.in_use && d.path != nil) {
                 val slot: *DocSnapshot = ?in.docs[in.doc_count];
-                slot.path     = dup_str(w.alloc, d.path);
-                slot.text     = dup_str(w.alloc, d.text);
-                slot.belongs  = document_belongs(w, r, d.path);
-                slot.own_root = document_own_root(w, r, d.path);
+                slot.path    = dup_str(w.alloc, d.path);
+                slot.text    = dup_str(w.alloc, d.text);
+                slot.belongs = document_belongs(w, r, d.path);
                 if (slot.path == nil || slot.text == nil) {
                     if (slot.path != nil) { strutil.str_free(w.alloc, slot.path); }
                     if (slot.text != nil) { strutil.str_free(w.alloc, slot.text); }
@@ -844,9 +862,25 @@ fun capture_input(w: *Workspace, r: *Root) *BuildInput {
     ret in;
 }
 
+# whether the build handed the snapshot an open buffer for canonical `path`
+fun input_buffers(in: *BuildInput, path: str) bool {
+    var i: u32 = 0;
+    for (i < in.doc_count) {
+        if (in.docs[i].belongs && str_equals(in.docs[i].path, path)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# release an input that never reached a build, along with the stale snapshot
+# it carries, which nothing else would release
 fun free_build_input(in: *BuildInput) {
     if (in == nil) { ret; }
     val alloc: *Allocator = in.alloc;
+    if (in.has_stale_snap) {
+        release_snapshot(?in.stale_snap);
+        in.has_stale_snap = false;
+    }
     if (in.docs != nil) {
         var i: u32 = 0;
         for (i < in.doc_count) {
@@ -862,6 +896,13 @@ fun free_build_input(in: *BuildInput) {
     deallocate[BuildInput](alloc, in, 1);
 }
 
+# release a snapshot, logging a refusal. a refused release leaves the snapshot
+# to its Session's teardown
+fun release_snapshot(snap: *editor.ProjectSnapshot) {
+    val err_project_dnit: err[fail.Fail] = editor.project_dnit(snap);
+    if (sel err_project_dnit.err) { trace.logf("project: a snapshot release was refused: {}", fail.describe(err_project_dnit.err)); }
+}
+
 # release a build result that was never installed
 #
 # `s` is borrowed from the Root and is deliberately not touched: an abandoned
@@ -869,14 +910,15 @@ fun free_build_input(in: *BuildInput) {
 pub fun free_build_output(o: *BuildOutput) {
     if (o == nil) { ret; }
     val alloc: *Allocator = o.alloc;
-    if (o.ok)               { driver.dnit_project(?o.p); }
-    if (o.mod_paths != nil) { free_path_snapshot(alloc, o.mod_paths, o.mod_fingerprints, o.mod_path_count, o.mod_path_count); }
+    if (o.ok)               { release_snapshot(?o.snap); }
+    if (o.has_stale)        { release_snapshot(?o.stale); }
+    if (o.mod_paths != nil) { free_path_snapshot(alloc, o.mod_paths, o.mod_ids, o.mod_files, o.mod_fingerprints, o.mod_path_count, o.mod_path_count); }
     if (o.message != nil)   { strutil.str_free(alloc, o.message); }
     notes.dnit(alloc, ?o.manifest_notes);
     deallocate[BuildOutput](alloc, o, 1);
 }
 
-# run one project analysis into a fresh Session
+# run one project analysis into the Root's idle Session
 #
 # This is the whole of what runs off the analysis thread. It reads its input and
 # the filesystem, writes only into memory it allocated, and never touches the
@@ -888,16 +930,19 @@ fun run_build(arg: ptr) ptr {
     val in:    *BuildInput = arg::*BuildInput;
     val alloc: *Allocator  = in.alloc;
 
-    val or_: res[*BuildOutput, allocator.Error] = allocate[BuildOutput](alloc, 1);
-    if (sel or_.err) {
+    val res_allocate: res[*BuildOutput, allocator.Error] = allocate[BuildOutput](alloc, 1);
+    if (sel res_allocate.err) {
         free_build_input(in);
         ret nil;
     }
-    val o: *BuildOutput = or_.ok;
+    val o: *BuildOutput = res_allocate.ok;
     o.alloc            = alloc;
     o.ok               = false;
     o.s                = in.sn;
+    o.has_stale        = false;
     o.mod_paths        = nil;
+    o.mod_ids          = nil;
+    o.mod_files        = nil;
     o.mod_fingerprints = nil;
     o.mod_path_count   = 0;
     o.man_mtime        = 0;
@@ -914,11 +959,20 @@ fun run_build(arg: ptr) ptr {
     }
 
     # the session being built into was serving until the last swap, so it still
-    # holds that snapshot's Project and its overlay keys. Releasing them is the
-    # worker's job precisely because it is real work on a big closure, and the
-    # analysis thread is what this whole design exists to keep free.
-    if (in.has_stale_p) { driver.dnit_project(?in.stale_p); }
-    for (o.s.overlay_len > 0) { sess.clear_overlay(o.s, o.s.overlays[0].path); }
+    # holds that snapshot, and a Session holds one snapshot at a time. Releasing
+    # it is the worker's job precisely because it is real work on a big closure,
+    # and the analysis thread is what this whole design exists to keep free.
+    if (in.has_stale_snap) {
+        in.has_stale_snap = false;
+        val err_project_dnit: err[fail.Fail] = editor.project_dnit(?in.stale_snap);
+        if (sel err_project_dnit.err) {
+            o.message   = dup_str(alloc, fail.describe(err_project_dnit.err));
+            o.stale     = in.stale_snap;
+            o.has_stale = true;
+            free_build_input(in);
+            ret (o)::ptr;
+        }
+    }
 
     stat_mtimes(alloc, in.root_path, ?o.man_mtime, ?o.lock_mtime);
     val started_ns: i64 = trace.now_ns();
@@ -934,104 +988,101 @@ fun analyze_into(in: *BuildInput, o: *BuildOutput) {
     val alloc: *Allocator    = in.alloc;
     val sn:    *sess.Session = o.s;
 
+    var buffers: *editor.ProjectBuffer = nil;
+    var count:   u32                   = 0;
+    if (in.doc_count > 0) {
+        val res_allocate: res[*editor.ProjectBuffer, allocator.Error] = allocate[editor.ProjectBuffer](alloc, in.doc_count::usize);
+        if (sel res_allocate.err) {
+            o.message = dup_str(alloc, lalloc.text(res_allocate.err));
+            ret;
+        }
+        buffers = res_allocate.ok;
+    }
     var i: u32 = 0;
     for (i < in.doc_count) {
         if (in.docs[i].belongs) {
-            val sr: res[bool, str] = install_overlay(alloc, sn, in.docs[i].path, in.docs[i].text);
-            if (sel sr.err) {
-                o.message = dup_str(alloc, sr.err);
-                ret;
-            }
+            buffers[count] = editor.ProjectBuffer{path: in.docs[i].path, text: in.docs[i].text};
+            count          = count + 1;
         }
         i = i + 1;
     }
 
-    val mr: res[manifest.Manifest, outcome.Fail] = driver.load_manifest(sn, in.root_path);
-    if (sel mr.err) {
-        var mf: outcome.Fail = mr.err;
-        refuse(o, ?mf);
+    # the snapshot keeps the project through a rejected phase, so the products
+    # behind the diagnostics stay readable while the user types. the root set is
+    # every artifact's closure with the open buffers' modules beside it, so a file
+    # is checked in the artifact its entry reaches
+    val manifest: str = manifest_uri(alloc, in.root_path);
+    fin {
+        if (manifest != nil) { strutil.str_free(alloc, manifest); }
+    }
+    var req: editor.ProjectRequest = editor.project_request(in.root_path, mach_compile.FRONTEND_SEMA);
+    req.buffers      = buffers;
+    req.buffer_count = count;
+    val res_opened: res[editor.ProjectSnapshot, fail.Fail] = editor.project_init(sn, ?req);
+    if (buffers != nil) { deallocate[editor.ProjectBuffer](alloc, buffers, in.doc_count::usize); }
+    if (sel res_opened.err) {
+        var f: fail.Fail = res_opened.err;
+        refuse(o, ?f, sn.sources, manifest);
+        fail.dnit(sn.alloc, f);
         ret;
     }
-    var m: manifest.Manifest = mr.ok;
 
-    var selection: manifest.Selection;
-    selection.target       = "";
-    selection.profile      = "";
-    selection.artifact     = "";
-    selection.want_lib     = false;
-    selection.has_artifact = false;
-    val psr: err[outcome.Fail] = manifest.select_primary_artifact(alloc, ?sn.interner, ?m, ?selection);
-    if (sel psr.err) {
-        var pf: outcome.Fail = psr.err;
-        refuse(o, ?pf);
-        manifest.dnit(?m, sn.build_alloc);
-        ret;
-    }
-    if (!selection.has_artifact && m.artifact_count == 1) {
-        val ao: opt[str] = intern.lookup(?sn.interner, m.artifacts[0].name);
-        if (sel ao.none) {
-            manifest.dnit(?m, sn.build_alloc);
-            o.message = dup_str(alloc, "project: artifact name is not interned");
-            ret;
+    var snap: editor.ProjectSnapshot = res_opened.ok;
+    o.manifest_notes = notes.capture(alloc, snap.diagnostics, manifest);
+    if (!snap.loaded) {
+        o.message = dup_str(alloc, snapshot_message(?snap));
+        if (sel snap.failure.some) {
+            if (!fail.is_reported(snap.failure.some)) {
+                notes.dnit(alloc, ?o.manifest_notes);
+                o.manifest_notes = notes.refusal(alloc, snap.failure.some, sn.sources, o.message, manifest);
+            }
         }
-        selection.artifact     = ao.some;
-        selection.want_lib     = m.artifacts[0].is_lib;
-        selection.has_artifact = true;
+        park_snapshot(o, ?snap);
+        ret;
     }
+    val opt_internal: opt[fail.Fail] = report_phase.internal_failure(snap.status);
+    if (sel opt_internal.some) { trace.logf("project: {} analyzed with an internal failure: {}", in.root_path, fail.describe(opt_internal.some)); }
 
-    var cli: request.CliArgs                         = empty_cli();
-    val rr:  res[request.BuildRequest, outcome.Fail] = request.compose(
-        alloc, ?sn.interner, ?m, ?cli, in.root_path, request.GOAL_OBJECTS, ?selection);
-    if (sel rr.err) {
-        var f: outcome.Fail = rr.err;
-        refuse(o, ?f);
-        manifest.dnit(?m, sn.build_alloc);
+    val res_snapshot_mod_paths: res[bool, str] = snapshot_mod_paths(alloc, sn, in, ?snap, o);
+    if (sel res_snapshot_mod_paths.err) {
+        o.message = dup_str(alloc, res_snapshot_mod_paths.err);
+        park_snapshot(o, ?snap);
         ret;
     }
-    var req: request.BuildRequest = rr.ok;
+    o.snap = snap;
+    o.ok   = true;
+}
 
-    var extra: *intern.StrId = nil;
-    val ecr:   res[u32, str] = collect_extra_roots(in, sn, ?m, ?extra);
-    if (sel ecr.err) {
-        o.message = dup_str(alloc, ecr.err);
-        vector.dnit[request.LinkToken](?req.link_tokens);
-        vector.dnit[str](?req.lib_dirs);
-        manifest.dnit(?m, sn.build_alloc);
-        ret;
+# release a snapshot the build will not install; one whose release is refused
+# goes back to the Root's spare with the Session that still holds it
+fun park_snapshot(o: *BuildOutput, snap: *editor.ProjectSnapshot) {
+    val err_project_dnit: err[fail.Fail] = editor.project_dnit(snap);
+    if (sel err_project_dnit.err) {
+        o.stale     = @snap;
+        o.has_stale = true;
     }
-    val extra_count: u32 = ecr.ok;
-    # the tolerant entry point keeps the project through a rejected phase, so
-    # the products behind the diagnostics stay readable while the user types.
-    # the root set is every artifact's closure, so a file is checked in the artifact
-    # its entry reaches and `{artifact.<id>.out}` resolves over what any artifact needs
-    val pr: res[driver.Project, outcome.Fail] = driver.analyze_project_tolerant(
-        sn, ?m, ?req, dproject.ROOT_UNION, extra, extra_count, driver.FRONTEND_SEMA);
-    if (extra != nil) { deallocate[intern.StrId](alloc, extra, in.doc_count::usize); }
-    vector.dnit[request.LinkToken](?req.link_tokens);
-    vector.dnit[str](?req.lib_dirs);
-    manifest.dnit(?m, sn.build_alloc);
-    if (sel pr.err) {
-        var f: outcome.Fail = pr.err;
-        refuse(o, ?f);
-        ret;
-    }
+}
 
-    o.p              = pr.ok;
-    o.manifest_notes = notes.capture(alloc, ?o.p.diags);
-    val bpr: res[bool, str] = snapshot_mod_paths(alloc, sn, ?o.p, o);
-    if (sel bpr.err) {
-        driver.dnit_project(?o.p);
-        o.message = dup_str(alloc, bpr.err);
-        ret;
-    }
-    o.ok = true;
+# the text to show for a snapshot that could not load its project
+fun snapshot_message(snap: *editor.ProjectSnapshot) str {
+    if (snap.message != nil && str_len(snap.message) > 0) { ret snap.message; }
+    ret "the project does not compile; see the diagnostics on its source files";
 }
 
 # record why a load was refused: the text the server reports, and, unless the
 # detail already went to located diagnostics, a note for the manifest
-fun refuse(o: *BuildOutput, f: *outcome.Fail) {
+fun refuse(o: *BuildOutput, f: *lfail.Fail, sources: *src.SourceMap, manifest: str) {
     o.message = dup_str(o.alloc, fail_message(f));
-    if (!outcome.is_reported(@f)) { o.manifest_notes = notes.refusal(o.alloc, o.message); }
+    if (!lfail.is_reported(@f)) { o.manifest_notes = notes.refusal(o.alloc, @f, sources, o.message, manifest); }
+}
+
+# the owned uri of the manifest at `root_path`, or nil
+fun manifest_uri(alloc: *Allocator, root_path: str) str {
+    val res_join: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, root_path, "mach.toml");
+    if (sel res_join.err) { ret nil; }
+    val uri: str = uris.of_path(alloc, res_join.ok);
+    strutil.str_free(alloc, res_join.ok);
+    ret uri;
 }
 
 # install a finished build as `r`'s serving snapshot, releasing the old one
@@ -1048,7 +1099,13 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     show_notes(w, r, o);
 
     if (!o.ok) {
-        # the previous snapshot keeps serving; only the attempt is recorded
+        # the previous snapshot keeps serving; only the attempt is recorded. a
+        # snapshot the spare could not release stays with it for the next build
+        if (o.has_stale && !r.spare_has_snap) {
+            r.spare_snap     = o.stale;
+            r.spare_has_snap = true;
+            o.has_stale      = false;
+        }
         if (o.message != nil) { report_load_failure(w, r.path, o.message); }
         free_build_output(o);
         ret false;
@@ -1057,13 +1114,13 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     # the outgoing Session becomes the spare and KEEPS its query cache. That
     # cache is the whole reason a rebuild costs a fraction of a cold build, and
     # building into a fresh session each time would discard it - measured on
-    # this repo, a rebuild goes from ~7s to ~34s without it. Its Project rides
+    # this repo, a rebuild goes from ~7s to ~34s without it. Its snapshot rides
     # along to be released by the next build, on the worker.
     free_mod_paths(w, r);
     free_windows(w, r);
     if (r.loaded) {
-        r.spare_p     = r.p;
-        r.spare_has_p = true;
+        r.spare_snap     = r.snap;
+        r.spare_has_snap = true;
     }
     # the outgoing session has built only if it was serving; at the first load
     # it is the empty one made beside it
@@ -1071,9 +1128,11 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     r.spare_cold = !r.loaded;
 
     r.s                 = o.s;
-    r.p                 = o.p;
+    r.snap              = o.snap;
     r.loaded            = true;
     r.mod_paths         = o.mod_paths;
+    r.mod_ids           = o.mod_ids;
+    r.mod_files         = o.mod_files;
     r.mod_fingerprints  = o.mod_fingerprints;
     r.mod_path_count    = o.mod_path_count;
     r.snapshot_revision = o.revision;
@@ -1081,7 +1140,7 @@ fun apply_build(w: *Workspace, r: *Root, o: *BuildOutput) bool {
     w.load_epoch        = w.load_epoch + 1;
     w.sema_epoch        = w.sema_epoch + 1;
 
-    # the Project and the path snapshot moved into the Root; the Session was
+    # the snapshot and the path snapshot moved into the Root; the Session was
     # only ever borrowed from it
     o.s         = nil;
     o.ok        = false;
@@ -1098,13 +1157,7 @@ fun show_notes(w: *Workspace, r: *Root, o: *BuildOutput) {
         notes.dnit(w.alloc, ?o.manifest_notes);
         ret;
     }
-    val jr: res[pathlib.Path, allocator.Error] = pathlib.join(w.alloc, r.path, "mach.toml");
-    if (sel jr.ok) {
-        val uri: str = uris.of_path(w.alloc, jr.ok);
-        notes.publish(w.alloc, uri, ?o.manifest_notes);
-        if (uri != nil) { strutil.str_free(w.alloc, uri); }
-        strutil.str_free(w.alloc, jr.ok);
-    }
+    notes.publish(w.alloc, ?r.manifest_notes, ?o.manifest_notes);
     notes.dnit(w.alloc, ?r.manifest_notes);
     r.manifest_notes = o.manifest_notes;
     o.manifest_notes = notes.empty();
@@ -1242,240 +1295,103 @@ pub fun pump(w: *Workspace, idle: bool) u8 {
     ret moved;
 }
 
-fun empty_cli() request.CliArgs {
-    var c: request.CliArgs;
-    c.verbosity    = 0;
-    c.quiet        = false;
-    c.target       = nil;
-    c.output       = nil;
-    c.emit_asm     = false;
-    c.emit_ir      = false;
-    c.profile      = nil;
-    c.bin          = nil;
-    c.lib          = nil;
-    c.all_targets  = false;
-    c.pie          = false;
-    c.subsystem    = nil;
-    c.g            = false;
-    c.opt_set      = false;
-    c.opt_release  = false;
-    c.jobs         = nil;
-    c.include_deps = false;
-    c.link_tokens  = vector.init[*u8](nil);
-    c.lib_dirs     = vector.init[*u8](nil);
-    ret c;
-}
-
-# install an open document under both its canonical path and the exact raw
-# `<project root>/<manifest src>/<relative module>` spelling the compiler driver
-# currently constructs. The second key covers `src = "./src"` in project and
-# dependency manifests until Mach #2998 centralizes normalization upstream.
-fun install_overlay(alloc: *Allocator, sn: *sess.Session, path: str, buffer: str) res[bool, str] {
-    val nr: err[fail.Fail] = sess.set_overlay(sn, path, buffer);
-    if (sel nr.err) { ret res[bool, str].err{fail.describe(nr.err)}; }
-    val own: str = project_root_for(alloc, path);
-    if (own == nil) { ret res[bool, str].ok{true}; }
-    val mp_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, own, "mach.toml");
-    if (sel mp_r.err) {
-        strutil.str_free(alloc, own);
-        ret res[bool, str].err{outcome.alloc_text(mp_r.err)};
-    }
-    val mp:     str                  = mp_r.ok;
-    val text_r: res[str, fs.FsError] = fs.read_string(alloc, mp);
-    strutil.str_free(alloc, mp);
-    if (sel text_r.err) {
-        strutil.str_free(alloc, own);
-        ret res[bool, str].err{outcome.fs_text(text_r.err)};
-    }
-    val text:    str                             = text_r.ok;
-    val table_r: res[toml.Table, toml.TomlError] = toml.parse(alloc, text);
-    strutil.str_free(alloc, text);
-    if (sel table_r.err) {
-        strutil.str_free(alloc, own);
-        ret res[bool, str].err{"project: manifest is not valid toml"};
-    }
-    var table: toml.Table = table_r.ok;
-    fin { toml.dnit(alloc, ?table); }
-    val src_o: opt[str] = toml.get_str(?table, "project.src");
-    if (sel src_o.none) {
-        strutil.str_free(alloc, own);
-        ret res[bool, str].ok{true};
-    }
-    val src_dir:   str                                = src_o.some;
-    val raw_src_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, own, src_dir);
-    strutil.str_free(alloc, own);
-    if (sel raw_src_r.err) { ret res[bool, str].err{outcome.alloc_text(raw_src_r.err)}; }
-    val raw_src:  str = raw_src_r.ok;
-    val src_norm: str = uris.normalize(alloc, raw_src);
-    if (src_norm == nil) {
-        strutil.str_free(alloc, raw_src);
-        ret res[bool, str].err{"project: failed to normalize document source directory"};
-    }
-    if (!uris.is_under(path, src_norm) || str_len(path) <= str_len(src_norm)) {
-        strutil.str_free(alloc, src_norm);
-        strutil.str_free(alloc, raw_src);
-        ret res[bool, str].ok{true};
-    }
-    val raw_path_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, raw_src,
-        (path::usize + str_len(src_norm) + 1)::str);
-    strutil.str_free(alloc, src_norm);
-    strutil.str_free(alloc, raw_src);
-    if (sel raw_path_r.err) { ret res[bool, str].err{outcome.alloc_text(raw_path_r.err)}; }
-    val raw_path: str            = raw_path_r.ok;
-    val rr:       err[fail.Fail] = sess.set_overlay(sn, raw_path, buffer);
-    var out:      res[bool, str] = res[bool, str].ok{true};
-    if (sel rr.err) { out = res[bool, str].err{fail.describe(rr.err)}; }
-    strutil.str_free(alloc, raw_path);
-    ret out;
-}
-
-# build compiler-owned extra roots for open files under this project's source
-# directory. files already in the artifact closure are harmless duplicates.
-fun collect_extra_roots(in: *BuildInput, sn: *sess.Session, m: *manifest.Manifest, out: **intern.StrId) res[u32, str] {
-    @out = nil;
-    val alloc: *Allocator = in.alloc;
-    val n:     usize      = in.doc_count::usize;
-    if (n == 0) { ret res[u32, str].ok{0}; }
-    val ar: res[*intern.StrId, allocator.Error] = allocate[intern.StrId](alloc, n);
-    if (sel ar.err) { ret res[u32, str].err{outcome.alloc_text(ar.err)}; }
-    val roots: *intern.StrId = ar.ok;
-
-    val io: opt[str] = intern.lookup(?sn.interner, m.id);
-    val so: opt[str] = intern.lookup(?sn.interner, m.src);
-    if (sel io.none) {
-        deallocate[intern.StrId](alloc, roots, n);
-        ret res[u32, str].err{"project: manifest source path is not interned"};
-    }
-    if (sel so.none) {
-        deallocate[intern.StrId](alloc, roots, n);
-        ret res[u32, str].err{"project: manifest source path is not interned"};
-    }
-    val src_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, in.root_path, so.some);
-    if (sel src_r.err) {
-        deallocate[intern.StrId](alloc, roots, n);
-        ret res[u32, str].err{outcome.alloc_text(src_r.err)};
-    }
-    val src_norm: str = uris.normalize(alloc, src_r.ok);
-    strutil.str_free(alloc, src_r.ok);
-    if (src_norm == nil) {
-        deallocate[intern.StrId](alloc, roots, n);
-        ret res[u32, str].err{"project: failed to normalize source directory"};
-    }
-
-    var count: u32   = 0;
-    var i:     usize = 0;
-    for (i < n) {
-        val d: *DocSnapshot = ?in.docs[i::u32];
-        if (d.own_root && uris.is_under(d.path, src_norm)) {
-            val fr: res[intern.StrId, str] = document_fqn(sn, io.some, src_norm, d.path);
-            if (sel fr.err) {
-                strutil.str_free(alloc, src_norm);
-                deallocate[intern.StrId](alloc, roots, n);
-                ret res[u32, str].err{fr.err};
-            }
-            roots[count] = fr.ok;
-            count        = count + 1;
-        }
-        i = i + 1;
-    }
-    strutil.str_free(alloc, src_norm);
-    if (count == 0) {
-        deallocate[intern.StrId](alloc, roots, n);
-        ret res[u32, str].ok{0};
-    }
-    @out = roots;
-    ret res[u32, str].ok{count};
-}
-
-fun document_fqn(sn: *sess.Session, id_text: str, src_dir: str, path: str) res[intern.StrId, str] {
-    val prefix: usize = str_len(src_dir);
-    val plen:   usize = str_len(path);
-    if (plen <= prefix + 6 || !pathlib.is_separator(path[prefix])) { ret res[intern.StrId, str].err{"project: document lies outside the source directory"}; }
-    if (path[plen - 5] != '.' || path[plen - 4] != 'm' || path[plen - 3] != 'a'
-        || path[plen - 2] != 'c' || path[plen - 1] != 'h') { ret res[intern.StrId, str].err{"project: document is not a Mach source file"}; }
-    val rel_len: usize                     = plen - prefix - 1 - 5;
-    val id_len:  usize                     = str_len(id_text);
-    val total:   usize                     = id_len + 1 + rel_len;
-    val br:      res[*u8, allocator.Error] = allocate[u8](sn.alloc, total);
-    if (sel br.err) { ret res[intern.StrId, str].err{outcome.alloc_text(br.err)}; }
-    val buf: *u8   = br.ok;
-    var i:   usize = 0;
-    for (i < id_len) {
-        buf[i] = id_text[i];
-        i      = i + 1;
-    }
-    buf[id_len] = '.';
-    var j: usize = 0;
-    for (j < rel_len) {
-        # module path segments, whichever separator the platform spells them with
-        val c: u8 = path[prefix + 1 + j];
-        if (pathlib.is_separator(c)) { buf[id_len + 1 + j] = '.'; }
-        or                           { buf[id_len + 1 + j] = c; }
-        j = j + 1;
-    }
-    val ir: res[intern.StrId, allocator.Error] = intern.intern_bytes(?sn.interner, buf::str, total);
-    deallocate[u8](sn.alloc, buf, total);
-    if (sel ir.err) { ret res[intern.StrId, str].err{outcome.alloc_text(ir.err)}; }
-    ret res[intern.StrId, str].ok{ir.ok};
-}
-
-# snapshot every loaded module's normalized source path into
-# `r.mod_paths`, indexed by module id, so the per-request uri -> module lookups
-# are allocation-free string compares. replacement is transactional: a failed
-# allocation or normalization rejects the new Project and preserves the last
+# snapshot every loaded module's normalized source path, stable identity and
+# FileId, indexed by snapshot module, so the per-request uri -> module lookups
+# are allocation-free compares. replacement is transactional: a failed
+# allocation or normalization rejects the new snapshot and preserves the last
 # successful path/fingerprint set for disk-change retry detection.
-fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, pr: *driver.Project, o: *BuildOutput) res[bool, str] {
-    val n: u32 = driver.module_count(pr);
+fun snapshot_mod_paths(alloc: *Allocator, sn: *sess.Session, in: *BuildInput, snap: *editor.ProjectSnapshot, o: *BuildOutput) res[bool, str] {
+    val n: u32 = editor.project_module_count(snap);
     if (n == 0) { ret res[bool, str].ok{true}; }
-    val arr_r: res[*str, allocator.Error] = allocate[str](alloc, n::usize);
-    if (sel arr_r.err) { ret res[bool, str].err{outcome.alloc_text(arr_r.err)}; }
-    val mt_r: res[*SourceFingerprint, allocator.Error] = allocate[SourceFingerprint](alloc, n::usize);
-    if (sel mt_r.err) {
-        deallocate[str](alloc, arr_r.ok, n::usize);
-        ret res[bool, str].err{outcome.alloc_text(mt_r.err)};
+    val res_allocate: res[*str, allocator.Error] = allocate[str](alloc, n::usize);
+    if (sel res_allocate.err) { ret res[bool, str].err{lalloc.text(res_allocate.err)}; }
+    val res_allocate_alloc: res[*lmodule.StableModuleId, allocator.Error] = allocate[lmodule.StableModuleId](alloc, n::usize);
+    if (sel res_allocate_alloc.err) {
+        deallocate[str](alloc, res_allocate.ok, n::usize);
+        ret res[bool, str].err{lalloc.text(res_allocate_alloc.err)};
     }
-    val paths:        *str               = arr_r.ok;
-    val fingerprints: *SourceFingerprint = mt_r.ok;
+    val res_file: res[*src.FileId, allocator.Error] = allocate[src.FileId](alloc, n::usize);
+    if (sel res_file.err) {
+        deallocate[str](alloc, res_allocate.ok, n::usize);
+        deallocate[lmodule.StableModuleId](alloc, res_allocate_alloc.ok, n::usize);
+        ret res[bool, str].err{lalloc.text(res_file.err)};
+    }
+    val res_allocate_usize: res[*SourceFingerprint, allocator.Error] = allocate[SourceFingerprint](alloc, n::usize);
+    if (sel res_allocate_usize.err) {
+        deallocate[str](alloc, res_allocate.ok, n::usize);
+        deallocate[lmodule.StableModuleId](alloc, res_allocate_alloc.ok, n::usize);
+        deallocate[src.FileId](alloc, res_file.ok, n::usize);
+        ret res[bool, str].err{lalloc.text(res_allocate_usize.err)};
+    }
+    val paths:        *str                    = res_allocate.ok;
+    val ids:          *lmodule.StableModuleId = res_allocate_alloc.ok;
+    val files:        *src.FileId             = res_file.ok;
+    val fingerprints: *SourceFingerprint      = res_allocate_usize.ok;
 
     var i: u32 = 0;
     for (i < n) {
         paths[i]              = nil;
+        ids[i]                = lmodule.STABLE_MODULE_NIL;
+        files[i]              = src.FILE_NIL;
         fingerprints[i].mtime = 0;
         fingerprints[i].size  = 0;
-        val fo: opt[*src.SourceFile] = src.get(?sn.sources, driver.module_at(pr, i).file_id);
-        if (sel fo.none) {
-            free_path_snapshot(alloc, paths, fingerprints, n, i);
+        val res_project_module_file: res[src.FileId, fail.Fail] = editor.project_module_file(snap, i);
+        if (sel res_project_module_file.err) {
+            free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
+            ret res[bool, str].err{fail.describe(res_project_module_file.err)};
+        }
+        files[i] = res_project_module_file.ok;
+        val opt_sources_entry: opt[*src.SourceFile] = src.get(sn.sources, res_project_module_file.ok);
+        if (sel opt_sources_entry.none) {
+            free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
             ret res[bool, str].err{"project: loaded module source is unavailable"};
         }
-        paths[i] = uris.normalize(alloc, fo.some.path);
+        val res_project_module_fqn: res[str, fail.Fail] = editor.project_module_fqn(snap, i);
+        if (sel res_project_module_fqn.err) {
+            free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
+            ret res[bool, str].err{fail.describe(res_project_module_fqn.err)};
+        }
+        val res_interner_added: res[intern.StrId, allocator.Error] = intern.add(sn.interner, res_project_module_fqn.ok);
+        if (sel res_interner_added.err) {
+            free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
+            ret res[bool, str].err{lalloc.text(res_interner_added.err)};
+        }
+        ids[i]   = lmodule.stable_module_id_lookup(?sn.modules, res_interner_added.ok);
+        paths[i] = uris.normalize(alloc, opt_sources_entry.some.path);
         if (paths[i] == nil) {
-            free_path_snapshot(alloc, paths, fingerprints, n, i);
+            free_path_snapshot(alloc, paths, ids, files, fingerprints, n, i);
             ret res[bool, str].err{"project: failed to normalize loaded module path"};
         }
-        fingerprints[i] = verified_fingerprint(alloc, sn, fo.some, paths[i]);
+        fingerprints[i] = verified_fingerprint(alloc, in, opt_sources_entry.some, paths[i]);
         i               = i + 1;
     }
     o.mod_paths        = paths;
+    o.mod_ids          = ids;
+    o.mod_files        = files;
     o.mod_fingerprints = fingerprints;
     o.mod_path_count   = n;
     ret res[bool, str].ok{true};
 }
 
-fun free_path_snapshot(alloc: *Allocator, paths: *str, fingerprints: *SourceFingerprint, cap: u32, initialized: u32) {
+fun free_path_snapshot(alloc: *Allocator, paths: *str, ids: *lmodule.StableModuleId, files: *src.FileId, fingerprints: *SourceFingerprint, cap: u32, initialized: u32) {
     var i: u32 = 0;
     for (i < initialized) {
         if (paths[i] != nil) { strutil.str_free(alloc, paths[i]); }
         i = i + 1;
     }
     deallocate[str](alloc, paths, cap::usize);
+    deallocate[lmodule.StableModuleId](alloc, ids, cap::usize);
+    deallocate[src.FileId](alloc, files, cap::usize);
     deallocate[SourceFingerprint](alloc, fingerprints, cap::usize);
 }
 
 # release the per-module normalized path snapshot
 fun free_mod_paths(w: *Workspace, r: *Root) {
     if (r.mod_paths == nil) { ret; }
-    free_path_snapshot(w.alloc, r.mod_paths, r.mod_fingerprints, r.mod_path_count, r.mod_path_count);
+    free_path_snapshot(w.alloc, r.mod_paths, r.mod_ids, r.mod_files, r.mod_fingerprints, r.mod_path_count, r.mod_path_count);
     r.mod_paths        = nil;
+    r.mod_ids          = nil;
+    r.mod_files        = nil;
     r.mod_fingerprints = nil;
     r.mod_path_count   = 0;
 }
@@ -1514,15 +1430,17 @@ fun maybe_reload(w: *Workspace, r: *Root) {
 # A root with a snapshot is rebuilt by `pump` once a change marks it dirty. A
 # root without one is otherwise retried only when a request reaches it, so a
 # manifest fixed outside the editor would keep showing its refusal until then.
+# A retry that is refused again counts too: the reason its buffers show can move.
 # ---
-# ret: whether any root loaded
+# ret: whether any root was retried
 pub fun retry_failed(w: *Workspace) bool {
     var any: bool = false;
     var i:   u32  = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && r.s != nil && !r.loaded && r.dirty) {
-            if (try_load(w, r)) { any = true; }
+            try_load(w, r);
+            any = true;
         }
         i = i + 1;
     }
@@ -1573,15 +1491,14 @@ pub fun document_changed(w: *Workspace, d: *documents.Document) res[bool, str] {
     ret res[bool, str].ok{true};
 }
 
-# remove a closing document's compiler overlays before its owned text is freed.
-# the next request rebuilds affected snapshots from disk.
+# mark every root a closing document belonged to stale. the serving snapshot
+# keeps reading the buffer's last text until the rebuild, which reads the file
 pub fun document_closed(w: *Workspace, d: *documents.Document) {
     if (d == nil || d.path == nil || w.roots == nil) { ret; }
     var i: u32 = 0;
     for (i < w.root_cap) {
         val r: *Root = ?w.roots[i];
         if (r.path != nil && r.s != nil && document_belongs(w, r, d.path)) {
-            sess.clear_overlay(r.s, d.path);
             r.input_revision = d.revision;
         }
         i = i + 1;
@@ -1629,14 +1546,6 @@ fun root_covers(w: *Workspace, file_norm: str, root_path: str) bool {
     ret covered;
 }
 
-fun document_own_root(w: *Workspace, r: *Root, path: str) bool {
-    val own: str = project_root_for(w.alloc, path);
-    if (own == nil) { ret false; }
-    val matches: bool = str_equals(own, r.path);
-    strutil.str_free(w.alloc, own);
-    ret matches;
-}
-
 fun document_belongs(w: *Workspace, r: *Root, path: str) bool {
     val own: str = project_root_for(w.alloc, path);
     if (own != nil && str_equals(own, r.path)) {
@@ -1672,14 +1581,14 @@ pub fun root_covers_document(w: *Workspace, r: *Root, d: *documents.Document) bo
     ret document_belongs(w, r, d.path);
 }
 
-# release a root's retained Project, source index, Session, and owned path
+# release a root's retained snapshots, source index, Sessions, and owned path
 fun free_root(w: *Workspace, r: *Root) {
     free_windows(w, r);
     free_root_graph(w, r);
     free_mod_paths(w, r);
-    if (r.spare_has_p) {
-        driver.dnit_project(?r.spare_p);
-        r.spare_has_p = false;
+    if (r.spare_has_snap) {
+        release_snapshot(?r.spare_snap);
+        r.spare_has_snap = false;
     }
     free_session(w.alloc, r.s);
     free_session(w.alloc, r.spare);
@@ -1690,11 +1599,11 @@ fun free_root(w: *Workspace, r: *Root) {
     reset_slot(r);
 }
 
-# release the retained Project while preserving the root, Session, and last
+# release the retained snapshot while preserving the root, Session, and last
 # successful source index so a failed rebuild can detect a later disk repair
 fun free_root_graph(w: *Workspace, r: *Root) {
     if (r.loaded) {
-        driver.dnit_project(?r.p);
+        release_snapshot(?r.snap);
         r.loaded = false;
     }
 }
@@ -1717,13 +1626,13 @@ fun stat_mtimes(alloc: *Allocator, root_path: str, man: *i64, lock: *i64) {
 # equality test, and a save followed immediately by a request lands inside the
 # same second
 fun join_mtime(alloc: *Allocator, dir: str, name: str) i64 {
-    val jr: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, dir, name);
-    if (sel jr.err) { ret 0; }
-    val p:    str                              = jr.ok;
-    var m:    i64                              = 0;
-    val fi_r: res[fs.Metadata, io_error.Error] = fs.metadata(p);
-    if (sel fi_r.ok) {
-        var fi: fs.Metadata = fi_r.ok;
+    val res_join: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, dir, name);
+    if (sel res_join.err) { ret 0; }
+    val p:            str                              = res_join.ok;
+    var m:            i64                              = 0;
+    val res_metadata: res[fs.Metadata, io_error.Error] = fs.metadata(p);
+    if (sel res_metadata.ok) {
+        var fi: fs.Metadata = res_metadata.ok;
         m = chrono.time_unix_nsec(fi.modified);
     }
     strutil.str_free(alloc, p);
@@ -1738,9 +1647,9 @@ fun file_fingerprint(path: str) SourceFingerprint {
     var fp: SourceFingerprint;
     fp.mtime = 0;
     fp.size  = 0;
-    val fi_r: res[fs.Metadata, io_error.Error] = fs.metadata(path);
-    if (sel fi_r.err) { ret fp; }
-    var fi: fs.Metadata = fi_r.ok;
+    val res_metadata: res[fs.Metadata, io_error.Error] = fs.metadata(path);
+    if (sel res_metadata.err) { ret fp; }
+    var fi: fs.Metadata = res_metadata.ok;
     fp.mtime = chrono.time_unix_nsec(fi.modified);
     fp.size  = fi.size;
     ret fp;
@@ -1762,17 +1671,17 @@ fun unknown_fingerprint() SourceFingerprint {
 # snapshot's own and never be rebuilt. So the stat comes first and the file is
 # then compared with what was analyzed, through the same read the loader uses: a
 # write that landed in between is a mismatch, recorded as unknown so the next
-# scan rebuilds it. An open document is analyzed from its overlay, whose bytes
-# the disk is not expected to hold, and is not compared.
-fun verified_fingerprint(alloc: *Allocator, sn: *sess.Session, file: *src.SourceFile, path: str) SourceFingerprint {
+# scan rebuilds it. An open document is analyzed from the buffer the build
+# handed the snapshot, whose bytes the disk is not expected to hold, and is not
+# compared.
+fun verified_fingerprint(alloc: *Allocator, in: *BuildInput, file: *src.SourceFile, path: str) SourceFingerprint {
     val fp: SourceFingerprint = file_fingerprint(path);
-    val ov: opt[str]          = sess.overlay_get(sn, file.path);
-    if (sel ov.some) { ret fp; }
-    val tr:   res[str, fs.FsError] = fs.read_string(alloc, path);
-    var same: bool                 = false;
-    if (sel tr.ok) {
-        same = str_equals(tr.ok, file.text);
-        strutil.str_free(alloc, tr.ok);
+    if (input_buffers(in, path)) { ret fp; }
+    val res_read_string: res[str, fs.FsError] = fs.read_string(alloc, path);
+    var same:            bool                 = false;
+    if (sel res_read_string.ok) {
+        same = str_equals(res_read_string.ok, file.text);
+        strutil.str_free(alloc, res_read_string.ok);
     }
     if (same) { ret fp; }
     ret unknown_fingerprint();
@@ -1809,8 +1718,8 @@ fun fingerprint_matches(path: str, prev: *SourceFingerprint) bool {
 # uri:      the request document's URI
 # sym:      the symbol whose declaration site is wanted
 # ret:      some(Site), or none when the defining module cannot be located
-pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast, own_text: positions.Text, uri: str, sym: *rslv.Symbol) opt[Site] {
-    if (sym.origin == own) {
+pub fun site_of(w: *Workspace, root: *Root, own: lmodule.StableModuleId, own_a: *ast.Ast, own_text: positions.Text, uri: str, sym: *rslv.Symbol) opt[Site] {
+    if (lmodule.stable_same(sym.origin, own)) {
         var s: Site;
         s.a     = own_a;
         s.text  = own_text;
@@ -1820,19 +1729,19 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
         ret opt[Site].some{s};
     }
 
-    val m: *driver.ModuleEntry = module_entry(root, sym.origin);
-    if (m == nil) { ret opt[Site].none{}; }
-    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
-    if (sel fo.none) { ret opt[Site].none{}; }
-    val local: *rslv.Symbol = defining_symbol(m.resolve_result, sym);
+    val opt_module_index: opt[u32] = module_index(root, sym.origin);
+    if (sel opt_module_index.none) { ret opt[Site].none{}; }
+    val opt_module_source: opt[*src.SourceFile] = module_source(root, opt_module_index.some);
+    if (sel opt_module_source.none) { ret opt[Site].none{}; }
+    val local: *rslv.Symbol = defining_symbol(module_resolve(root, opt_module_index.some), sym);
     if (local == nil) { ret opt[Site].none{}; }
 
     val furi: str = module_uri(w, root, sym.origin);
     if (furi == nil) { ret opt[Site].none{}; }
 
     var s: Site;
-    s.a     = m.a;
-    s.text  = module_text(w, root, sym.origin, fo.some);
+    s.a     = module_ast(root, opt_module_index.some);
+    s.text  = module_text(w, root, opt_module_index.some, opt_module_source.some);
     s.uri   = furi;
     s.sym   = local;
     s.owned = true;
@@ -1847,10 +1756,10 @@ pub fun site_of(w: *Workspace, root: *Root, own: sess.ModuleId, own_a: *ast.Ast,
 # sym:  any symbol, including a `use` or `fwd` binding
 # ret:  the defining symbol, or nil
 pub fun defining_symbol_in(root: *Root, sym: *rslv.Symbol) *rslv.Symbol {
-    if (sym.decl != id.DECL_NIL) { ret sym; }
-    val m: *driver.ModuleEntry = module_entry(root, sym.origin);
-    if (m == nil) { ret nil; }
-    ret defining_symbol(m.resolve_result, sym);
+    if (!id.decl_is_nil(sym.decl)) { ret sym; }
+    val opt_module_index: opt[u32] = module_index(root, sym.origin);
+    if (sel opt_module_index.none) { ret nil; }
+    ret defining_symbol(module_resolve(root, opt_module_index.some), sym);
 }
 
 # the defining module's own symbol for `sym`. a `use` or `fwd` binding names
@@ -1863,23 +1772,20 @@ pub fun defining_symbol_in(root: *Root, sym: *rslv.Symbol) *rslv.Symbol {
 # sym: a symbol whose origin is that module
 # ret: the local symbol, `sym` itself when it already carries its declaration, or nil
 fun defining_symbol(rr: *rslv.ResolveResult, sym: *rslv.Symbol) *rslv.Symbol {
-    if (sym.decl != id.DECL_NIL) { ret sym; }
-    if (rr == nil)               { ret nil; }
+    if (!id.decl_is_nil(sym.decl)) { ret sym; }
+    if (rr == nil)                 { ret nil; }
     var kind: rslv.SymKind = sym.kind;
     if (kind == rslv.SYM_IMPORTED) { kind = sym.definition_kind; }
     var i: u32 = 0;
     for (i < rr.symbol_count) {
         val cand: *rslv.Symbol = ?rr.symbols[i];
-        if (cand.kind == kind && cand.canon == sym.canon
-            && cand.origin == sym.origin && cand.decl != id.DECL_NIL) { ret cand; }
+        if (cand.kind == kind && intern.str_same(cand.canon, sym.canon)
+            && lmodule.stable_same(cand.origin, sym.origin) && !id.decl_is_nil(cand.decl)) { ret cand; }
         i = i + 1;
     }
     ret nil;
 }
 
-# loaded module `mid`'s entry in `root`, or nil when there is no
-# loaded project or the id is out of range
-# the loaded module whose source is `file`, or none
 # the source of `fid` in `root`'s session, read against the client's buffer
 # when an open document holds it and has moved past the snapshot. a file that is
 # not a loaded module pairs as it is
@@ -1890,26 +1796,97 @@ fun defining_symbol(rr: *rslv.ResolveResult, sym: *rslv.Symbol) *rslv.Symbol {
 # ret:  the pairing; its file is nil when `fid` is unknown
 pub fun file_text(w: *Workspace, root: *Root, fid: src.FileId) positions.Text {
     if (root == nil || !root.loaded) { ret positions.text_of(nil); }
-    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, fid);
-    if (sel fo.none) { ret positions.text_of(nil); }
-    val mo: opt[sess.ModuleId] = module_for_file(root, fid);
-    if (sel mo.none) { ret positions.text_of(fo.some); }
-    ret module_text(w, root, mo.some, fo.some);
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(root.s.sources, fid);
+    if (sel opt_sources_entry.none) { ret positions.text_of(nil); }
+    val opt_module_for_file: opt[u32] = module_for_file(root, fid);
+    if (sel opt_module_for_file.none) { ret positions.text_of(opt_sources_entry.some); }
+    ret module_text(w, root, opt_module_for_file.some, opt_sources_entry.some);
 }
 
-fun module_for_file(root: *Root, file: src.FileId) opt[sess.ModuleId] {
-    if (root == nil || !root.loaded) { ret opt[sess.ModuleId].none{}; }
+# whether `i` indexes a module of `root`'s live snapshot
+fun module_live(root: *Root, i: u32) bool {
+    ret root != nil && root.loaded && i < root.mod_path_count;
+}
+
+# the snapshot index of the loaded module whose source is `file`, or none
+fun module_for_file(root: *Root, file: src.FileId) opt[u32] {
+    if (root == nil || !root.loaded) { ret opt[u32].none{}; }
     var i: u32 = 0;
-    for (i < driver.module_count(?root.p)) {
-        if (driver.module_at(?root.p, i).file_id == file) { ret opt[sess.ModuleId].some{i::sess.ModuleId}; }
+    for (i < root.mod_path_count) {
+        if (src.file_same(root.mod_files[i], file)) { ret opt[u32].some{i}; }
         i = i + 1;
     }
-    ret opt[sess.ModuleId].none{};
+    ret opt[u32].none{};
 }
 
-fun module_entry(root: *Root, mid: sess.ModuleId) *driver.ModuleEntry {
-    if (root == nil || !root.loaded || mid::u32 >= driver.module_count(?root.p)) { ret nil; }
-    ret driver.module_at(?root.p, mid::u32);
+# the snapshot index of the module whose identity is `mid`, or none when no
+# loaded module carries it
+fun module_index(root: *Root, mid: lmodule.StableModuleId) opt[u32] {
+    if (root == nil || !root.loaded || lmodule.stable_is_nil(mid)) { ret opt[u32].none{}; }
+    var i: u32 = 0;
+    for (i < root.mod_path_count) {
+        if (lmodule.stable_same(root.mod_ids[i], mid)) { ret opt[u32].some{i}; }
+        i = i + 1;
+    }
+    ret opt[u32].none{};
+}
+
+# the identity of the module at snapshot index `i` in [0, module_count), the
+# id its symbols carry as their origin; nil when there is none
+pub fun module_id_at(root: *Root, i: u32) lmodule.StableModuleId {
+    if (!module_live(root, i)) { ret lmodule.STABLE_MODULE_NIL; }
+    ret root.mod_ids[i];
+}
+
+# the source file the module at snapshot index `i` was read from, or none
+fun module_source(root: *Root, i: u32) opt[*src.SourceFile] {
+    if (!module_live(root, i)) { ret opt[*src.SourceFile].none{}; }
+    ret src.get(root.s.sources, root.mod_files[i]);
+}
+
+# a snapshot module's products: its tree, resolve and sema results, each nil
+# when its phase did not run. the snapshot's view expires with its Session's
+# next query operation, and nothing but a build runs one, so an expiry is
+# logged rather than served
+fun module_ast(root: *Root, i: u32) *ast.Ast {
+    if (!module_live(root, i)) { ret nil; }
+    val res_project_ast_of: res[*ast.Ast, fail.Fail] = editor.project_ast_of(?root.snap, i);
+    if (sel res_project_ast_of.err) {
+        trace.logf("project: module tree unavailable: {}", fail.describe(res_project_ast_of.err));
+        ret nil;
+    }
+    ret res_project_ast_of.ok;
+}
+
+fun module_resolve(root: *Root, i: u32) *rslv.ResolveResult {
+    if (!module_live(root, i)) { ret nil; }
+    val res_project_resolve_of: res[*rslv.ResolveResult, fail.Fail] = editor.project_resolve_of(?root.snap, i);
+    if (sel res_project_resolve_of.err) {
+        trace.logf("project: module resolution unavailable: {}", fail.describe(res_project_resolve_of.err));
+        ret nil;
+    }
+    ret res_project_resolve_of.ok;
+}
+
+fun module_sema(root: *Root, i: u32) *sema_product.SemaResult {
+    if (!module_live(root, i)) { ret nil; }
+    val res_project_sema_of: res[*sema_product.SemaResult, fail.Fail] = editor.project_sema_of(?root.snap, i);
+    if (sel res_project_sema_of.err) {
+        trace.logf("project: module types unavailable: {}", fail.describe(res_project_sema_of.err));
+        ret nil;
+    }
+    ret res_project_sema_of.ok;
+}
+
+# whether the snapshot's own parse of the module at index `i` was accepted. the
+# module's standing would not do: it also takes resolve and sema, and a module
+# that parsed with a name error is what a stale buffer carries diagnostics from
+fun module_parse_ok(root: *Root, i: u32) bool {
+    if (module_ast(root, i) == nil) { ret false; }
+    val m:         *dproject.ModuleEntry    = dproject.module_at(?root.snap.project, i);
+    val opt_shown: opt[dfront.ParsedModule] = dfront.parsed(?root.snap.project, m);
+    if (sel opt_shown.none) { ret false; }
+    ret report_phase.is_accepted(opt_shown.some.status);
 }
 
 # release a Site's URI when it owns one
@@ -1933,7 +1910,7 @@ pub fun free_site(w: *Workspace, site: *Site) {
 pub rec ModuleView {
     a:       *ast.Ast;
     rr:      *rslv.ResolveResult;
-    sr:      *sema.SemaResult;
+    sr:      *sema_product.SemaResult;
     text:    positions.Text;
     file_id: src.FileId;
 }
@@ -1945,10 +1922,10 @@ pub rec ModuleView {
 # parse_ok: the snapshot's own parse of this module was accepted
 pub rec DocumentView {
     root:     *Root;
-    module:   sess.ModuleId;
+    module:   lmodule.StableModuleId;
     a:        *ast.Ast;
     rr:       *rslv.ResolveResult;
-    sr:       *sema.SemaResult;
+    sr:       *sema_product.SemaResult;
     text:     positions.Text;
     interner: *intern.Interner;
     revision: u64;
@@ -2040,31 +2017,30 @@ pub fun current_pending(w: *Workspace, d: *documents.Document) bool {
 }
 
 fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[DocumentView, str] {
-    val mo: opt[sess.ModuleId] = module_for_norm(root, d.path);
-    if (sel mo.none) { ret res[DocumentView, str].err{"project: document module was not loaded"}; }
-    val mid: sess.ModuleId       = mo.some;
-    val m:   *driver.ModuleEntry = module_entry(root, mid);
+    val opt_module_for_norm: opt[u32] = module_for_norm(root, d.path);
+    if (sel opt_module_for_norm.none) { ret res[DocumentView, str].err{"project: document module was not loaded"}; }
+    val mi: u32 = opt_module_for_norm.some;
     # a module whose own parse was rejected carries its tree and resolve result
     # but no sema product; the view says so through a nil `sr` rather than
     # falling back to single-buffer analysis
-    if (m == nil || m.a == nil || m.resolve_result == nil) {
-        ret res[DocumentView, str].err{"project: document analysis unavailable"};
-    }
-    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
-    if (sel fo.none) { ret res[DocumentView, str].err{"project: document source unavailable"}; }
+    val a:  *ast.Ast            = module_ast(root, mi);
+    val rr: *rslv.ResolveResult = module_resolve(root, mi);
+    if (a == nil || rr == nil) { ret res[DocumentView, str].err{"project: document analysis unavailable"}; }
+    val opt_module_source: opt[*src.SourceFile] = module_source(root, mi);
+    if (sel opt_module_source.none) { ret res[DocumentView, str].err{"project: document source unavailable"}; }
     var v: DocumentView;
     v.root   = root;
-    v.module = mid;
-    v.a      = m.a;
-    v.rr     = m.resolve_result;
-    v.sr     = m.sema_result;
+    v.module = root.mod_ids[mi];
+    v.a      = a;
+    v.rr     = rr;
+    v.sr     = module_sema(root, mi);
     v.stale  = d.revision > root.snapshot_revision;
-    v.text   = positions.text_of(fo.some);
-    if (v.stale) { v.text = positions.text_against(fo.some, documents.live_file(w.docs, d), module_windows(w, root, mid, fo.some, d)); }
-    v.interner = ?root.s.interner;
+    v.text   = positions.text_of(opt_module_source.some);
+    if (v.stale) { v.text = positions.text_against(opt_module_source.some, documents.live_file(w.docs, d), module_windows(w, root, mi, opt_module_source.some, d)); }
+    v.interner = root.s.interner;
     v.revision = root.snapshot_revision;
-    v.file_id  = m.file_id;
-    v.parse_ok = sel m.parse_status.kind.accepted;
+    v.file_id  = root.mod_files[mi];
+    v.parse_ok = module_parse_ok(root, mi);
     ret res[DocumentView, str].ok{v};
 }
 
@@ -2075,7 +2051,7 @@ fun view_from_root(w: *Workspace, root: *Root, d: *documents.Document) res[Docum
 # ret:  the loaded module count
 pub fun module_count(root: *Root) u32 {
     if (root == nil || !root.loaded) { ret 0; }
-    ret driver.module_count(?root.p);
+    ret root.mod_path_count;
 }
 
 # a borrowed view of loaded module `mid` in `root` for the use-site
@@ -2087,17 +2063,19 @@ pub fun module_count(root: *Root) u32 {
 # root: the root governing the request, or nil
 # mid:  a loaded module id in [0, module_count)
 # ret:  some(ModuleView), or none
-pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleView] {
-    val m: *driver.ModuleEntry = module_entry(root, mid);
-    if (m == nil || !m.resolved) { ret opt[ModuleView].none{}; }
-    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
-    if (sel fo.none) { ret opt[ModuleView].none{}; }
+pub fun module_view(w: *Workspace, root: *Root, mid: lmodule.StableModuleId) opt[ModuleView] {
+    val opt_module_index: opt[u32] = module_index(root, mid);
+    if (sel opt_module_index.none) { ret opt[ModuleView].none{}; }
+    val rr: *rslv.ResolveResult = module_resolve(root, opt_module_index.some);
+    if (rr == nil) { ret opt[ModuleView].none{}; }
+    val opt_module_source: opt[*src.SourceFile] = module_source(root, opt_module_index.some);
+    if (sel opt_module_source.none) { ret opt[ModuleView].none{}; }
     var v: ModuleView;
-    v.a       = m.a;
-    v.rr      = m.resolve_result;
-    v.sr      = m.sema_result;
-    v.text    = module_text(w, root, mid, fo.some);
-    v.file_id = m.file_id;
+    v.a       = module_ast(root, opt_module_index.some);
+    v.rr      = rr;
+    v.sr      = module_sema(root, opt_module_index.some);
+    v.text    = module_text(w, root, opt_module_index.some, opt_module_source.some);
+    v.file_id = root.mod_files[opt_module_index.some];
     ret opt[ModuleView].some{v};
 }
 
@@ -2115,20 +2093,20 @@ pub fun module_view(w: *Workspace, root: *Root, mid: sess.ModuleId) opt[ModuleVi
 # file: the module's snapshot source
 # d:    the open document holding the module
 # ret:  the windows, or nil
-fun module_windows(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile, d: *documents.Document) *textdiff.Windows {
+fun module_windows(w: *Workspace, root: *Root, mi: u32, file: *src.SourceFile, d: *documents.Document) *textdiff.Windows {
     val live: *src.SourceFile = documents.live_file(w.docs, d);
     if (live == nil) { ret nil; }
     if (root.wins == nil) {
-        val n:  u32                                     = driver.module_count(?root.p);
-        val wr: res[*textdiff.Windows, allocator.Error] = allocate[textdiff.Windows](w.alloc, n::usize);
-        if (sel wr.err) { ret nil; }
-        val rr: res[*u64, allocator.Error] = allocate[u64](w.alloc, n::usize);
-        if (sel rr.err) {
-            deallocate[textdiff.Windows](w.alloc, wr.ok, n::usize);
+        val n:            u32                                     = root.mod_path_count;
+        val res_allocate: res[*textdiff.Windows, allocator.Error] = allocate[textdiff.Windows](w.alloc, n::usize);
+        if (sel res_allocate.err) { ret nil; }
+        val res_allocate_alloc: res[*u64, allocator.Error] = allocate[u64](w.alloc, n::usize);
+        if (sel res_allocate_alloc.err) {
+            deallocate[textdiff.Windows](w.alloc, res_allocate.ok, n::usize);
             ret nil;
         }
-        root.wins     = wr.ok;
-        root.wins_rev = rr.ok;
+        root.wins     = res_allocate.ok;
+        root.wins_rev = res_allocate_alloc.ok;
         root.wins_len = n;
         var i: u32 = 0;
         for (i < n) {
@@ -2137,12 +2115,12 @@ fun module_windows(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.So
             i                = i + 1;
         }
     }
-    if (mid::u32 >= root.wins_len) { ret nil; }
-    val slot: *textdiff.Windows = ?root.wins[mid::u32];
-    if (root.wins_rev[mid::u32] == d.revision) { ret slot; }
-    root.wins_rev[mid::u32] = 0;
+    if (mi >= root.wins_len) { ret nil; }
+    val slot: *textdiff.Windows = ?root.wins[mi];
+    if (root.wins_rev[mi] == d.revision) { ret slot; }
+    root.wins_rev[mi] = 0;
     if (!textdiff.compute(w.alloc, file, str_len(file.text), live, str_len(live.text), slot)) { ret nil; }
-    root.wins_rev[mid::u32] = d.revision;
+    root.wins_rev[mi] = d.revision;
     ret slot;
 }
 
@@ -2173,10 +2151,10 @@ fun free_windows(w: *Workspace, r: *Root) {
 # mid:  the module
 # file: the module's snapshot source
 # ret:  the pairing
-fun module_text(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.SourceFile) positions.Text {
-    val d: *documents.Document = ahead_document(w, root, mid);
+fun module_text(w: *Workspace, root: *Root, mi: u32, file: *src.SourceFile) positions.Text {
+    val d: *documents.Document = ahead_at(w, root, mi);
     if (d == nil) { ret positions.text_of(file); }
-    ret positions.text_against(file, documents.live_file(w.docs, d), module_windows(w, root, mid, file, d));
+    ret positions.text_against(file, documents.live_file(w.docs, d), module_windows(w, root, mi, file, d));
 }
 
 # the open document mirroring module `mid` of `root` whose text has moved past
@@ -2187,9 +2165,16 @@ fun module_text(w: *Workspace, root: *Root, mid: sess.ModuleId, file: *src.Sourc
 # root: the module's root, or nil
 # mid:  a module of `root`'s snapshot
 # ret:  the ahead document, or nil
-pub fun ahead_document(w: *Workspace, root: *Root, mid: sess.ModuleId) *documents.Document {
-    if (w.docs == nil || root == nil || root.mod_paths == nil || mid::u32 >= root.mod_path_count) { ret nil; }
-    val path: str = root.mod_paths[mid::u32];
+pub fun ahead_document(w: *Workspace, root: *Root, mid: lmodule.StableModuleId) *documents.Document {
+    val opt_module_index: opt[u32] = module_index(root, mid);
+    if (sel opt_module_index.none) { ret nil; }
+    ret ahead_at(w, root, opt_module_index.some);
+}
+
+# `ahead_document` for the module at snapshot index `mi`
+fun ahead_at(w: *Workspace, root: *Root, mi: u32) *documents.Document {
+    if (w.docs == nil || root == nil || root.mod_paths == nil || mi >= root.mod_path_count) { ret nil; }
+    val path: str = root.mod_paths[mi];
     if (path == nil) { ret nil; }
     val n: usize = documents.slot_count(w.docs);
     var i: usize = 0;
@@ -2213,7 +2198,7 @@ pub fun ahead_document(w: *Workspace, root: *Root, mid: sess.ModuleId) *document
 # sr:  a buffer's / module's SemaResult, or nil
 # eid: the expression id to type
 # ret: the expression's TypeId, or TYPE_NIL
-pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
+pub fun type_of(sr: *sema_product.SemaResult, eid: id.ExprId) type_kind.TypeId {
     ret mtypes.type_of(sr, eid);
 }
 
@@ -2223,7 +2208,7 @@ pub fun type_of(sr: *sema.SemaResult, eid: id.ExprId) type.TypeId {
 # sr:  a buffer's / module's SemaResult, or nil
 # did: the declaration id to type
 # ret: the declaration's TypeId, or TYPE_NIL
-pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
+pub fun decl_type_of(sr: *sema_product.SemaResult, did: id.DeclId) type_kind.TypeId {
     ret mtypes.decl_type_of(sr, did);
 }
 
@@ -2234,7 +2219,7 @@ pub fun decl_type_of(sr: *sema.SemaResult, did: id.DeclId) type.TypeId {
 # sr:  a buffer's / module's SemaResult, or nil
 # tid: the Ast type id to resolve
 # ret: the written type's TypeId, or TYPE_NIL
-pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
+pub fun type_ref_of(sr: *sema_product.SemaResult, tid: id.TypeId) type_kind.TypeId {
     ret mtypes.type_ref_of(sr, tid);
 }
 
@@ -2252,11 +2237,11 @@ pub fun type_ref_of(sr: *sema.SemaResult, tid: id.TypeId) type.TypeId {
 # fields_len:   number of fields (record fields / union variants)
 # is_rec:       true for a record, false for a union
 pub rec RecordSite {
-    origin:       sess.ModuleId;
+    origin:       lmodule.StableModuleId;
     decl:         id.DeclId;
     file:         src.FileId;
     name:         intern.StrId;
-    name_span:    token.Span;
+    name_span:    lsrc.Span;
     a:            *ast.Ast;
     text:         positions.Text;
     fields_start: u32;
@@ -2278,20 +2263,18 @@ pub rec RecordSite {
 # root: the root the type was resolved under, or nil
 # tid:  a TypeId, typically read from a SemaResult via `type_of`
 # ret:  some(RecordSite), or none
-pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) opt[RecordSite] {
-    val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
-    if (sel no.none) { ret opt[RecordSite].none{}; }
-    val n: mtypes.Nominal = no.some;
+pub fun record_decl(w: *Workspace, root: *Root, tid: type_kind.TypeId) opt[RecordSite] {
+    val opt_nominal_of_tid: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (sel opt_nominal_of_tid.none) { ret opt[RecordSite].none{}; }
+    val n: mtypes.Nominal = opt_nominal_of_tid.some;
 
-    val mid: opt[sess.ModuleId] = module_for_file(root, n.file);
-    if (sel mid.none) { ret opt[RecordSite].none{}; }
-    val m: *driver.ModuleEntry = module_entry(root, mid.some);
-    if (m == nil) { ret opt[RecordSite].none{}; }
-    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
-    if (sel fo.none) { ret opt[RecordSite].none{}; }
-    val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
-    if (sel decl.none) { ret opt[RecordSite].none{}; }
-    ret record_site_from(mid.some, decl.some, m.file_id, n.name, m.a, module_text(w, root, mid.some, fo.some));
+    val opt_module_for_file: opt[u32] = module_for_file(root, n.file);
+    if (sel opt_module_for_file.none) { ret opt[RecordSite].none{}; }
+    val opt_module_source: opt[*src.SourceFile] = module_source(root, opt_module_for_file.some);
+    if (sel opt_module_source.none) { ret opt[RecordSite].none{}; }
+    val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(module_ast(root, opt_module_for_file.some), positions.text_of(opt_module_source.some), root.s.interner, n);
+    if (sel opt_decl.none) { ret opt[RecordSite].none{}; }
+    ret record_site_from(root.mod_ids[opt_module_for_file.some], opt_decl.some, root.mod_files[opt_module_for_file.some], n.name, module_ast(root, opt_module_for_file.some), module_text(w, root, opt_module_for_file.some, opt_module_source.some));
 }
 
 # `record_decl` extended to resolve a record / union declared in
@@ -2308,14 +2291,14 @@ pub fun record_decl(w: *Workspace, root: *Root, tid: type.TypeId) opt[RecordSite
 # own_text: the buffer's text, as the request reads it
 # tid:      a TypeId, typically read from a SemaResult via `type_of`
 # ret:      some(RecordSite), or none
-pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type.TypeId) opt[RecordSite] {
-    val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
-    if (sel no.none) { ret opt[RecordSite].none{}; }
-    val n: mtypes.Nominal = no.some;
-    if (own_text.file != nil && n.file == own_fid) {
-        val decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
-        if (sel decl.none) { ret opt[RecordSite].none{}; }
-        ret record_site_from(own, decl.some, own_fid, n.name, own_a, own_text);
+pub fun record_decl_in(w: *Workspace, root: *Root, own: lmodule.StableModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type_kind.TypeId) opt[RecordSite] {
+    val opt_nominal_of_tid: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (sel opt_nominal_of_tid.none) { ret opt[RecordSite].none{}; }
+    val n: mtypes.Nominal = opt_nominal_of_tid.some;
+    if (own_text.file != nil && src.file_same(n.file, own_fid)) {
+        val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
+        if (sel opt_decl.none) { ret opt[RecordSite].none{}; }
+        ret record_site_from(own, opt_decl.some, own_fid, n.name, own_a, own_text);
     }
     ret record_decl(w, root, tid);
 }
@@ -2332,20 +2315,20 @@ pub fun record_decl_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: 
 # that declares it, however many hops sit between them.
 pub fun type_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: str) opt[TypeSite] {
     if (root == nil || module_fqn == nil || type_name == nil) { ret opt[TypeSite].none{}; }
-    val mo: opt[sess.ModuleId] = module_by_fqn(w, root, module_fqn);
-    if (sel mo.none) { ret opt[TypeSite].none{}; }
-    val mvo: opt[ModuleView] = module_view(w, root, mo.some);
-    if (sel mvo.none) { ret opt[TypeSite].none{}; }
-    val mv: ModuleView = mvo.some;
+    val opt_module_by_fqn: opt[lmodule.StableModuleId] = module_by_fqn(w, root, module_fqn);
+    if (sel opt_module_by_fqn.none) { ret opt[TypeSite].none{}; }
+    val opt_module_view: opt[ModuleView] = module_view(w, root, opt_module_by_fqn.some);
+    if (sel opt_module_view.none) { ret opt[TypeSite].none{}; }
+    val mv: ModuleView = opt_module_view.some;
     if (mv.rr == nil) { ret opt[TypeSite].none{}; }
     var i: u32 = 0;
     for (i < mv.rr.pub_count) {
-        val sym: *rslv.Symbol = ?mv.rr.symbols[i];
-        val no:  opt[str]     = intern.lookup(?root.s.interner, sym.name);
-        if (sel no.some) {
-            if (str_equals(no.some, type_name)) {
-                val site: opt[TypeSite] = type_site_for_symbol(w, root, mo.some, mv, sym);
-                if (sel site.some) { ret site; }
+        val sym:                *rslv.Symbol = ?mv.rr.symbols[i];
+        val opt_interner_entry: opt[str]     = intern.get(root.s.interner, sym.name);
+        if (sel opt_interner_entry.some) {
+            if (str_equals(opt_interner_entry.some, type_name)) {
+                val opt_site: opt[TypeSite] = type_site_for_symbol(w, root, opt_module_by_fqn.some, mv, sym);
+                if (sel opt_site.some) { ret opt_site; }
             }
         }
         i = i + 1;
@@ -2357,15 +2340,15 @@ pub fun type_in_module(w: *Workspace, root: *Root, module_fqn: str, type_name: s
 # declaring module. `defining_symbol_in` walks the re-export to the
 # declaration-bearing symbol, and the compiler flattens the origin, so a chain
 # of re-exports resolves in one step (#332)
-fun type_site_for_symbol(w: *Workspace, root: *Root, mid: sess.ModuleId, mv: ModuleView, sym: *rslv.Symbol) opt[TypeSite] {
-    if (sym.decl != id.DECL_NIL) {
+fun type_site_for_symbol(w: *Workspace, root: *Root, mid: lmodule.StableModuleId, mv: ModuleView, sym: *rslv.Symbol) opt[TypeSite] {
+    if (!id.decl_is_nil(sym.decl)) {
         ret type_site_from(mid, sym.decl, mv.file_id, mv.a, mv.text);
     }
     val def: *rslv.Symbol = defining_symbol_in(root, sym);
-    if (def == nil || def.decl == id.DECL_NIL) { ret opt[TypeSite].none{}; }
-    val dmvo: opt[ModuleView] = module_view(w, root, def.origin);
-    if (sel dmvo.none) { ret opt[TypeSite].none{}; }
-    val dmv: ModuleView = dmvo.some;
+    if (def == nil || id.decl_is_nil(def.decl)) { ret opt[TypeSite].none{}; }
+    val opt_module_view: opt[ModuleView] = module_view(w, root, def.origin);
+    if (sel opt_module_view.none) { ret opt[TypeSite].none{}; }
+    val dmv: ModuleView = opt_module_view.some;
     ret type_site_from(def.origin, def.decl, dmv.file_id, dmv.a, dmv.text);
 }
 
@@ -2384,17 +2367,17 @@ fun type_site_for_symbol(w: *Workspace, root: *Root, mid: sess.ModuleId, mv: Mod
 # own_text: the buffer's text, as the request reads it
 # decl:     the rec / uni DeclId in the buffer
 # ret:      some(RecordSite), or none
-pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, decl: id.DeclId) opt[RecordSite] {
-    if (decl == id.DECL_NIL) { ret opt[RecordSite].none{}; }
-    val site: opt[RecordSite] = record_site_from(own, decl, own_fid, intern.STR_NIL, own_a, own_text);
-    if (sel site.none) { ret site; }
-    var rs:   RecordSite = site.some;
+pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: lmodule.StableModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, decl: id.DeclId) opt[RecordSite] {
+    if (id.decl_is_nil(decl)) { ret opt[RecordSite].none{}; }
+    val opt_site: opt[RecordSite] = record_site_from(own, decl, own_fid, intern.STR_NIL, own_a, own_text);
+    if (sel opt_site.none) { ret opt_site; }
+    var rs:   RecordSite = opt_site.some;
     val text: str        = positions.span_text(rs.text, rs.name_span, alloc);
     if (text == nil) { ret opt[RecordSite].none{}; }
-    val ir: res[intern.StrId, allocator.Error] = intern.intern(itn, text);
+    val res_itn_added: res[intern.StrId, allocator.Error] = intern.add(itn, text);
     strutil.str_free(alloc, text);
-    if (sel ir.err) { ret opt[RecordSite].none{}; }
-    rs.name = ir.ok;
+    if (sel res_itn_added.err) { ret opt[RecordSite].none{}; }
+    rs.name = res_itn_added.ok;
     ret opt[RecordSite].some{rs};
 }
 
@@ -2408,10 +2391,10 @@ pub fun record_site_at(itn: *intern.Interner, alloc: *Allocator, own: sess.Modul
 # text:      SourceFile backing `a`, paired with its length
 # kind:      the declaration kind that named the type
 pub rec TypeSite {
-    origin:    sess.ModuleId;
+    origin:    lmodule.StableModuleId;
     decl:      id.DeclId;
     file:      src.FileId;
-    name_span: token.Span;
+    name_span: lsrc.Span;
     a:         *ast.Ast;
     text:      positions.Text;
     kind:      adecl.DeclKind;
@@ -2440,35 +2423,33 @@ pub rec TypeSite {
 # own_text: the buffer's text, as the request reads it
 # tid:      a TypeId, typically read from a SemaResult
 # ret:      some(TypeSite), or none for a type with no nominal declaration
-pub fun type_site_in(w: *Workspace, root: *Root, own: sess.ModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type.TypeId) opt[TypeSite] {
-    val no: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
-    if (sel no.none) { ret opt[TypeSite].none{}; }
-    val n: mtypes.Nominal = no.some;
+pub fun type_site_in(w: *Workspace, root: *Root, own: lmodule.StableModuleId, own_fid: src.FileId, own_a: *ast.Ast, own_text: positions.Text, tid: type_kind.TypeId) opt[TypeSite] {
+    val opt_nominal_of_tid: opt[mtypes.Nominal] = nominal_of_tid(w, root, tid);
+    if (sel opt_nominal_of_tid.none) { ret opt[TypeSite].none{}; }
+    val n: mtypes.Nominal = opt_nominal_of_tid.some;
 
-    if (own_text.file != nil && n.file == own_fid) {
-        val own_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
-        if (sel own_decl.none) { ret opt[TypeSite].none{}; }
-        ret type_site_from(own, own_decl.some, own_fid, own_a, own_text);
+    if (own_text.file != nil && src.file_same(n.file, own_fid)) {
+        val opt_own_decl: opt[id.DeclId] = mtypes.nominal_decl(own_a, own_text, interner(w, root), n);
+        if (sel opt_own_decl.none) { ret opt[TypeSite].none{}; }
+        ret type_site_from(own, opt_own_decl.some, own_fid, own_a, own_text);
     }
 
-    val mid: opt[sess.ModuleId] = module_for_file(root, n.file);
-    if (sel mid.none) { ret opt[TypeSite].none{}; }
-    val m: *driver.ModuleEntry = module_entry(root, mid.some);
-    if (m == nil) { ret opt[TypeSite].none{}; }
-    val fo: opt[*src.SourceFile] = src.get(?root.s.sources, m.file_id);
-    if (sel fo.none) { ret opt[TypeSite].none{}; }
-    val decl: opt[id.DeclId] = mtypes.nominal_decl(m.a, positions.text_of(fo.some), ?root.s.interner, n);
-    if (sel decl.none) { ret opt[TypeSite].none{}; }
-    ret type_site_from(mid.some, decl.some, m.file_id, m.a, module_text(w, root, mid.some, fo.some));
+    val opt_module_for_file: opt[u32] = module_for_file(root, n.file);
+    if (sel opt_module_for_file.none) { ret opt[TypeSite].none{}; }
+    val opt_module_source: opt[*src.SourceFile] = module_source(root, opt_module_for_file.some);
+    if (sel opt_module_source.none) { ret opt[TypeSite].none{}; }
+    val opt_decl: opt[id.DeclId] = mtypes.nominal_decl(module_ast(root, opt_module_for_file.some), positions.text_of(opt_module_source.some), root.s.interner, n);
+    if (sel opt_decl.none) { ret opt[TypeSite].none{}; }
+    ret type_site_from(root.mod_ids[opt_module_for_file.some], opt_decl.some, root.mod_files[opt_module_for_file.some], module_ast(root, opt_module_for_file.some), module_text(w, root, opt_module_for_file.some, opt_module_source.some));
 }
 
 # build a TypeSite for the decl `decl` in `a` (backed by `file`), or
 # none when the decl is absent or declares no type name. the one place a new
 # type-declaring kind is admitted
-pub fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, text: positions.Text) opt[TypeSite] {
-    val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
-    if (sel d_opt.none) { ret opt[TypeSite].none{}; }
-    val d: *adecl.Decl = d_opt.some;
+pub fun type_site_from(origin: lmodule.StableModuleId, decl: id.DeclId, fid: src.FileId, a: *ast.Ast, text: positions.Text) opt[TypeSite] {
+    val opt_decl: opt[*adecl.Decl] = ast.get_decl(a, decl);
+    if (sel opt_decl.none) { ret opt[TypeSite].none{}; }
+    val d: *adecl.Decl = opt_decl.some;
 
     var ts: TypeSite;
     if (d.kind == adecl.DECL_KIND_REC) { ts.name_span = d.data.rec_.name; }
@@ -2488,7 +2469,7 @@ pub fun type_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, 
 # the nominal back-link of `tid` against the type interner the request's
 # analysis ran under: the root's when there is one, else the standalone
 # session's. none when `tid` is not nominal or the root is not loaded
-fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) opt[mtypes.Nominal] {
+fun nominal_of_tid(w: *Workspace, root: *Root, tid: type_kind.TypeId) opt[mtypes.Nominal] {
     if (root != nil && !root.loaded) { ret opt[mtypes.Nominal].none{}; }
     ret mtypes.nominal_of(type_interner(w, root), tid);
 }
@@ -2497,10 +2478,10 @@ fun nominal_of_tid(w: *Workspace, root: *Root, tid: type.TypeId) opt[mtypes.Nomi
 # by `file`), or none when the decl is absent or not a rec / uni. the shared core
 # of `record_decl` / `record_decl_in` - both having chosen which Ast / file the
 # declaration lives in
-fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, name: intern.StrId, a: *ast.Ast, text: positions.Text) opt[RecordSite] {
-    val d_opt: opt[*adecl.Decl] = ast.get_decl(a, decl);
-    if (sel d_opt.none) { ret opt[RecordSite].none{}; }
-    val d:      *adecl.Decl = d_opt.some;
+fun record_site_from(origin: lmodule.StableModuleId, decl: id.DeclId, fid: src.FileId, name: intern.StrId, a: *ast.Ast, text: positions.Text) opt[RecordSite] {
+    val opt_decl: opt[*adecl.Decl] = ast.get_decl(a, decl);
+    if (sel opt_decl.none) { ret opt[RecordSite].none{}; }
+    val d:      *adecl.Decl = opt_decl.some;
     val is_rec: bool        = d.kind == adecl.DECL_KIND_REC;
     if (!is_rec && d.kind != adecl.DECL_KIND_UNI) { ret opt[RecordSite].none{}; }
 
@@ -2533,10 +2514,19 @@ fun record_site_from(origin: sess.ModuleId, decl: id.DeclId, fid: src.FileId, na
 # root: the root governing the request, or nil
 # mid:  a loaded module id
 # ret:  an owned URI, or nil
-pub fun module_uri(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
-    if (root == nil || !root.loaded || mid::u32 >= root.mod_path_count) { ret nil; }
-    if (root.mod_paths[mid::u32] == nil)                                { ret nil; }
-    ret uris.of_norm(w.alloc, root.mod_paths[mid::u32]);
+pub fun module_uri(w: *Workspace, root: *Root, mid: lmodule.StableModuleId) str {
+    val opt_module_index: opt[u32] = module_index(root, mid);
+    if (sel opt_module_index.none) { ret nil; }
+    val mi: u32 = opt_module_index.some;
+    if (mi >= root.mod_path_count || root.mod_paths[mi] == nil) { ret nil; }
+    ret uris.of_norm(w.alloc, root.mod_paths[mi]);
+}
+
+# the diagnostics a root's live snapshot recorded, located through the root's
+# Session sources; nil when no snapshot is live
+pub fun diagnostics_of(root: *Root) *diag.DiagnosticStore {
+    if (root == nil || !root.loaded) { ret nil; }
+    ret root.snap.diagnostics;
 }
 
 # the session a root's types and interners belong to
@@ -2573,19 +2563,19 @@ pub fun root_is_loaded(r: *Root) bool {
 # the interned FQN of a loaded module, or nil
 #
 # The name a module alias stands for. `module_uri` gives where it lives; this
-# gives what it is called, so hover can say `module std.data.json` rather than
+# gives what it is called, so hover can say `module std.text.string` rather than
 # echoing the `use` line the cursor is already on.
 # ---
 # w:    the workspace
 # root: the root owning the module
 # mid:  module id within that root
 # ret:  borrowed FQN text, or nil when the module is not loaded
-pub fun module_fqn(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
-    val e: *driver.ModuleEntry = module_entry(root, mid);
-    if (e == nil) { ret nil; }
-    val o: opt[str] = intern.lookup(?root.s.interner, e.fqn);
-    if (sel o.none) { ret nil; }
-    ret o.some;
+pub fun module_fqn(w: *Workspace, root: *Root, mid: lmodule.StableModuleId) str {
+    val opt_module_index: opt[u32] = module_index(root, mid);
+    if (sel opt_module_index.none) { ret nil; }
+    val res_project_module_fqn: res[str, fail.Fail] = editor.project_module_fqn(?root.snap, opt_module_index.some);
+    if (sel res_project_module_fqn.err) { ret nil; }
+    ret res_project_module_fqn.ok;
 }
 
 # the loaded module in `root` called `fqn`, or none
@@ -2598,17 +2588,11 @@ pub fun module_fqn(w: *Workspace, root: *Root, mid: sess.ModuleId) str {
 # root: the root to search, or nil
 # fqn:  a module path as written, `std.print`
 # ret:  some(ModuleId), or none when no loaded module has that name
-pub fun module_by_fqn(w: *Workspace, root: *Root, fqn: str) opt[sess.ModuleId] {
-    if (root == nil || !root.loaded || fqn == nil) { ret opt[sess.ModuleId].none{}; }
-    var i: u32 = 0;
-    for (i < driver.module_count(?root.p)) {
-        val o: opt[str] = intern.lookup(?root.s.interner, driver.module_at(?root.p, i).fqn);
-        if (sel o.some) {
-            if (str_equals(o.some, fqn)) { ret opt[sess.ModuleId].some{i::sess.ModuleId}; }
-        }
-        i = i + 1;
-    }
-    ret opt[sess.ModuleId].none{};
+pub fun module_by_fqn(w: *Workspace, root: *Root, fqn: str) opt[lmodule.StableModuleId] {
+    if (root == nil || !root.loaded || fqn == nil) { ret opt[lmodule.StableModuleId].none{}; }
+    val opt_project_module_by_fqn: opt[u32] = editor.project_module_by_fqn(?root.snap, fqn);
+    if (sel opt_project_module_by_fqn.none) { ret opt[lmodule.StableModuleId].none{}; }
+    ret opt[lmodule.StableModuleId].some{module_id_at(root, opt_project_module_by_fqn.some)};
 }
 
 # the loaded module in `root` whose source file is the document
@@ -2624,61 +2608,54 @@ pub fun module_by_fqn(w: *Workspace, root: *Root, fqn: str) opt[sess.ModuleId] {
 # root: the root governing the request, or nil
 # uri:  a document URI
 # ret:  some(ModuleId), or none
-pub fun module_for_uri(w: *Workspace, root: *Root, uri: str) opt[sess.ModuleId] {
-    if (root == nil || !root.loaded || uri == nil) { ret opt[sess.ModuleId].none{}; }
+pub fun module_for_uri(w: *Workspace, root: *Root, uri: str) opt[lmodule.StableModuleId] {
+    if (root == nil || !root.loaded || uri == nil) { ret opt[lmodule.StableModuleId].none{}; }
     val norm: str = uris.path_of(w.alloc, uri);
-    if (norm == nil) { ret opt[sess.ModuleId].none{}; }
-    val result: opt[sess.ModuleId] = module_for_norm(root, norm);
+    if (norm == nil) { ret opt[lmodule.StableModuleId].none{}; }
+    val opt_module_for_norm: opt[u32] = module_for_norm(root, norm);
     strutil.str_free(w.alloc, norm);
-    ret result;
+    if (sel opt_module_for_norm.none) { ret opt[lmodule.StableModuleId].none{}; }
+    ret opt[lmodule.StableModuleId].some{module_id_at(root, opt_module_for_norm.some)};
 }
 
 # the loaded module in `root` whose normalized source path
 # equals `norm`, or none. the allocation-free core of module_for_uri, also used
 # where one normalized document path is matched against several roots
-fun has_module_for_uri(o: opt[sess.ModuleId]) bool {
+fun has_module_for_uri(o: opt[lmodule.StableModuleId]) bool {
     ret sel o.some;
 }
 
-fun has_module_for_norm(o: opt[sess.ModuleId]) bool {
+fun has_module_for_norm(o: opt[u32]) bool {
     ret sel o.some;
 }
 
-fun module_for_norm(root: *Root, norm: str) opt[sess.ModuleId] {
-    if (root == nil || norm == nil) { ret opt[sess.ModuleId].none{}; }
+fun module_for_norm(root: *Root, norm: str) opt[u32] {
+    if (root == nil || norm == nil) { ret opt[u32].none{}; }
     var i: u32 = 0;
     for (i < root.mod_path_count) {
         if (root.mod_paths[i] != nil && str_equals(root.mod_paths[i], norm)) {
-            ret opt[sess.ModuleId].some{i::sess.ModuleId};
+            ret opt[u32].some{i};
         }
         i = i + 1;
     }
-    ret opt[sess.ModuleId].none{};
+    ret opt[u32].none{};
 }
 
 # whether loaded module `mid` in `root` belongs to the user's
-# own editable project rather than a vendored dependency. False when the whole
-# root is vendored; otherwise true iff the module FQN begins with the project id.
+# own editable project rather than a dependency. False when the whole root is
+# vendored; otherwise the snapshot's own root-membership answer.
 # ---
 # w:    the workspace
 # root: the root governing the request, or nil
 # mid:  a loaded module id
 # ret:  true for a project-owned module
-pub fun is_project_module(w: *Workspace, root: *Root, mid: sess.ModuleId) bool {
-    val m: *driver.ModuleEntry = module_entry(root, mid);
-    if (m == nil)      { ret false; }
-    if (root.vendored) { ret false; }
-    val id_opt:  opt[str] = intern.lookup(?root.s.interner, root.p.config.id);
-    val fqn_opt: opt[str] = intern.lookup(?root.s.interner, m.fqn);
-    if (sel id_opt.none)  { ret false; }
-    if (sel fqn_opt.none) { ret false; }
-    val pid:  str   = id_opt.some;
-    val fqn:  str   = fqn_opt.some;
-    val plen: usize = str_len(pid);
-    val flen: usize = str_len(fqn);
-    if (flen < plen || !str_starts_with(fqn, pid)) { ret false; }
-    if (flen == plen)                              { ret true; }
-    ret fqn[plen] == '.';
+pub fun is_project_module(w: *Workspace, root: *Root, mid: lmodule.StableModuleId) bool {
+    val opt_module_index: opt[u32] = module_index(root, mid);
+    if (sel opt_module_index.none) { ret false; }
+    if (root.vendored)             { ret false; }
+    val res_project_module_is_root: res[bool, fail.Fail] = editor.project_module_is_root(?root.snap, opt_module_index.some);
+    if (sel res_project_module_is_root.err) { ret false; }
+    ret res_project_module_is_root.ok;
 }
 
 # the project root governing `uri` - the nearest ancestor of its
@@ -2721,15 +2698,15 @@ pub fun has_project(w: *Workspace, uri: str) bool {
 # when the manifest / lockfile changes
 # the text to show for a build-layer `Fail`.
 #
-# `outcome.Fail` carries a message only when the failure was NOT already filed
+# `lfail.Fail` carries a message only when the failure was NOT already filed
 # as a located diagnostic; a reported failure leaves `message` empty because the
 # compiler's own render step would have printed the diagnostics. the lsp has no
 # render step for a project load, so an empty message would surface as a blank
 # warning - name the channel the detail actually went to instead
-fun fail_message(f: *outcome.Fail) str {
-    if (sel f.internal)    { ret "internal compiler error while loading the project"; }
-    if (sel f.user)        { ret f.user; }
-    if (sel f.environment) { ret f.environment; }
+fun fail_message(f: *lfail.Fail) str {
+    if (sel f.message) { ret "internal compiler error while loading the project"; }
+    val opt_text: opt[str] = lfail.text(@f);
+    if (sel opt_text.some) { ret opt_text.some; }
     ret "the project does not compile; see the diagnostics on its source files";
 }
 
@@ -2740,13 +2717,13 @@ fun report_load_failure(w: *Workspace, root: str, msg: str) {
     trace.log(msg);
     trace.log("\n");
 
-    val p1:    str                       = "mach-lsp: failed to load project at ";
-    val p2:    str                       = ": ";
-    val p3:    str                       = " (cross-module features disabled for this project)";
-    val total: usize                     = str_len(p1) + str_len(root) + str_len(p2) + str_len(msg) + str_len(p3);
-    val r:     res[*u8, allocator.Error] = allocate[u8](w.alloc, total + 1);
-    if (sel r.err) { ret; }
-    val buf: *u8   = r.ok;
+    val p1:           str                       = "mach-lsp: failed to load project at ";
+    val p2:           str                       = ": ";
+    val p3:           str                       = " (cross-module features disabled for this project)";
+    val total:        usize                     = str_len(p1) + str_len(root) + str_len(p2) + str_len(msg) + str_len(p3);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](w.alloc, total + 1);
+    if (sel res_allocate.err) { ret; }
+    val buf: *u8   = res_allocate.ok;
     var off: usize = 0;
     off      = append(buf, off, p1);
     off      = append(buf, off, root);
@@ -2762,15 +2739,15 @@ fun report_load_failure(w: *Workspace, root: str, msg: str) {
 fun show_warning(w: *Workspace, text: str) {
     val qmsg: str = json.quote(text, w.alloc);
     if (qmsg == nil) { ret; }
-    val n1:    str                       = "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":2,\"message\":";
-    val n2:    str                       = "}}";
-    val total: usize                     = str_len(n1) + str_len(qmsg) + str_len(n2);
-    val r:     res[*u8, allocator.Error] = allocate[u8](w.alloc, total + 1);
-    if (sel r.err) {
+    val n1:           str                       = "{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":2,\"message\":";
+    val n2:           str                       = "}}";
+    val total:        usize                     = str_len(n1) + str_len(qmsg) + str_len(n2);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](w.alloc, total + 1);
+    if (sel res_allocate.err) {
         json.free_str(qmsg, w.alloc);
         ret;
     }
-    val buf: *u8   = r.ok;
+    val buf: *u8   = res_allocate.ok;
     var off: usize = 0;
     off      = append(buf, off, n1);
     off      = append(buf, off, qmsg);
@@ -2785,29 +2762,29 @@ fun show_warning(w: *Workspace, text: str) {
 # `mach.toml`, as an owned string, or nil when none exists. walks up to the
 # filesystem root with `path.parent` / `path.join`
 fun project_root_for(alloc: *Allocator, file_path: str) str {
-    val first_r: res[pathlib.Path, allocator.Error] = pathlib.parent(alloc, file_path);
-    if (sel first_r.err) { ret nil; }
-    var dir: str = first_r.ok;
+    val res_first: res[pathlib.Path, allocator.Error] = pathlib.parent(alloc, file_path);
+    if (sel res_first.err) { ret nil; }
+    var dir: str = res_first.ok;
 
     for (true) {
-        val cand_r: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, dir, "mach.toml");
-        if (sel cand_r.err) {
+        val res_cand: res[pathlib.Path, allocator.Error] = pathlib.join(alloc, dir, "mach.toml");
+        if (sel res_cand.err) {
             strutil.str_free(alloc, dir);
             ret nil;
         }
-        val cand:    str                       = cand_r.ok;
-        val found_r: res[bool, io_error.Error] = fs.is_file(cand);
-        var found:   bool                      = false;
-        if (sel found_r.ok) { found = found_r.ok; }
+        val cand:      str                       = res_cand.ok;
+        val res_found: res[bool, io_error.Error] = fs.is_file(cand);
+        var found:     bool                      = false;
+        if (sel res_found.ok) { found = res_found.ok; }
         strutil.str_free(alloc, cand);
         if (found) { ret dir; }
 
-        val up_r: res[pathlib.Path, allocator.Error] = pathlib.parent(alloc, dir);
-        if (sel up_r.err) {
+        val res_parent: res[pathlib.Path, allocator.Error] = pathlib.parent(alloc, dir);
+        if (sel res_parent.err) {
             strutil.str_free(alloc, dir);
             ret nil;
         }
-        val up: str = up_r.ok;
+        val up: str = res_parent.ok;
         if (str_equals(up, dir)) {
             strutil.str_free(alloc, up);
             strutil.str_free(alloc, dir);

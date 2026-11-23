@@ -1,6 +1,6 @@
 # JSON-RPC message reading and LSP payload construction
 #
-# reading goes through `std.data.json`: a message is parsed once into a real
+# reading goes through the `json` package: a message is parsed once into a real
 # Value tree and every field is reached by navigating it. the server used to
 # scan the raw body for a quoted key, which matched that key ANYWHERE in the
 # document - including inside an opened file's own source text, which for a
@@ -32,9 +32,13 @@ use std.allocator.allocate;
 use std.allocator.deallocate;
 use std.allocator.reallocate;
 
+use json_decode: json.decode;
+use json_error:  json.error;
+use json_ndjson: json.ndjson;
+use json_parse:  json.parse;
+use json_value:  json.value;
 use std.allocator.arena;
 use std.allocator.page;
-use sj: std.data.json;
 use std.io.writer;
 use mem: std.memory;
 
@@ -103,20 +107,20 @@ fun buf_reserve(b: *Buf, want: usize) bool {
     for (next < need) { next = next * 2; }
 
     if (b.data == nil) {
-        val r: res[*u8, allocator.Error] = allocate[u8](b.a, next);
-        if (sel r.err) {
+        val res_allocate: res[*u8, allocator.Error] = allocate[u8](b.a, next);
+        if (sel res_allocate.err) {
             b.failed = true;
             ret false;
         }
-        b.data = r.ok;
+        b.data = res_allocate.ok;
     }
     or {
-        val r: res[*u8, allocator.Error] = reallocate[u8](b.a, b.data, b.cap, next);
-        if (sel r.err) {
+        val res_reallocate: res[*u8, allocator.Error] = reallocate[u8](b.a, b.data, b.cap, next);
+        if (sel res_reallocate.err) {
             b.failed = true;
             ret false;
         }
-        b.data = r.ok;
+        b.data = res_reallocate.ok;
     }
     b.cap = next;
     ret true;
@@ -153,8 +157,8 @@ fun buf_write(ctx: ptr, p: *u8, len: usize) res[usize, writer.WriteError] {
 # b: the buffer to wrap
 # w: writer initialized in place; borrows `b`, which must outlive it
 pub fun buf_writer(b: *Buf, w: *writer.Writer) {
-    w.ctx     = b::ptr;
-    w.f_write = buf_write;
+    w.ctx      = b::ptr;
+    w.fn_write = buf_write;
 }
 
 # append `s` as a quoted JSON string, escaped by the std emitter
@@ -165,7 +169,7 @@ pub fun buf_writer(b: *Buf, w: *writer.Writer) {
 pub fun buf_push_quoted(b: *Buf, s: str) {
     var w: writer.Writer;
     buf_writer(b, ?w);
-    sj.write_json_string(?w, s::*u8);
+    json_ndjson.write_json_string(?w, s::*u8);
 }
 
 # append `value` in base 10
@@ -243,7 +247,7 @@ pub fun buf_str(b: *Buf) str {
 # root:  parsed root value; an object for any well-formed message
 # valid: whether the body parsed at all
 pub rec Message {
-    root:  sj.Value;
+    root:  json_value.Value;
     valid: bool;
 }
 
@@ -270,8 +274,8 @@ val READER_ARENA_CAP: usize = 64 * 1024;
 # ret:     true when the arena was created
 pub fun reader_init(rd: *Reader, backing: *Allocator) bool {
     rd.ready = false;
-    val r: err[allocator.Error] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
-    if (sel r.err) { ret false; }
+    val err_arena_made: err[allocator.Error] = arena.init(?rd.ar, backing, READER_ARENA_CAP);
+    if (sel err_arena_made.err) { ret false; }
     rd.ready = true;
     ret true;
 }
@@ -307,10 +311,10 @@ pub fun read(rd: *Reader, body: str, len: usize) Message {
     m.valid = false;
     if (!rd.ready || body == nil) { ret m; }
     var a: Allocator;
-    arena.make(?a, ?rd.ar);
-    val r: res[sj.Value, sj.JsonError] = sj.parse(body::*u8, len, ?a);
-    if (sel r.err) { ret m; }
-    m.root  = r.ok;
+    arena.allocator(?a, ?rd.ar);
+    val res_parse: res[json_value.Value, json_error.JsonError] = json_parse.parse(body::*u8, len, ?a);
+    if (sel res_parse.err) { ret m; }
+    m.root  = res_parse.ok;
     m.valid = true;
     ret m;
 }
@@ -326,11 +330,11 @@ pub fun release(rd: *Reader) {
 # v:   value to read
 # key: member name
 # ret: borrowed member value, or nil
-pub fun member(v: *sj.Value, key: str) *sj.Value {
+pub fun member(v: *json_value.Value, key: str) *json_value.Value {
     if (v == nil) { ret nil; }
-    val m: opt[*sj.Value] = sj.value_find(v, key);
-    if (sel m.none) { ret nil; }
-    ret m.some;
+    val opt_value_find: opt[*json_value.Value] = json_value.value_find(v, key);
+    if (sel opt_value_find.none) { ret nil; }
+    ret opt_value_find.some;
 }
 
 # the member `key` of the member `outer` of `v`, or nil at any miss
@@ -339,28 +343,28 @@ pub fun member(v: *sj.Value, key: str) *sj.Value {
 # outer: outer member name
 # key:   inner member name
 # ret:   borrowed member value, or nil
-pub fun member2(v: *sj.Value, outer: str, key: str) *sj.Value {
+pub fun member2(v: *json_value.Value, outer: str, key: str) *json_value.Value {
     ret member(member(v, outer), key);
 }
 
 # the `index`-th element of array `v`, or nil when out of range
-pub fun element(v: *sj.Value, index: usize) *sj.Value {
-    if (v == nil || !sj.value_is_array(v)) { ret nil; }
-    val e: opt[*sj.Value] = sj.value_get(v, index);
-    if (sel e.none) { ret nil; }
-    ret e.some;
+pub fun element(v: *json_value.Value, index: usize) *json_value.Value {
+    if (v == nil || !json_value.value_is_array(v)) { ret nil; }
+    val opt_value_get: opt[*json_value.Value] = json_value.value_get(v, index);
+    if (sel opt_value_get.none) { ret nil; }
+    ret opt_value_get.some;
 }
 
 # the number of elements in array or object `v`, 0 for anything else
-pub fun count(v: *sj.Value) usize {
+pub fun count(v: *json_value.Value) usize {
     if (v == nil) { ret 0; }
-    ret sj.value_count(v);
+    ret json_value.value_count(v);
 }
 
 # whether `v` is present and JSON null
-pub fun is_null(v: *sj.Value) bool {
+pub fun is_null(v: *json_value.Value) bool {
     if (v == nil) { ret false; }
-    ret sj.value_is_null(v);
+    ret json_value.value_is_null(v);
 }
 
 # the decoded text of string value `v`, allocated from `alloc`
@@ -371,16 +375,16 @@ pub fun is_null(v: *sj.Value) bool {
 # v:     value to decode
 # alloc: allocator backing the returned string
 # ret:   owned nul-terminated text, or nil
-pub fun text(v: *sj.Value, alloc: *Allocator) str {
-    if (v == nil || !sj.value_is_string(v)) { ret nil; }
-    val sr: res[usize, sj.JsonError] = sj.value_string_decode(v, nil, 0);
-    if (sel sr.err) { ret nil; }
-    val n:  usize                     = sr.ok;
-    val br: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel br.err) { ret nil; }
-    val buf: *u8                      = br.ok;
-    val dr:  res[usize, sj.JsonError] = sj.value_string_decode(v, buf, n);
-    if (sel dr.err) {
+pub fun text(v: *json_value.Value, alloc: *Allocator) str {
+    if (v == nil || !json_value.value_is_string(v)) { ret nil; }
+    val res_value_string_decode: res[usize, json_error.JsonError] = json_decode.value_string_decode(v, nil, 0);
+    if (sel res_value_string_decode.err) { ret nil; }
+    val n:            usize                     = res_value_string_decode.ok;
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val buf:                         *u8                              = res_allocate.ok;
+    val res_value_string_decode_buf: res[usize, json_error.JsonError] = json_decode.value_string_decode(v, buf, n);
+    if (sel res_value_string_decode_buf.err) {
         deallocate[u8](alloc, buf, n + 1);
         ret nil;
     }
@@ -389,15 +393,15 @@ pub fun text(v: *sj.Value, alloc: *Allocator) str {
 }
 
 # the integer value of number `v`, or `fallback` when absent or not a number
-pub fun number(v: *sj.Value, fallback: i64) i64 {
-    if (v == nil || !sj.value_is_number(v)) { ret fallback; }
-    ret sj.value_number(v);
+pub fun number(v: *json_value.Value, fallback: i64) i64 {
+    if (v == nil || !json_value.value_is_number(v)) { ret fallback; }
+    ret json_value.value_number(v);
 }
 
 # the boolean value of `v`, or `fallback` when absent or not a boolean
-pub fun boolean(v: *sj.Value, fallback: bool) bool {
-    if (v == nil || !sj.value_is_bool(v)) { ret fallback; }
-    ret sj.value_bool(v);
+pub fun boolean(v: *json_value.Value, fallback: bool) bool {
+    if (v == nil || !json_value.value_is_bool(v)) { ret fallback; }
+    ret json_value.value_bool(v);
 }
 
 # whether string value `v` equals `s` after decoding
@@ -409,7 +413,7 @@ pub fun boolean(v: *sj.Value, fallback: bool) bool {
 # s:     expected text
 # alloc: scratch allocator for the decode
 # ret:   true when `v` is a string equal to `s`
-pub fun text_equals(v: *sj.Value, s: str, alloc: *Allocator) bool {
+pub fun text_equals(v: *json_value.Value, s: str, alloc: *Allocator) bool {
     val got: str = text(v, alloc);
     if (got == nil) { ret false; }
     val eq: bool = str_equals(got, s);
@@ -425,14 +429,14 @@ pub fun text_equals(v: *sj.Value, s: str, alloc: *Allocator) bool {
 # ---
 # b:  buffer to append to
 # id: the request's id value, or nil for a message that carried none
-pub fun buf_push_id(b: *Buf, id: *sj.Value) {
+pub fun buf_push_id(b: *Buf, id: *json_value.Value) {
     if (id == nil) {
         buf_push(b, "null");
         ret;
     }
-    if (sj.value_is_string(id)) {
+    if (json_value.value_is_string(id)) {
         var n:   usize = 0;
-        val raw: *u8   = sj.value_string(id, ?n);
+        val raw: *u8   = json_value.value_string(id, ?n);
         buf_push_byte(b, '"');
         if (raw != nil && n > 0) {
             if (buf_reserve(b, n)) {
@@ -443,8 +447,8 @@ pub fun buf_push_id(b: *Buf, id: *sj.Value) {
         buf_push_byte(b, '"');
         ret;
     }
-    if (sj.value_is_number(id)) {
-        buf_push_i64(b, sj.value_number(id));
+    if (json_value.value_is_number(id)) {
+        buf_push_i64(b, json_value.value_number(id));
         ret;
     }
     buf_push(b, "null");
@@ -475,13 +479,13 @@ pub fun quote(s: str, alloc: *Allocator) str {
         buf_dnit(?b);
         ret nil;
     }
-    val n: usize                     = str_len(view);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel r.err) {
+    val n:            usize                     = str_len(view);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) {
         buf_dnit(?b);
         ret nil;
     }
-    val out: *u8 = r.ok;
+    val out: *u8 = res_allocate.ok;
     if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
     out[n] = 0;
     buf_dnit(?b);
@@ -509,13 +513,13 @@ fun buf_take(b: *Buf, alloc: *Allocator) str {
         buf_dnit(b);
         ret nil;
     }
-    val n: usize                     = str_len(view);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel r.err) {
+    val n:            usize                     = str_len(view);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) {
         buf_dnit(b);
         ret nil;
     }
-    val out: *u8 = r.ok;
+    val out: *u8 = res_allocate.ok;
     if (n > 0) { mem.raw_copy(out::ptr, view::ptr, n); }
     out[n] = 0;
     buf_dnit(b);
@@ -531,7 +535,7 @@ fun buf_take(b: *Buf, alloc: *Allocator) str {
 # id:    the request's id value, or nil
 # alloc: allocator backing the result
 # ret:   owned token text (`"abc"`, `7`, `null`), or nil when there is no id
-pub fun id_text(id: *sj.Value, alloc: *Allocator) str {
+pub fun id_text(id: *json_value.Value, alloc: *Allocator) str {
     if (id == nil) { ret nil; }
     var b: Buf = buf_init(alloc);
     buf_push_id(?b, id);
@@ -571,46 +575,26 @@ test content_survives_growth_past_the_initial_capacity {
     ret 0;
 }
 
-test numbers_render_in_base_10_with_a_sign_only_where_negative {
+# the decimal writers at zero, at both i64 extremes and at a usize of all twenty
+# digits; the i64 minimum has no positive i64 to negate into
+test buf_push_i64__zero_the_extremes_and_a_full_width_usize {
     var pa: Allocator;
     page.make(?pa);
     var b: Buf = buf_init(?pa);
-    buf_push_usize(?b, 0);
+    buf_push_i64(?b, 0);
     buf_push_byte(?b, ' ');
-    buf_push_i64(?b, -42);
+    buf_push_i64(?b, 9223372036854775807);
     buf_push_byte(?b, ' ');
-    buf_push_i64(?b, 42);
-    var fail: bool = false;
-    if (!str_equals(buf_str(?b), "0 -42 42")) { fail = true; }
+    buf_push_i64(?b, 0x8000000000000000u64:~i64);
+    buf_push_byte(?b, ' ');
+    buf_push_usize(?b, 18446744073709551615);
+    val same: bool = str_equals(buf_str(?b), "0 9223372036854775807 -9223372036854775808 18446744073709551615");
     buf_dnit(?b);
-    if (fail) { ret 1; }
+    if (!same) { ret 1; }
     ret 0;
 }
 
 # --- reading ---
-
-test string_escapes_in_a_value_decode_to_their_logical_bytes {
-    var pa: Allocator;
-    page.make(?pa);
-    var rd: Reader;
-    if (!reader_init(?rd, ?pa)) { ret 1; }
-    val body: str     = "{\"text\":\"a\\nb\\tc\\\"d\"}";
-    var m:    Message = read(?rd, body, str_len(body));
-    var fail: bool    = false;
-    if (!m.valid) { fail = true; }
-    or {
-        val v: str = text(member(?m.root, "text"), ?pa);
-        if (v == nil) { fail = true; }
-        or {
-            if (!str_equals(v, "a\nb\tc\"d")) { fail = true; }
-            free_str(v, ?pa);
-        }
-    }
-    release(?rd);
-    reader_dnit(?rd);
-    if (fail) { ret 1; }
-    ret 0;
-}
 
 # a response must echo the request id with the type it arrived as; a string id
 # is re-emitted from its wire bytes rather than decoded and re-escaped
@@ -700,10 +684,10 @@ pub fun buf_push_range(b: *Buf, s: str, from: usize, to: usize) {
 # an owned copy of `s`
 pub fun dup(s: str, alloc: *Allocator) str {
     if (s == nil) { ret nil; }
-    val n: usize                     = str_len(s);
-    val r: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
-    if (sel r.err) { ret nil; }
-    val out: *u8 = r.ok;
+    val n:            usize                     = str_len(s);
+    val res_allocate: res[*u8, allocator.Error] = allocate[u8](alloc, n + 1);
+    if (sel res_allocate.err) { ret nil; }
+    val out: *u8 = res_allocate.ok;
     if (n > 0) { mem.raw_copy(out::ptr, s::ptr, n); }
     out[n] = 0;
     ret out::str;

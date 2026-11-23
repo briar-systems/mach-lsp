@@ -18,16 +18,19 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 
-use mach.lang.build.outcome;
-use mach.lang.editor;
-use mach.lang.fail;
-use mach.lang.fe.ast;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.sema;
-use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
-use sj:   std.data.json;
+use A: std.allocator;
+
+use sj: json.value;
+use mach.base.fail;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.compile;
+use mach.editor;
+use mach.front.ast;
+use rslv:         mach.front.resolve;
+use sema_product: mach.front.sema.product;
+use sess:         mach.session;
+use lmodule:      mach.session.module;
 
 use mls.documents;
 use mls.json;
@@ -41,7 +44,7 @@ use mls.project;
 # sr:       semantic result, or nil when the document has none
 # a:        parsed Ast
 # rr:       resolve side tables
-# own:      the document's own module id
+# own:      the identity the document's own symbols carry as their origin
 # own_fid:  the document's own source file id
 # root:     the project root that governs it, or nil for a standalone buffer
 # stale:    the snapshot predates this document's text; `text` maps between them
@@ -49,10 +52,10 @@ use mls.project;
 pub rec Analyzed {
     interner: *intern.Interner;
     text:     positions.Text;
-    sr:       *sema.SemaResult;
+    sr:       *sema_product.SemaResult;
     a:        *ast.Ast;
     rr:       *rslv.ResolveResult;
-    own:      sess.ModuleId;
+    own:      lmodule.StableModuleId;
     own_fid:  src.FileId;
     root:     *project.Root;
     stale:    bool;
@@ -79,9 +82,9 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     val doc: *documents.Document = documents.find(docs, uri);
     if (doc == nil) { ret false; }
 
-    val vr: res[project.DocumentView, str] = project.document_view(ws, doc);
-    if (sel vr.ok) {
-        val v: project.DocumentView = vr.ok;
+    val res_document_view: res[project.DocumentView, str] = project.document_view(ws, doc);
+    if (sel res_document_view.ok) {
+        val v: project.DocumentView = res_document_view.ok;
         out.rr       = v.rr;
         out.a        = v.a;
         out.sr       = v.sr;
@@ -96,18 +99,29 @@ pub fun analyze(ws: *project.Workspace, es: *editor.EditorSession, docs: *docume
     }
     if (project.has_project(ws, uri)) { ret false; }
 
-    if (!standalone(es, doc.file_id, editor.PHASE_SEMA, out)) { ret false; }
-    if (out.rr == nil)                                        { ret false; }
-    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-    if (sel fo.none) { ret false; }
-    out.interner = ?es.s.interner;
-    out.text     = positions.text_of(fo.some);
+    if (!standalone(es, doc.file_id, compile.FRONTEND_SEMA, out)) { ret false; }
+    if (out.rr == nil)                                            { ret false; }
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(es.s.sources, doc.file_id);
+    if (sel opt_sources_entry.none) { ret false; }
+    out.interner = es.s.interner;
+    out.text     = positions.text_of(opt_sources_entry.some);
     out.root     = nil;
-    out.own      = doc.file_id::sess.ModuleId;
+    out.own      = buffer_module(es, doc.file_id);
     out.own_fid  = doc.file_id;
     out.stale    = false;
     out.current  = true;
     ret true;
+}
+
+# the identity a standalone buffer's symbols carry as their origin. the editor
+# names a standalone buffer's module by the buffer's path; nil when the editor
+# has not analyzed the buffer
+fun buffer_module(es: *editor.EditorSession, fid: src.FileId) lmodule.StableModuleId {
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(es.s.sources, fid);
+    if (sel opt_sources_entry.none) { ret lmodule.STABLE_MODULE_NIL; }
+    val res_name: res[intern.StrId, A.Error] = intern.add(es.s.interner, opt_sources_entry.some.path);
+    if (sel res_name.err) { ret lmodule.STABLE_MODULE_NIL; }
+    ret lmodule.stable_module_id_lookup(?es.s.modules, res_name.ok);
 }
 
 # resolve `uri` to its current analysis whether or not the document is open
@@ -136,12 +150,12 @@ pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *do
 
     val root: *project.Root = project.root_for_loaded(ws, uri);
     if (root == nil) { ret false; }
-    val mo: opt[sess.ModuleId] = project.module_for_uri(ws, root, uri);
-    if (sel mo.none) { ret false; }
-    val mid:  sess.ModuleId           = mo.some;
-    val mv_o: opt[project.ModuleView] = project.module_view(ws, root, mid);
-    if (sel mv_o.none) { ret false; }
-    val mv: project.ModuleView = mv_o.some;
+    val opt_module_for_uri: opt[lmodule.StableModuleId] = project.module_for_uri(ws, root, uri);
+    if (sel opt_module_for_uri.none) { ret false; }
+    val mid:             lmodule.StableModuleId  = opt_module_for_uri.some;
+    val opt_module_view: opt[project.ModuleView] = project.module_view(ws, root, mid);
+    if (sel opt_module_view.none) { ret false; }
+    val mv: project.ModuleView = opt_module_view.some;
 
     out.interner = project.interner(ws, root);
     out.text     = mv.text;
@@ -165,30 +179,30 @@ pub fun analyze_uri(ws: *project.Workspace, es: *editor.EditorSession, docs: *do
 # ---
 # es:    the standalone editor session
 # fid:   the open buffer
-# phase: PHASE_PARSE, PHASE_RESOLVE or PHASE_SEMA
+# phase: compile.FRONTEND_PARSE, compile.FRONTEND_RESOLVE or compile.FRONTEND_SEMA
 # out:   receives `a`, `rr` and `sr`; a product the phase did not reach is nil
 # ret:   true when the frontend ran; the products may still be nil on a rejected phase
-pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.AnalysisPhase, out: *Analyzed) bool {
+pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: compile.FrontendPhase, out: *Analyzed) bool {
     out.a  = nil;
     out.rr = nil;
     out.sr = nil;
-    var req: editor.AnalysisRequest                   = editor.analysis_request(fid, phase);
-    val ar:  res[editor.AnalysisResult, outcome.Fail] = editor.analyze(es, ?req);
-    if (sel ar.err) {
-        var f: outcome.Fail = ar.err;
+    var req:         editor.AnalysisRequest                = editor.analysis_request(fid, phase);
+    val res_analyze: res[editor.AnalysisResult, fail.Fail] = editor.analyze(es, ?req);
+    if (sel res_analyze.err) {
+        var f: fail.Fail = res_analyze.err;
         editor.fail_dnit(es, ?f);
         ret false;
     }
-    var result: editor.AnalysisResult    = ar.ok;
-    val a:      res[*ast.Ast, fail.Fail] = editor.ast_of(?result);
-    if (sel a.ok) { out.a = a.ok; }
-    if (phase >= editor.PHASE_RESOLVE) {
-        val rr: res[*rslv.ResolveResult, fail.Fail] = editor.resolve_of(?result);
-        if (sel rr.ok) { out.rr = rr.ok; }
+    var result:     editor.AnalysisResult    = res_analyze.ok;
+    val res_ast_of: res[*ast.Ast, fail.Fail] = editor.ast_of(?result);
+    if (sel res_ast_of.ok) { out.a = res_ast_of.ok; }
+    if (phase >= compile.FRONTEND_RESOLVE) {
+        val res_resolve_of: res[*rslv.ResolveResult, fail.Fail] = editor.resolve_of(?result);
+        if (sel res_resolve_of.ok) { out.rr = res_resolve_of.ok; }
     }
-    if (phase == editor.PHASE_SEMA) {
-        val sr: res[*sema.SemaResult, fail.Fail] = editor.sema_of(?result);
-        if (sel sr.ok) { out.sr = sr.ok; }
+    if (phase == compile.FRONTEND_SEMA) {
+        val res_sema_of: res[*sema_product.SemaResult, fail.Fail] = editor.sema_of(?result);
+        if (sel res_sema_of.ok) { out.sr = res_sema_of.ok; }
     }
     editor.analysis_dnit(?result);
     ret true;
@@ -200,7 +214,7 @@ pub fun standalone(es: *editor.EditorSession, fid: src.FileId, phase: editor.Ana
 # doc: the open document
 pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.Ast {
     var an: Analyzed;
-    if (!standalone(es, doc.file_id, editor.PHASE_PARSE, ?an)) { ret nil; }
+    if (!standalone(es, doc.file_id, compile.FRONTEND_PARSE, ?an)) { ret nil; }
     ret an.a;
 }
 
@@ -220,14 +234,14 @@ pub fun syntax_tree(es: *editor.EditorSession, doc: *documents.Document) *ast.As
 pub fun syntax_of(es: *editor.EditorSession, doc: *documents.Document, out: *Analyzed) bool {
     val tree: *ast.Ast = syntax_tree(es, doc);
     if (tree == nil) { ret false; }
-    val fo: opt[*src.SourceFile] = src.get(?es.s.sources, doc.file_id);
-    if (sel fo.none) { ret false; }
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(es.s.sources, doc.file_id);
+    if (sel opt_sources_entry.none) { ret false; }
     out.interner = nil;
-    out.text     = positions.text_of(fo.some);
+    out.text     = positions.text_of(opt_sources_entry.some);
     out.sr       = nil;
     out.a        = tree;
     out.rr       = nil;
-    out.own      = sess.MODULE_NIL;
+    out.own      = lmodule.STABLE_MODULE_NIL;
     out.own_fid  = doc.file_id;
     out.root     = nil;
     out.stale    = false;
@@ -258,10 +272,10 @@ pub fun locate(ws: *project.Workspace, es: *editor.EditorSession, docs: *documen
 # is on its way, so reaching here behind means no rebuild will arrive
 pub fun locate_current(ws: *project.Workspace, es: *editor.EditorSession, docs: *documents.Store,
     params: *sj.Value, uri: str, out: *Analyzed) opt[usize] {
-    val o: opt[usize] = locate(ws, es, docs, params, uri, out);
-    if (sel o.none)   { ret o; }
-    if (!out.current) { ret opt[usize].none{}; }
-    ret o;
+    val opt_locate: opt[usize] = locate(ws, es, docs, params, uri, out);
+    if (sel opt_locate.none) { ret opt_locate; }
+    if (!out.current)        { ret opt[usize].none{}; }
+    ret opt_locate;
 }
 
 # the byte offset denoted by a request's `position`, or none when it is absent
@@ -292,12 +306,12 @@ pub fun offset_of(params: *sj.Value, t: positions.Text) opt[usize] {
 pub fun request_range(params: *sj.Value, t: positions.Text, lo: *usize, hi: *usize) bool {
     val rng: *sj.Value = json.member(params, "range");
     if (rng == nil) { ret false; }
-    val so: opt[usize] = bound_of(rng, "start", t, false);
-    val eo: opt[usize] = bound_of(rng, "end", t, true);
-    if (sel so.none) { ret false; }
-    if (sel eo.none) { ret false; }
-    @lo = so.some;
-    @hi = eo.some;
+    val opt_bound_of:     opt[usize] = bound_of(rng, "start", t, false);
+    val opt_bound_of_rng: opt[usize] = bound_of(rng, "end", t, true);
+    if (sel opt_bound_of.none)     { ret false; }
+    if (sel opt_bound_of_rng.none) { ret false; }
+    @lo = opt_bound_of.some;
+    @hi = opt_bound_of_rng.some;
     if (@hi < @lo) { @hi = @lo; }
     ret true;
 }

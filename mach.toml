@@ -1,68 +1,80 @@
 [project]
 id = "mls"
-version = "2.1.0"
+version = "3.0.0"
 src = "src"
-out = "out/{target.name}/{profile.name}"
-mach = "^6"
+work = "out/{target.name}/{profile.name}"
+mach = "^7"
 
 [target.linux-x86_64]
-default = true
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
-[target.linux-arm64]
-isa = "aarch64"
-os  = "linux"
+[target.linux-aarch64]
+arch = "aarch64"
+sys = "linux"
 abi = "aapcs64"
 
 [target.linux-riscv64]
-isa = "riscv64"
-os  = "linux"
+arch = "riscv64"
+sys = "linux"
 abi = "lp64d"
 
 [target.windows-x86_64]
-isa  = "x86_64"
-os   = "windows"
+arch = "x86_64"
+sys  = "windows"
 abi  = "win64"
+env  = "msvc"
+
+[target.windows-aarch64]
+arch = "aarch64"
+sys  = "windows"
+abi  = "aapcs64win"
+env  = "msvc"
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os  = "darwin"
+arch = "x86_64"
+sys = "darwin"
 abi = "sysv64"
+env = "macos"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os  = "darwin"
-abi = "aapcs64"
+arch = "aarch64"
+sys = "darwin"
+abi = "darwinpcs"
+env = "macos"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.mls]
 kind = "bin"
 entry = "bin/main.mach"
-out = "bin/mls{artifact.suffix}"
+out = "{project.work}/bin/mls{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+version = "^10.0.0"
 
 [dep.mach]
 git = "https://github.com/briar-systems/mach"
-ref = "tag/v6.3.0"
+ref = "tag/v7.0.0"
+
+[dep.toml]
+git = "https://github.com/briar-systems/mach-toml"
+version = "^0.1.0"
+
+[dep.json]
+git = "https://github.com/briar-systems/mach-json"
+version = "^0.1.0"

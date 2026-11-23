@@ -58,16 +58,16 @@ use std.allocator.Allocator;
 use std.allocator.allocate;
 use std.allocator.deallocate;
 
-use mach.lang.editor;
-use mach.lang.fe.ast;
-use mach.lang.fe.ast.decl;
-use aexpr: mach.lang.fe.ast.expr;
-use mach.lang.fe.ast.id;
-use rslv: mach.lang.fe.resolve;
-use mach.lang.fe.token;
-use mach.lang.intern;
-use sess: mach.lang.session;
-use src:  mach.lang.source;
+use mach.base.intern;
+use src: mach.base.source;
+use mach.editor;
+use mach.front.ast;
+use mach.front.ast.decl;
+use aexpr: mach.front.ast.expr;
+use mach.front.ast.id;
+use rslv:    mach.front.resolve;
+use sess:    mach.session;
+use lmodule: mach.session.module;
 
 use mls.analysis;
 use mls.documents;
@@ -77,7 +77,7 @@ use mls.positions;
 use mls.project;
 use mls.render;
 
-use sj:      std.data.json;
+use sj:      json.value;
 use strutil: std.text.string;
 
 use std.allocator;
@@ -102,11 +102,11 @@ val INDIRECT_DETAIL: str = "fun value: the call target is not statically known";
 # decl_span: the whole declaration, the item's range and the body's bounds
 rec Anchor {
     site:      project.Site;
-    origin:    sess.ModuleId;
+    origin:    lmodule.StableModuleId;
     decl:      id.DeclId;
     canon:     intern.StrId;
-    name_span: token.Span;
-    decl_span: token.Span;
+    name_span: src.Span;
+    decl_span: src.Span;
 }
 
 # one call site naming the anchored function, with the declaration it was made
@@ -116,7 +116,7 @@ rec Anchor {
 # span:   the callee name span, which is the LSP fromRange
 rec Hit {
     caller: id.DeclId;
-    span:   token.Span;
+    span:   src.Span;
 }
 
 # one call made by the anchored function, resolved to what it names
@@ -136,11 +136,11 @@ rec Callee {
     uri:       str;
     owned:     bool;
     text:      positions.Text;
-    name_span: token.Span;
-    decl_span: token.Span;
+    name_span: src.Span;
+    decl_span: src.Span;
     kind:      i64;
     indirect:  bool;
-    from:      token.Span;
+    from:      src.Span;
     from_text: positions.Text;
 }
 
@@ -154,15 +154,15 @@ pub fun prepare(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Alloc
     val id_raw: str = json.id_text(req, alloc);
     if (id_raw == nil) { ret; }
 
-    var an:    analysis.Analyzed;
-    val off_o: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
-    if (sel off_o.none) {
+    var an:      analysis.Analyzed;
+    val opt_off: opt[usize] = analysis.locate(ws, es, docs, params, uri, ?an);
+    if (sel opt_off.none) {
         render.reply_null(alloc, id_raw);
         ret;
     }
 
     var t: Anchor;
-    if (!anchor_at(ws, ?an, uri, off_o.some, ?t)) {
+    if (!anchor_at(ws, ?an, uri, opt_off.some, ?t)) {
         render.reply_null(alloc, id_raw);
         ret;
     }
@@ -221,22 +221,22 @@ pub fun incoming(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allo
     val mc:  u32 = project.module_count(an.root);
     var mid: u32 = 0;
     for (mid < mc) {
-        val cur:  sess.ModuleId           = mid::sess.ModuleId;
-        val mv_o: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
-        if (sel mv_o.none) {
+        val cur:             lmodule.StableModuleId  = project.module_id_at(an.root, mid);
+        val opt_module_view: opt[project.ModuleView] = project.module_view(ws, an.root, cur);
+        if (sel opt_module_view.none) {
             mid = mid + 1;
             cnt;
         }
-        val mv:   project.ModuleView = mv_o.some;
+        val mv:   project.ModuleView = opt_module_view.some;
         var muri: str                = nil;
-        if (cur == an.own) { muri = item_uri; }
-        or                 { muri = project.module_uri(ws, an.root, cur); }
+        if (lmodule.stable_same(cur, an.own)) { muri = item_uri; }
+        or                                    { muri = project.module_uri(ws, an.root, cur); }
         if (muri == nil) {
             mid = mid + 1;
             cnt;
         }
         emit_module_incoming(?b, alloc, ?mv, muri, ?t, ?groups);
-        if (cur != an.own) { strutil.str_free(ws.alloc, muri); }
+        if (!lmodule.stable_same(cur, an.own)) { strutil.str_free(ws.alloc, muri); }
         mid = mid + 1;
     }
 
@@ -266,7 +266,7 @@ pub fun outgoing(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allo
     # the item's uri is the declaring module's, so the anchor's spans index the
     # analysis just built from it; anything else is an item this server did not
     # mint and its spans would be read against the wrong Ast
-    if (t.origin != an.own) {
+    if (!lmodule.stable_same(t.origin, an.own)) {
         render.reply_empty_array(alloc, id_raw);
         project.free_site(ws, ?t.site);
         json.free_str(item_uri, alloc);
@@ -280,14 +280,14 @@ pub fun outgoing(ws: *project.Workspace, es: *editor.EditorSession, alloc: *Allo
         json.free_str(item_uri, alloc);
         ret;
     }
-    val ra: res[*Callee, allocator.Error] = allocate[Callee](alloc, n);
-    if (sel ra.err) {
+    val res_allocate: res[*Callee, allocator.Error] = allocate[Callee](alloc, n);
+    if (sel res_allocate.err) {
         render.reply_empty_array(alloc, id_raw);
         project.free_site(ws, ?t.site);
         json.free_str(item_uri, alloc);
         ret;
     }
-    val callees: *Callee = ra.ok;
+    val callees: *Callee = res_allocate.ok;
     val found:   usize   = collect_body_calls(ws, ?an, item_uri, t.decl_span, callees, n);
 
     emit_outgoing(alloc, id_raw, callees, found);
@@ -331,12 +331,12 @@ fun anchor_of_item(ws: *project.Workspace, es: *editor.EditorSession, docs: *doc
         json.free_str(iuri, alloc);
         ret false;
     }
-    val oo: opt[usize] = positions.offset_at(an_out.text, line::usize, ch::usize);
-    if (sel oo.none) {
+    val opt_offset_at: opt[usize] = positions.offset_at(an_out.text, line::usize, ch::usize);
+    if (sel opt_offset_at.none) {
         json.free_str(iuri, alloc);
         ret false;
     }
-    if (!anchor_at(ws, an_out, iuri, oo.some, out)) {
+    if (!anchor_at(ws, an_out, iuri, opt_offset_at.some, out)) {
         json.free_str(iuri, alloc);
         ret false;
     }
@@ -351,24 +351,24 @@ fun anchor_of_item(ws: *project.Workspace, es: *editor.EditorSession, docs: *doc
 # recovered through `project.site_of`, which is what makes a cross-module callee
 # addressable at all.
 fun anchor_at(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, offset: usize, out: *Anchor) bool {
-    val ro: opt[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.text.file, offset);
-    if (sel ro.none) { ret false; }
-    val so: opt[*rslv.Symbol] = features.symbol(an.rr, ro.some.sym_id);
-    if (sel so.none) { ret false; }
+    val opt_ref_at: opt[features.SymbolRef] = features.ref_at(an.a, an.rr, an.own, an.text.file, offset);
+    if (sel opt_ref_at.none) { ret false; }
+    val opt_symbol: opt[*rslv.Symbol] = features.symbol(an.rr, opt_ref_at.some.sym_id);
+    if (sel opt_symbol.none) { ret false; }
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, so.some);
-    if (sel site_o.none) { ret false; }
-    var site: project.Site = site_o.some;
-    if (site.sym.decl == id.DECL_NIL) {
+    val opt_site: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, opt_symbol.some);
+    if (sel opt_site.none) { ret false; }
+    var site: project.Site = opt_site.some;
+    if (id.decl_is_nil(site.sym.decl)) {
         project.free_site(ws, ?site);
         ret false;
     }
-    val d_opt: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
-    if (sel d_opt.none) {
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(site.a, site.sym.decl);
+    if (sel opt_decl.none) {
         project.free_site(ws, ?site);
         ret false;
     }
-    val d: *decl.Decl = d_opt.some;
+    val d: *decl.Decl = opt_decl.some;
     if (d.kind != decl.DECL_KIND_FUN) {
         project.free_site(ws, ?site);
         ret false;
@@ -389,9 +389,9 @@ fun emit_module_incoming(b: *json.Buf, alloc: *Allocator, mv: *project.ModuleVie
     t: *Anchor, groups: *usize) {
     val n: usize = count_calls_to(mv.a, mv.rr, t);
     if (n == 0) { ret; }
-    val ra: res[*Hit, allocator.Error] = allocate[Hit](alloc, n);
-    if (sel ra.err) { ret; }
-    val hits: *Hit = ra.ok;
+    val res_allocate: res[*Hit, allocator.Error] = allocate[Hit](alloc, n);
+    if (sel res_allocate.err) { ret; }
+    val hits: *Hit = res_allocate.ok;
     collect_calls_to(mv.a, mv.rr, t, hits, n);
 
     val dn: u32 = features.top_level_count(mv.a);
@@ -403,7 +403,7 @@ fun emit_module_incoming(b: *json.Buf, alloc: *Allocator, mv: *project.ModuleVie
         val shown: bool  = decl_item_maps(mv.a, mv.text, did);
         var i:     usize = 0;
         for (shown && i < n) {
-            if (hits[i].caller == did && positions.maps(mv.text, hits[i].span)) {
+            if (id.decl_same(hits[i].caller, did) && positions.maps(mv.text, hits[i].span)) {
                 if (!open) {
                     if (@groups > 0) { json.buf_push_byte(b, ','); }
                     json.buf_push(b, "{\"from\":");
@@ -430,9 +430,9 @@ fun emit_module_incoming(b: *json.Buf, alloc: *Allocator, mv: *project.ModuleVie
 fun count_calls_to(a: *ast.Ast, rr: *rslv.ResolveResult, t: *Anchor) usize {
     var n: usize = 0;
     var i: usize = 0;
-    for (i < a.expr_len) {
-        var span: token.Span;
-        if (call_to(a, rr, i::id.ExprId, t, ?span)) { n = n + 1; }
+    for (i < a.exprs.len) {
+        var span: src.Span;
+        if (call_to(a, rr, id.expr(i::u32), t, ?span)) { n = n + 1; }
         i = i + 1;
     }
     ret n;
@@ -443,9 +443,9 @@ fun count_calls_to(a: *ast.Ast, rr: *rslv.ResolveResult, t: *Anchor) usize {
 fun collect_calls_to(a: *ast.Ast, rr: *rslv.ResolveResult, t: *Anchor, out: *Hit, cap: usize) {
     var n: usize = 0;
     var i: usize = 0;
-    for (i < a.expr_len && n < cap) {
-        var span: token.Span;
-        if (call_to(a, rr, i::id.ExprId, t, ?span)) {
+    for (i < a.exprs.len && n < cap) {
+        var span: src.Span;
+        if (call_to(a, rr, id.expr(i::u32), t, ?span)) {
             out[n].span   = span;
             out[n].caller = enclosing_decl(a, span.offset);
             n             = n + 1;
@@ -463,18 +463,18 @@ fun collect_calls_to(a: *ast.Ast, rr: *rslv.ResolveResult, t: *Anchor, out: *Hit
 #
 # The callee of a qualified call (`mod.fn()`) is a member expression, and the span
 # a client should highlight is the member name rather than the whole `mod.fn`.
-fun call_to(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, t: *Anchor, span_out: *token.Span) bool {
-    val eo: opt[*aexpr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret false; }
-    val e: *aexpr.Expr = eo.some;
+fun call_to(a: *ast.Ast, rr: *rslv.ResolveResult, eid: id.ExprId, t: *Anchor, span_out: *src.Span) bool {
+    val opt_expr: opt[*aexpr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none) { ret false; }
+    val e: *aexpr.Expr = opt_expr.some;
     if (e.kind != aexpr.EXPR_KIND_CALL) { ret false; }
 
     val callee: id.ExprId     = e.data.call.callee;
     val sid:    rslv.SymbolId = resolved_symbol(rr, callee);
     if (!features.symbol_denotes(rr, sid, t.origin, t.decl, t.canon, rslv.SYM_FUN)) { ret false; }
-    val co: opt[*aexpr.Expr] = ast.get_expr(a, callee);
-    if (sel co.none) { ret false; }
-    @span_out = features.name_span_of_expr(co.some);
+    val opt_expr_callee: opt[*aexpr.Expr] = ast.get_expr(a, callee);
+    if (sel opt_expr_callee.none) { ret false; }
+    @span_out = features.name_span_of_expr(opt_expr_callee.some);
     ret true;
 }
 
@@ -486,10 +486,10 @@ fun enclosing_decl(a: *ast.Ast, offset: usize) id.DeclId {
     val n: u32 = features.top_level_count(a);
     var i: u32 = 0;
     for (i < n) {
-        val did:   id.DeclId       = features.top_level_decl(a, i);
-        val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-        if (sel d_opt.some) {
-            if (ast.span_contains(d_opt.some.span, offset)) { ret did; }
+        val did:      id.DeclId       = features.top_level_decl(a, i);
+        val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+        if (sel opt_decl.some) {
+            if (ast.span_contains(opt_decl.some.span, offset)) { ret did; }
         }
         i = i + 1;
     }
@@ -497,35 +497,35 @@ fun enclosing_decl(a: *ast.Ast, offset: usize) id.DeclId {
 }
 
 # how many call expressions `body` contains
-fun count_body_calls(an: *analysis.Analyzed, body: token.Span) usize {
+fun count_body_calls(an: *analysis.Analyzed, body: src.Span) usize {
     var n: usize = 0;
     var i: usize = 0;
-    for (i < an.a.expr_len) {
-        if (is_body_call(an.a, i::id.ExprId, body)) { n = n + 1; }
+    for (i < an.a.exprs.len) {
+        if (is_body_call(an.a, id.expr(i::u32), body)) { n = n + 1; }
         i = i + 1;
     }
     ret n;
 }
 
 # whether expr `eid` is a call written inside `body`
-fun is_body_call(a: *ast.Ast, eid: id.ExprId, body: token.Span) bool {
-    val eo: opt[*aexpr.Expr] = ast.get_expr(a, eid);
-    if (sel eo.none) { ret false; }
-    val e: *aexpr.Expr = eo.some;
+fun is_body_call(a: *ast.Ast, eid: id.ExprId, body: src.Span) bool {
+    val opt_expr: opt[*aexpr.Expr] = ast.get_expr(a, eid);
+    if (sel opt_expr.none) { ret false; }
+    val e: *aexpr.Expr = opt_expr.some;
     if (e.kind != aexpr.EXPR_KIND_CALL) { ret false; }
     ret ast.span_contains(body, e.span.offset);
 }
 
 # resolve every call in `body` to what it names
-fun collect_body_calls(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, body: token.Span,
+fun collect_body_calls(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, body: src.Span,
     out: *Callee, cap: usize) usize {
     var n: usize = 0;
     var i: usize = 0;
-    for (i < an.a.expr_len && n < cap) {
-        if (is_body_call(an.a, i::id.ExprId, body)) {
-            val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, i::id.ExprId);
-            if (sel eo.some) {
-                if (resolve_callee(ws, an, uri, eo.some.data.call.callee, ?out[n])) { n = n + 1; }
+    for (i < an.a.exprs.len && n < cap) {
+        if (is_body_call(an.a, id.expr(i::u32), body)) {
+            val opt_expr: opt[*aexpr.Expr] = ast.get_expr(an.a, id.expr(i::u32));
+            if (sel opt_expr.some) {
+                if (resolve_callee(ws, an, uri, opt_expr.some.data.call.callee, ?out[n])) { n = n + 1; }
             }
         }
         i = i + 1;
@@ -540,9 +540,9 @@ fun collect_body_calls(ws: *project.Workspace, an: *analysis.Analyzed, uri: str,
 # function type has no declaration of its own and carries its owning function's
 # DeclId, so reading the decl would report the enclosing function as the callee.
 fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, callee: id.ExprId, out: *Callee) bool {
-    val eo: opt[*aexpr.Expr] = ast.get_expr(an.a, callee);
-    if (sel eo.none) { ret false; }
-    val here: token.Span = features.name_span_of_expr(eo.some);
+    val opt_expr: opt[*aexpr.Expr] = ast.get_expr(an.a, callee);
+    if (sel opt_expr.none) { ret false; }
+    val here: src.Span = features.name_span_of_expr(opt_expr.some);
 
     out.uri       = uri;
     out.owned     = false;
@@ -555,10 +555,10 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
     out.from_text = an.text;
 
     val sid: rslv.SymbolId = resolved_symbol(an.rr, callee);
-    if (sid == rslv.SYMBOL_NIL) { ret true; }
-    val so: opt[*rslv.Symbol] = features.symbol(an.rr, sid);
-    if (sel so.none) { ret true; }
-    val sym: *rslv.Symbol = so.some;
+    if (rslv.symbol_is_nil(sid)) { ret true; }
+    val opt_symbol: opt[*rslv.Symbol] = features.symbol(an.rr, sid);
+    if (sel opt_symbol.none) { ret true; }
+    val sym: *rslv.Symbol = opt_symbol.some;
 
     # what the callee is, decided before where it lives: a buffer analyzed
     # outside a project resolves an imported name to a symbol whose declaring
@@ -568,12 +568,12 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
     out.kind     = LSP_VARIABLE;
     if (!out.indirect) { out.kind = LSP_FUNCTION; }
 
-    val site_o: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
-    if (sel site_o.none) { ret true; }
-    var site: project.Site = site_o.some;
+    val opt_site: opt[project.Site] = project.site_of(ws, an.root, an.own, an.a, an.text, uri, sym);
+    if (sel opt_site.none) { ret true; }
+    var site: project.Site = opt_site.some;
 
-    val nso: opt[token.Span] = features.definition_name_span(site.a, site.sym);
-    if (sel nso.none) {
+    val opt_definition_name_span: opt[src.Span] = features.definition_name_span(site.a, site.sym);
+    if (sel opt_definition_name_span.none) {
         project.free_site(ws, ?site);
         ret true;
     }
@@ -581,14 +581,14 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
     out.uri       = site.uri;
     out.owned     = site.owned;
     out.text      = site.text;
-    out.name_span = nso.some;
-    out.decl_span = nso.some;
+    out.name_span = opt_definition_name_span.some;
+    out.decl_span = opt_definition_name_span.some;
 
     # a parameter or generic binding has no declaration node of its own, so its
     # binding name is the whole item; everything else has a declaration to span
     if (site.sym.kind != rslv.SYM_PARAM && site.sym.kind != rslv.SYM_GENERIC) {
-        val dso: opt[token.Span] = features.decl_span_of(site.a, site.sym);
-        if (sel dso.some) { out.decl_span = dso.some; }
+        val opt_decl_span_of: opt[src.Span] = features.decl_span_of(site.a, site.sym);
+        if (sel opt_decl_span_of.some) { out.decl_span = opt_decl_span_of.some; }
     }
 
     # the site's uri is now owned by the Callee; do not release it here
@@ -599,8 +599,8 @@ fun resolve_callee(ws: *project.Workspace, an: *analysis.Analyzed, uri: str, cal
 
 # the symbol expr `eid` resolves to, or SYMBOL_NIL
 fun resolved_symbol(rr: *rslv.ResolveResult, eid: id.ExprId) rslv.SymbolId {
-    if (rr.expr_resolved == nil || eid::u32 >= rr.expr_count) { ret rslv.SYMBOL_NIL; }
-    ret rr.expr_resolved[eid];
+    if (rr.expr_resolved == nil || id.expr_index(eid) >= rr.expr_count) { ret rslv.SYMBOL_NIL; }
+    ret rr.expr_resolved[id.expr_index(eid)];
 }
 
 # send the CallHierarchyOutgoingCall[], one entry per distinct callee
@@ -659,22 +659,22 @@ fun callee_shown(callees: *Callee, i: usize, n: usize) bool {
 }
 
 # whether an item's two ranges can both be reported
-fun item_maps(text: positions.Text, name_span: token.Span, decl_span: token.Span) bool {
+fun item_maps(text: positions.Text, name_span: src.Span, decl_span: src.Span) bool {
     ret positions.maps(text, name_span) && positions.maps_around(text, decl_span);
 }
 
 # whether the item `push_decl_item` would write for `did` can be reported
 fun decl_item_maps(a: *ast.Ast, text: positions.Text, did: id.DeclId) bool {
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) { ret true; }
-    val d: *decl.Decl = d_opt.some;
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) { ret true; }
+    val d: *decl.Decl = opt_decl.some;
     ret item_maps(text, decl_item_name(d), d.span);
 }
 
 # the span `push_decl_item` names a declaration by
-fun decl_item_name(d: *decl.Decl) token.Span {
-    val nso: opt[token.Span] = features.decl_name_span(d);
-    if (sel nso.some) { ret nso.some; }
+fun decl_item_name(d: *decl.Decl) src.Span {
+    val opt_decl_name_span: opt[src.Span] = features.decl_name_span(d);
+    if (sel opt_decl_name_span.some) { ret opt_decl_name_span.some; }
     ret d.span;
 }
 
@@ -710,12 +710,12 @@ fun free_callees(ws: *project.Workspace, callees: *Callee, n: usize) {
 
 # append a CallHierarchyItem for the module-scope declaration `did`
 fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text: positions.Text, did: id.DeclId) {
-    val d_opt: opt[*decl.Decl] = ast.get_decl(a, did);
-    if (sel d_opt.none) {
+    val opt_decl: opt[*decl.Decl] = ast.get_decl(a, did);
+    if (sel opt_decl.none) {
         push_item(b, alloc, uri, text, empty_span(), empty_span(), LSP_VARIABLE, nil);
         ret;
     }
-    val d: *decl.Decl = d_opt.some;
+    val d: *decl.Decl = opt_decl.some;
     push_item(b, alloc, uri, text, decl_item_name(d), d.span, render.symbol_kind(d.kind), nil);
 }
 
@@ -726,7 +726,7 @@ fun push_decl_item(b: *json.Buf, alloc: *Allocator, a: *ast.Ast, uri: str, text:
 # an interned name, and the bytes are what the client shows either way. the caller
 # has checked `item_maps`, so both ranges are written.
 fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
-    name_span: token.Span, decl_span: token.Span, kind: i64, detail: str) {
+    name_span: src.Span, decl_span: src.Span, kind: i64, detail: str) {
     json.buf_push(b, "{\"name\":");
     val name: str = positions.span_text(text, name_span, alloc);
     if (name != nil) {
@@ -750,8 +750,8 @@ fun push_item(b: *json.Buf, alloc: *Allocator, uri: str, text: positions.Text,
     json.buf_push_byte(b, '}');
 }
 
-fun empty_span() token.Span {
-    var s: token.Span;
+fun empty_span() src.Span {
+    var s: src.Span;
     s.offset = 0;
     s.len    = 0;
     ret s;

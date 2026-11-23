@@ -28,17 +28,18 @@ use std.types.string.str_equals;
 
 use std.allocator.Allocator;
 
-use diag: mach.lang.diagnostic;
-use mach.lang.editor;
-use mach.lang.fe.token;
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
-use sj:      std.data.json;
+use sj:   json.value;
+use diag: mach.base.diagnostic;
+use mach.base.diagnostic.annotation;
+use src: mach.base.source;
+use mach.editor;
+use sess:    mach.session;
 use strutil: std.text.string;
 
 use mls.analysis;
 use mls.documents;
 use mls.json;
+use mls.notes;
 use mls.positions;
 use mls.project;
 use mls.render;
@@ -66,12 +67,12 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
         ret;
     }
 
-    val vr: res[project.DocumentView, str] = project.document_view(ws, d);
-    if (sel vr.err) {
+    val res_document_view: res[project.DocumentView, str] = project.document_view(ws, d);
+    if (sel res_document_view.err) {
         render.reply_empty_array(alloc, id_raw);
         ret;
     }
-    val v: project.DocumentView = vr.ok;
+    val v: project.DocumentView = res_document_view.ok;
     # a fix's edits are computed against the snapshot's text; applied to a buffer
     # that has moved on they would rewrite the wrong bytes, so a stale view offers
     # nothing. the server holds this request until the rebuild lands
@@ -107,10 +108,10 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
     var i:       usize = 0;
     for (i < s.diags.items.len) {
         val dg: *diag.Diagnostic = ?s.diags.items.data[i];
-        if (dg.loc.file_id == v.file_id && overlaps(dg.loc.span, lo, hi)) {
+        if (src.file_same(dg.loc.file, v.file_id) && overlaps(dg.loc.span, lo, hi)) {
             var f: usize = 0;
             for (f < dg.fixes.len) {
-                if (push_action(?b, ws, alloc, ?s.sources, v.text, uri, dg, ?dg.fixes.data[f], emitted > 0)) {
+                if (push_action(?b, ws, alloc, s.sources, v.text, uri, dg, ?dg.fixes.data[f], emitted > 0)) {
                     emitted = emitted + 1;
                 }
                 f = f + 1;
@@ -129,7 +130,7 @@ pub fun code_actions(ws: *project.Workspace, es: *editor.EditorSession, alloc: *
 # with the squiggle it is offered under, and so applying it can clear that entry.
 # nothing is written, and false returned, when a span cannot be reported
 fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
-    text: positions.Text, uri: str, dg: *diag.Diagnostic, fix: *diag.Fix, comma: bool) bool {
+    text: positions.Text, uri: str, dg: *diag.Diagnostic, fix: *annotation.Fix, comma: bool) bool {
     if (!positions.maps(text, dg.loc.span)) { ret false; }
     if (!edits_map(sources, text, fix))     { ret false; }
     if (comma)                              { json.buf_push_byte(b, ','); }
@@ -141,7 +142,7 @@ fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources
     json.buf_push(b, ",\"diagnostics\":[{\"range\":");
     render.span_range(b, text, dg.loc.span);
     json.buf_push(b, ",\"severity\":");
-    json.buf_push_i64(b, severity_of(dg.severity));
+    json.buf_push_i64(b, notes.lsp_severity(dg));
     json.buf_push(b, ",\"source\":\"mach\",\"message\":");
     json.buf_push_quoted(b, dg.message);
     json.buf_push(b, "}]");
@@ -155,10 +156,10 @@ fun push_action(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources
 }
 
 # whether every edit of `fix` in the requested document can be reported
-fun edits_map(sources: *src.SourceMap, text: positions.Text, fix: *diag.Fix) bool {
+fun edits_map(sources: *src.SourceMap, text: positions.Text, fix: *annotation.Fix) bool {
     var e: usize = 0;
     for (e < fix.edits.len) {
-        val ed: *diag.Edit = ?fix.edits.data[e];
+        val ed: *annotation.Edit = ?fix.edits.data[e];
         if (edit_file(sources, ed) == text.file && !positions.maps(text, ed.loc.span)) { ret false; }
         e = e + 1;
     }
@@ -171,12 +172,12 @@ fun edits_map(sources: *src.SourceMap, text: positions.Text, fix: *diag.Fix) boo
 # without a lookup; an edit naming another file resolves its own URI through the
 # source map rather than being silently dropped into the wrong document.
 fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources: *src.SourceMap,
-    text: positions.Text, uri: str, fix: *diag.Fix) {
+    text: positions.Text, uri: str, fix: *annotation.Fix) {
     var wrote_group: bool  = false;
     var e:           usize = 0;
     for (e < fix.edits.len) {
-        val ed:   *diag.Edit = ?fix.edits.data[e];
-        val same: bool       = edit_file(sources, ed) == text.file;
+        val ed:   *annotation.Edit = ?fix.edits.data[e];
+        val same: bool             = edit_file(sources, ed) == text.file;
         if (same) {
             if (!wrote_group) {
                 json.buf_push_quoted(b, uri);
@@ -193,10 +194,10 @@ fun push_edits(b: *json.Buf, ws: *project.Workspace, alloc: *Allocator, sources:
 }
 
 # the source file an edit addresses, or nil
-fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
-    val fo: opt[*src.SourceFile] = src.get(sources, ed.loc.file_id);
-    if (sel fo.none) { ret nil; }
-    ret fo.some;
+fun edit_file(sources: *src.SourceMap, ed: *annotation.Edit) *src.SourceFile {
+    val opt_sources_entry: opt[*src.SourceFile] = src.get(sources, ed.loc.file);
+    if (sel opt_sources_entry.none) { ret nil; }
+    ret opt_sources_entry.some;
 }
 
 # whether a diagnostic's span touches the requested range
@@ -204,7 +205,7 @@ fun edit_file(sources: *src.SourceMap, ed: *diag.Edit) *src.SourceFile {
 # Touching rather than containing: a client asks for actions at a cursor, which
 # is a zero-length range, and a fix for the error under that cursor must be
 # offered even though nothing is selected.
-fun overlaps(span: token.Span, lo: usize, hi: usize) bool {
+fun overlaps(span: src.Span, lo: usize, hi: usize) bool {
     val start: usize = span.offset;
     var end:   usize = span.offset + span.len;
     if (span.len == 0) { end = start; }
@@ -235,12 +236,4 @@ fun wants_quickfix(params: *sj.Value, alloc: *Allocator) bool {
         i = i + 1;
     }
     ret false;
-}
-
-# the LSP severity for a compiler severity
-fun severity_of(sev: diag.Severity) i64 {
-    if (sev == diag.SEVERITY_ERROR)   { ret 1; }
-    if (sev == diag.SEVERITY_WARNING) { ret 2; }
-    if (sev == diag.SEVERITY_INFO)    { ret 3; }
-    ret 4;
 }

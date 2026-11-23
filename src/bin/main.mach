@@ -32,9 +32,9 @@ fun main(argc: i64, argv: **u8) i64 {
     # should not need a client, and must not start a server
     if (has_flag(argc, argv, "--version")) { ret print_version(); }
 
-    var alloc: Allocator;
-    val pe:    err[allocator.Error] = page.make(?alloc);
-    if (sel pe.err) { ret 1; }
+    var alloc:         Allocator;
+    val err_page_made: err[allocator.Error] = page.make(?alloc);
+    if (sel err_page_made.err) { ret 1; }
 
     # two roles, one executable. Without `--worker` this process is the
     # supervisor: it owns the client's stdio and runs no compiler code, so a
